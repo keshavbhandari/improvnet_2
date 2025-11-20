@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "improvnet"
+version = "0.1.0"
+description = "ImprovNet 2"
+authors = [
+    {name = "Keshav Bhandari", email = "keshavbhandari@gmail.com"}
+]
+readme = { file = "readme.md", content-type = "text/markdown" }
+license = {file = "LICENSE"}
+
+# Dependencies
+dependencies = [
+    "transformers>=4.40.0",
+    "accelerate",
+    "tensorboard",
+    "einops",
+    "ipdb"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["improvnet", "improvnet.*"]
+
+[tool.setuptools.exclude-package-data]
+"improvnet" = ["artifacts/*"]
