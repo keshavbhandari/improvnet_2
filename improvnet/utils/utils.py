@@ -347,27 +347,46 @@ class ProcessData:
                 masked_tokens[idx] = tuple([mask_token] * len(tok))
         return masked_tokens
     
-    def random_mask(self, tokens: list, mask_token: str, ratio: float, attr_mask_prob: float = 0.4) -> list:
+    def random_mask(self, tokens: list, mask_token: str, ratio: float) -> list:
         """
-        Randomly masks any subset of attributes within each compound note or string tuple.
-        attr_mask_prob controls how likely each attribute is to be masked (default=0.4).
+        Randomly masks a subset of attributes within selected compound tokens.
+        
+        Simplified logic:
+        1. Select exactly 'ratio' percent of tokens.
+        2. For each selected token, mask a random number of attributes (1 to all).
         """
         num_tokens = len(tokens)
         num_mask = int(num_tokens * ratio)
         mask_indices = random.sample(range(num_tokens), num_mask)
         
         masked_tokens = copy.deepcopy(tokens)
+        
         for idx in mask_indices:
             tok = masked_tokens[idx]
+            
+            # 1. Handle non-tuple tokens (like <S>, <E>)
             if not isinstance(tok, tuple):
+                masked_tokens[idx] = mask_token
                 continue
 
+            # 2. Handle Compound Tokens
+            tok_list = list(tok)
+            num_attrs = len(tok_list)
+            
+            # Determine how many attributes to mask (ensure at least 1)
+            # This makes the corruption random but guaranteed
+            count_to_mask = random.randint(1, num_attrs)
+            
+            # Pick specific indices to mask
+            indices_to_mask = random.sample(range(num_attrs), count_to_mask)
+            
             new_tok = []
-            for field in tok:
-                if random.random() < attr_mask_prob:
+            for i in range(num_attrs):
+                if i in indices_to_mask:
                     new_tok.append(mask_token)
                 else:
-                    new_tok.append(field)
+                    new_tok.append(tok_list[i])
+            
             masked_tokens[idx] = tuple(new_tok)
 
         return masked_tokens

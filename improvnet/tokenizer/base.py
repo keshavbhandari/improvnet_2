@@ -9,7 +9,7 @@ from typing import (
     TypeAlias,
 )
 
-from ariautils.midi import MidiDict
+from .midi import MidiDict
 
 
 SpecialToken: TypeAlias = str
