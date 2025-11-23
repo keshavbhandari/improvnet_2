@@ -436,11 +436,43 @@ class AmortizedImprovNet(PreTrainedModel):
             logits_main = tuple(head(x_final) for head in self.output_heads_main)
             logits_accom = tuple(head(x_final) for head in self.output_heads_accom)
 
+        # --- 4. Loss Calculation with SHIFTING ---
         total_loss = None
         if labels_main is not None and x_final.shape[1] == L_total:
             loss_fct = nn.CrossEntropyLoss()
-            loss_main = sum([loss_fct(logits_main[i].view(-1, self.config.vocab_sizes[i]), labels_main[:, :, i].view(-1)) for i in range(NUM_VOICE_ATTRIBUTES)])
-            loss_accom = sum([loss_fct(logits_accom[i].view(-1, self.config.vocab_sizes[i]), labels_accom[:, :, i].view(-1)) for i in range(NUM_VOICE_ATTRIBUTES)])
+            
+            # Shift so that tokens < n predict n
+            # Logits: Remove the last token (we don't have a label for the next one)
+            # Labels: Remove the first token (we don't predict the start token)
+            
+            # Apply Shifting Logic
+            shift_labels_main = labels_main[:, 1:, :] # [B, L-1, 5]
+            shift_labels_accom = labels_accom[:, 1:, :] # [B, L-1, 5]
+            
+            loss_main = 0
+            for i in range(NUM_VOICE_ATTRIBUTES):
+                # Logits: [B, L, Vocab] -> Slice to [B, L-1, Vocab]
+                shift_logits = logits_main[i][:, :-1, :].contiguous()
+                shift_labels = shift_labels_main[:, :, i].contiguous()
+                
+                # Flatten
+                loss_main += loss_fct(
+                    shift_logits.view(-1, self.config.vocab_sizes[i]), 
+                    shift_labels.view(-1)
+                )
+
+            loss_accom = 0
+            for i in range(NUM_VOICE_ATTRIBUTES):
+                # Logits: [B, L, Vocab] -> Slice to [B, L-1, Vocab]
+                shift_logits = logits_accom[i][:, :-1, :].contiguous()
+                shift_labels = shift_labels_accom[:, :, i].contiguous()
+                
+                # Flatten
+                loss_accom += loss_fct(
+                    shift_logits.view(-1, self.config.vocab_sizes[i]), 
+                    shift_labels.view(-1)
+                )
+
             total_loss = loss_main + loss_accom
 
         if not return_dict:
