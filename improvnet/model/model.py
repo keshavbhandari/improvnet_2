@@ -2,40 +2,108 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional
-from torch.utils.checkpoint import checkpoint
+from typing import Optional, Tuple, List
 from transformers import PreTrainedModel, PretrainedConfig
 
-# 5 attributes: [instrument, pitch, velocity, onset, duration]
-DEFAULT_MRA_BASE_VALUES = [10000.0, 131.0, 20.0, 1031.0, 1031.0, 10000.0]
+# --- Constants ---
 NUM_ATTRIBUTES = 6
-NUM_VOICE_ATTRIBUTES = 5 # instrument, pitch, velocity, onset, duration
+NUM_VOICE_ATTRIBUTES = 5 
+DEFAULT_MRA_BASE_VALUES = [100.0, 131.0, 20.0, 1031.0, 1031.0, 10000.0]
 
-class MultidimensionalRelativeAttention(nn.Module):
-    """
-    Implements Flash Attention with Multidimensional Relative Attention (MRA).
-    """
-    def __init__(self, hidden_size, num_heads, num_dims=NUM_ATTRIBUTES, 
-                 base_values=DEFAULT_MRA_BASE_VALUES, bias=True):
-        super().__init__()
-        assert hidden_size % num_heads == 0
-        assert num_heads % num_dims == 0, f"num_heads ({num_heads}) must be divisible by num_dims ({num_dims})"
+class ImprovNetConfig(PretrainedConfig):
+    model_type = "improvnet"
+    def __init__(
+        self,
+        hidden_size=780, 
+        num_heads=30,
+        num_decoder_layers=12, 
+        num_encoder_layers=4,
+        ffn_dim=3120,
+        vocab_sizes=[129, 128, 128, 512, 512],
+        seq_len=2048,
+        num_genres=10,
+        num_forms=5,
+        no_bias=False,
+        gradient_checkpointing=False,
+        initializer_range=0.02,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.hidden_size = hidden_size
         self.num_heads = num_heads
-        self.num_dims = num_dims
+        self.num_decoder_layers = num_decoder_layers
+        self.num_encoder_layers = num_encoder_layers
+        self.ffn_dim = ffn_dim
+        self.vocab_sizes = vocab_sizes
+        self.seq_len = seq_len
+        self.num_genres = num_genres
+        self.num_forms = num_forms
+        self.no_bias = no_bias
+        self.gradient_checkpointing = gradient_checkpointing
+        self.initializer_range = initializer_range
         self.head_dim = hidden_size // num_heads
-        self.heads_per_dim = num_heads // num_dims
-        assert self.head_dim % 2 == 0
+
+# --- 1. Embeddings ---
+class MoonbeamInput(nn.Module):
+    def __init__(self, hidden_size, vocab_sizes, num_dims=NUM_VOICE_ATTRIBUTES):
+        super().__init__()
+        self.attr_emb_dim = hidden_size // NUM_ATTRIBUTES 
+        self.embeds = nn.ModuleList([
+            nn.Embedding(vocab_sizes[i], self.attr_emb_dim) for i in range(num_dims)
+        ])
+    def forward(self, instrument, pitch, velocity, onset, duration):
+        inputs = [instrument, pitch, velocity, onset, duration]
+        embeds = [self.embeds[i](inputs[i]) for i in range(len(inputs))]
+        return torch.cat(embeds, dim=-1)
+
+class TimestepEmbedder(nn.Module):
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        half = dim // 2
+        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(t.device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        return self.mlp(t_freq)
+
+# --- 2. Attention with KV Cache Support ---
+class MRAAttention(nn.Module):
+    def __init__(self, config: ImprovNetConfig, is_cross_attention=False):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_heads
+        self.head_dim = config.head_dim
+        self.is_cross_attention = is_cross_attention
         
-        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
-        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
-        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
-        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
-        
-        for i in range(num_dims):
-            base = base_values[i]
-            inv_freqs_g = 1.0 / (base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
-            self.register_buffer(f'inv_freqs_{i}', inv_freqs_g)
-            
+        # MRA Setup (Only for Self-Attention)
+        if not is_cross_attention:
+            self.num_groups = NUM_ATTRIBUTES
+            self.heads_per_group = self.num_heads // self.num_groups
+            for i in range(self.num_groups):
+                base = DEFAULT_MRA_BASE_VALUES[i]
+                inv_freqs_g = 1.0 / (base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+                self.register_buffer(f'inv_freqs_{i}', inv_freqs_g)
+
+        self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=not config.no_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=not config.no_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=not config.no_bias)
+        self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=not config.no_bias)
+
     def _rotate_half(self, x):
         x1 = x[..., : x.shape[-1] // 2]
         x2 = x[..., x.shape[-1] // 2 :]
@@ -47,525 +115,340 @@ class MultidimensionalRelativeAttention(nn.Module):
         cos = torch.cos(sinusoid_inp).unsqueeze(2).repeat_interleave(2, dim=-1)
         return (x * cos) + (self._rotate_half(x) * sin)
 
-    def forward(self, x_norm, attributes, cached_kv=None, update_mask=None):
-        B, L, D = x_norm.shape
-        
-        # 1. Project Q, K, V
-        q_current = self.q_proj(x_norm)
-        k_current = self.k_proj(x_norm)
-        v_current = self.v_proj(x_norm)
-        
-        # 2. Apply Caching Logic
-        if cached_kv is not None:
-            k_cached, v_cached = cached_kv
-            # Use new K only for updated tokens, else use cached K
-            k = torch.where(update_mask, k_current, k_cached)
-            # Always use the full new V for V-verify (as per dLLM-Cache paper)
-            v = v_current 
-        else:
-            # First step, no cache exists
-            k = k_current
-            v = v_current
+    def apply_mra_rotation(self, tensor, attributes):
+        rotated_list = []
+        for g in range(self.num_groups):
+            start_head = g * self.heads_per_group
+            end_head = (g + 1) * self.heads_per_group
+            tensor_group = tensor[:, :, start_head:end_head, :]
+            position_values = attributes[:, :, g].float()
+            inv_freqs_g = getattr(self, f'inv_freqs_{g}')
+            rotated_group = self._apply_rotary_pos_emb(tensor_group, position_values, inv_freqs_g)
+            rotated_list.append(rotated_group)
+        return torch.cat(rotated_list, dim=2)
 
-        # Reshape for MHA
-        q = q_current.reshape(B, L, self.num_heads, self.head_dim)
-        k = k.reshape(B, L, self.num_heads, self.head_dim)
-        v_sdpa = v.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2) # (B, H, L, D_head)
-
-        # 3. Apply MRA rotation to Q and K (k is already mixed)
-        q_rotated, k_rotated = [], []
-        for i in range(self.num_dims):
-            start_head, end_head = i * self.heads_per_dim, (i + 1) * self.heads_per_dim
-            q_group = q[:, :, start_head:end_head, :]
-            k_group = k[:, :, start_head:end_head, :]
-            
-            positions_g = attributes[:, :, i].float()
-            inv_freqs_g = getattr(self, f'inv_freqs_{i}')
-            
-            q_rotated.append(self._apply_rotary_pos_emb(q_group, positions_g, inv_freqs_g))
-            k_rotated.append(self._apply_rotary_pos_emb(k_group, positions_g, inv_freqs_g))
-        
-        q = torch.cat(q_rotated, dim=2).transpose(1, 2) # (B, H, L, D_head)
-        k = torch.cat(k_rotated, dim=2).transpose(1, 2) # (B, H, L, D_head)
-
-        # 4. Flash Attention
-        output = F.scaled_dot_product_attention(q, k, v_sdpa)
-        
-        # 5. Reshape and final projection
-        output = output.transpose(1, 2).contiguous().reshape(B, L, D)
-        
-        # Return new (k, v) pair to be cached
-        # We return the *mixed* k and the *full new* v
-        return self.o_proj(output), (k_current, v_current)
-
-class SwiGLU_FFN(nn.Module):
-    def __init__(self, hidden_size, ffn_dim, bias=True):
-        super().__init__()
-        self.w1_gate = nn.Linear(hidden_size, ffn_dim, bias=bias)
-        self.w2_up = nn.Linear(hidden_size, ffn_dim, bias=bias)
-        self.w3_down = nn.Linear(ffn_dim, hidden_size, bias=bias)
-        self.act_fn = nn.SiLU()
-    def forward(self, x):
-        return self.w3_down(self.act_fn(self.w1_gate(x)) * self.w2_up(x))
-
-class ImprovNetTransformerBlock(nn.Module):
-    """
-    Modified Transformer Block with Adaptive Caching Logic.
-    """
-    def __init__(self, config: "ImprovNetConfig"):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(config.hidden_size)
-        self.attn = MultidimensionalRelativeAttention(
-            hidden_size=config.hidden_size,
-            num_heads=config.num_heads,
-            num_dims=NUM_ATTRIBUTES, # 6
-            bias=not config.no_bias
-        )
-        self.norm2 = nn.LayerNorm(config.hidden_size)
-        self.ffn = SwiGLU_FFN(
-            hidden_size=config.hidden_size,
-            ffn_dim=config.ffn_dim,
-            bias=not config.no_bias
-        )
-
-    def forward(self, x, attributes, cache=None, update_ratio=0.25):
-        """
-        MODIFIED: Now has two distinct paths for training (cache=None)
-        and inference (cache is not None).
-        """
-        
-        if cache is not None:
-            # --- 1. INFERENCE / CACHING PATH ---
-            x_norm1 = self.norm1(x)
-            
-            # --- 1a. V-Verify Logic ---
-            v_current = self.attn.v_proj(x_norm1)
-            v_cached = cache['v']
-            sim = F.cosine_similarity(v_current, v_cached, dim=-1) # (B, L)
-            
-            num_tokens = x.shape[1]
-            num_to_update = int(num_tokens * update_ratio)
-            
-            if num_to_update > 0:
-                topk = torch.topk(sim, k=num_to_update, dim=-1, largest=False)
-                update_mask = torch.zeros_like(sim, dtype=torch.bool).scatter(
-                    -1, topk.indices, True
-                ).unsqueeze(-1) # (B, L, 1)
-            else:
-                update_mask = torch.zeros_like(sim, dtype=torch.bool).unsqueeze(-1)
-            
-            cached_kv = (cache.get('k'), v_cached)
-
-            # --- 1b. Adaptive Attention ---
-            attn_out_current, (k_new, v_new) = self.attn(
-                x_norm1, attributes, cached_kv, update_mask
-            )
-            attn_out_cached = cache.get('attn_out')
-            attn_out = torch.where(update_mask, attn_out_current, attn_out_cached)
-            x = x + attn_out
-
-            # --- 1c. Adaptive FFN ---
-            x_norm2 = self.norm2(x)
-            ffn_out_current = self.ffn(x_norm2)
-            ffn_out_cached = cache.get('ffn_out')
-            ffn_out = torch.where(update_mask, ffn_out_current, ffn_out_cached)
-            x = x + ffn_out
-            
-            # --- 1d. Prepare new cache for next step ---
-            new_cache = {'k': k_new, 'v': v_new, 'attn_out': attn_out, 'ffn_out': ffn_out}
-            
-            return x, new_cache
-
-        else:
-            # --- 2. TRAINING / NO-CACHE PATH ---
-            
-            # 2a. Standard Attention
-            x_norm1 = self.norm1(x)
-            # We don't pass cache or update_mask, and we don't need the new K, V
-            attn_out, _ = self.attn(
-                x_norm1, attributes, cached_kv=None, update_mask=None
-            )
-            x = x + attn_out
-
-            # 2b. Standard FFN
-            x_norm2 = self.norm2(x)
-            ffn_out = self.ffn(x_norm2)
-            x = x + ffn_out
-            
-            # 2c. Return x and an empty cache (which will be ignored)
-            return x, None
-
-class MoonbeamInput(nn.Module):
-    """
-    Input Embedding for Moonbeam / ImprovNet. Splits input attributes
-    and embeds each separately, then concatenates.
-    """
-    def __init__(self, hidden_size, vocab_sizes, num_dims=NUM_VOICE_ATTRIBUTES):
-        super().__init__()
-        assert len(vocab_sizes) == num_dims
-        # Must be divisible by 6 (5 attrs + 1 pos_index)
-        assert hidden_size % NUM_ATTRIBUTES == 0
-        self.emb_dim = hidden_size // NUM_ATTRIBUTES # e.g., 780 / 6 = 130
-        
-        self.embeds = nn.ModuleList([
-            nn.Embedding(vocab_sizes[i], self.emb_dim) for i in range(num_dims)
-        ])
-        
-    def forward(self, instrument, pitch, velocity, onset, duration):
-        inputs = [instrument, pitch, velocity, onset, duration]
-        embeds = [self.embeds[i](inputs[i]) for i in range(len(inputs))]
-        # Returns shape (B, L, C * 5/6)
-        return torch.cat(embeds, dim=-1)
-
-class ImprovNetConfig(PretrainedConfig):
-    model_type = "improvnet"
-
-    def __init__(
-        self,
-        hidden_size=780,
-        num_heads=12,
-        num_layers=16,
-        ffn_dim=3120, # 780 * 4
-        vocab_sizes=[129, 128, 128, 1024, 1024], # 5 vocabs
-        seq_len=2048, # Length of ONE stream
-        num_genres=10,
-        num_forms=5,
-        no_bias=False,
-        gradient_checkpointing=False,
-        initializer_range=0.02,
-        adaptive_update_ratio=0.25,
-        **kwargs
+    def forward(
+        self, 
+        hidden_states, 
+        encoder_hidden_states=None, 
+        attributes=None,            
+        attention_mask=None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None
     ):
-        super().__init__(**kwargs)
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.num_layers = num_layers
-        self.ffn_dim = ffn_dim
-        self.vocab_sizes = vocab_sizes
-        self.seq_len = seq_len
-        self.num_genres = num_genres
-        self.num_forms = num_forms
-        self.no_bias = no_bias
-        self.gradient_checkpointing = gradient_checkpointing
-        self.initializer_range = initializer_range
-        self.adaptive_update_ratio = adaptive_update_ratio
-        
-        # MODIFICATION: New 6-D constraints
-        assert hidden_size % num_heads == 0
-        assert num_heads % NUM_ATTRIBUTES == 0, f"num_heads ({num_heads}) must be divisible by {NUM_ATTRIBUTES}"
-        assert hidden_size % NUM_ATTRIBUTES == 0, f"hidden_size ({hidden_size}) must be divisible by {NUM_ATTRIBUTES}"
+        B, L, C = hidden_states.shape
+        H, D = self.num_heads, self.head_dim
 
-# ---
-# --- ImprovNet (MODIFIED) ---
-# ---
-class ImprovNet(PreTrainedModel):
+        q = self.q_proj(hidden_states).view(B, L, H, D)
+        
+        if self.is_cross_attention:
+            if past_key_value is not None:
+                k, v = past_key_value
+            elif encoder_hidden_states is not None:
+                B_enc, L_enc, _ = encoder_hidden_states.shape
+                k = self.k_proj(encoder_hidden_states).view(B_enc, L_enc, H, D)
+                v = self.v_proj(encoder_hidden_states).view(B_enc, L_enc, H, D)
+            else:
+                raise ValueError("Cross attention requires encoder_hidden_states or past_key_value")
+            
+            q_rot, k_rot = q.transpose(1, 2), k.transpose(1, 2)
+            v_final = v.transpose(1, 2)
+            
+            current_key_value = (k, v)
+
+        else:
+            # Self-Attention
+            k = self.k_proj(hidden_states).view(B, L, H, D)
+            v = self.v_proj(hidden_states).view(B, L, H, D)
+            
+            q_rot = self.apply_mra_rotation(q, attributes)
+            k_rot = self.apply_mra_rotation(k, attributes)
+            
+            if past_key_value is not None:
+                past_k, past_v = past_key_value
+                k_rot = torch.cat([past_k, k_rot], dim=1) 
+                v = torch.cat([past_v, v], dim=1)
+            
+            current_key_value = (k_rot, v)
+            
+            q_rot = q_rot.transpose(1, 2)
+            k_rot = k_rot.transpose(1, 2)
+            v_final = v.transpose(1, 2)
+
+        attn_output = F.scaled_dot_product_attention(
+            q_rot, k_rot, v_final, attn_mask=attention_mask, is_causal=False 
+        )
+        
+        attn_output = attn_output.transpose(1, 2).contiguous().reshape(B, L, C)
+        return self.o_proj(attn_output), current_key_value
+
+# --- 3. Encoder Block ---
+class EncoderBlock(nn.Module):
+    def __init__(self, config: ImprovNetConfig):
+        super().__init__()
+        self.attn_norm = nn.LayerNorm(config.hidden_size)
+        self.attn = MRAAttention(config, is_cross_attention=False)
+        self.ffn_norm = nn.LayerNorm(config.hidden_size)
+        self.w1 = nn.Linear(config.hidden_size, config.ffn_dim)
+        self.w2 = nn.Linear(config.hidden_size, config.ffn_dim)
+        self.w3 = nn.Linear(config.ffn_dim, config.hidden_size)
+        self.act = nn.SiLU()
+
+    def forward(self, x, attributes, attention_mask=None):
+        res = x
+        x_norm = self.attn_norm(x)
+        attn_out, _ = self.attn(x_norm, attributes=attributes, attention_mask=attention_mask)
+        x = res + attn_out
+        
+        res = x
+        x_norm = self.ffn_norm(x)
+        ffn_out = self.w3(self.act(self.w1(x_norm)) * self.w2(x_norm))
+        x = res + ffn_out
+        return x
+
+# --- 4. Decoder Block ---
+class DecoderBlock(nn.Module):
+    def __init__(self, config: ImprovNetConfig):
+        super().__init__()
+        self.self_attn_norm = nn.LayerNorm(config.hidden_size)
+        self.self_attn = MRAAttention(config, is_cross_attention=False)
+        
+        self.cross_attn_norm = nn.LayerNorm(config.hidden_size)
+        self.cross_attn = MRAAttention(config, is_cross_attention=True)
+        
+        self.ffn_norm = nn.LayerNorm(config.hidden_size)
+        self.w1 = nn.Linear(config.hidden_size, config.ffn_dim)
+        self.w2 = nn.Linear(config.hidden_size, config.ffn_dim)
+        self.w3 = nn.Linear(config.ffn_dim, config.hidden_size)
+        self.act = nn.SiLU()
+
+    def forward(
+        self, 
+        x, 
+        attributes, 
+        encoder_hidden_states, 
+        self_attention_mask=None,
+        cross_attention_mask=None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None
+    ):
+        self_cache = past_key_value[0] if past_key_value is not None else None
+        cross_cache = past_key_value[1] if past_key_value is not None else None
+
+        # 1. Self Attention
+        res = x
+        x_norm = self.self_attn_norm(x)
+        attn_out, new_self_cache = self.self_attn(
+            x_norm, 
+            attributes=attributes, 
+            attention_mask=self_attention_mask,
+            past_key_value=self_cache
+        )
+        x = res + attn_out
+        
+        # 2. Cross Attention
+        res = x
+        x_norm = self.cross_attn_norm(x)
+        attn_out, new_cross_cache = self.cross_attn(
+            x_norm,
+            encoder_hidden_states=encoder_hidden_states,
+            attention_mask=cross_attention_mask,
+            past_key_value=cross_cache
+        )
+        x = res + attn_out
+        
+        # 3. FFN
+        res = x
+        x_norm = self.ffn_norm(x)
+        ffn_out = self.w3(self.act(self.w1(x_norm)) * self.w2(x_norm))
+        x = res + ffn_out
+        
+        return x, (new_self_cache, new_cross_cache)
+
+# --- 5. Amortized Model ---
+class AmortizedImprovNet(PreTrainedModel):
     config_class = ImprovNetConfig
-    
     def __init__(self, config: ImprovNetConfig):
         super().__init__(config)
         self.config = config
-        self.seq_len = config.seq_len # This is L (length of one stream)
-        self.vocab_sizes = config.vocab_sizes
-        self.gradient_checkpointing = config.gradient_checkpointing
-
-        # --- MODIFICATION: Handle 5 attribute vocabs + 1 pos embedding ---
+        
         self.input_embed = MoonbeamInput(config.hidden_size, config.vocab_sizes)
-        
-        # Pos embedding for 2 * L total tokens
-        self.pos_embed = nn.Embedding(
-            config.seq_len * 2, 
-            config.hidden_size // NUM_ATTRIBUTES # emb_dim (C/6)
-        )
-        
+        self.pos_embed = nn.Embedding(config.seq_len * 2, config.hidden_size // NUM_ATTRIBUTES)
         self.genre_embed = nn.Embedding(config.num_genres, config.hidden_size)
         self.form_embed = nn.Embedding(config.num_forms, config.hidden_size)
-
-        self.transformer_blocks = nn.ModuleList([
-            ImprovNetTransformerBlock(config) for _ in range(config.num_layers)
-        ])
+        self.time_embed = TimestepEmbedder(config.hidden_size)
+        
+        self.encoder_blocks = nn.ModuleList([EncoderBlock(config) for _ in range(config.num_encoder_layers)])
+        self.decoder_blocks = nn.ModuleList([DecoderBlock(config) for _ in range(config.num_decoder_layers)])
+        
         self.final_norm = nn.LayerNorm(config.hidden_size)
-
-        # Output heads are still for 5 attributes
-        self.output_heads_main = nn.ModuleList([
-            nn.Linear(config.hidden_size, config.vocab_sizes[i], bias=not config.no_bias) 
-            for i in range(NUM_VOICE_ATTRIBUTES)
-        ])
-        self.output_heads_accom = nn.ModuleList([
-            nn.Linear(config.hidden_size, config.vocab_sizes[i], bias=not config.no_bias) 
-            for i in range(NUM_VOICE_ATTRIBUTES)
-        ])
+        
+        self.output_heads_main = nn.ModuleList([nn.Linear(config.hidden_size, config.vocab_sizes[i]) for i in range(NUM_VOICE_ATTRIBUTES)])
+        self.output_heads_accom = nn.ModuleList([nn.Linear(config.hidden_size, config.vocab_sizes[i]) for i in range(NUM_VOICE_ATTRIBUTES)])
         
         self.post_init()
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.bias is not None:
-                module.bias.data.zero_()
+            if module.bias is not None: module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
+            if module.padding_idx is not None: module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, nn.LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
-        # Manually init pos_embed
-        if hasattr(self, 'pos_embed'):
-            self.pos_embed.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
 
-
-    def _calculate_loss(self, all_logits, labels, loss_mask):
-        total_loss = 0.0
-        loss_count = 0
-        loss_fct = nn.CrossEntropyLoss(reduction='none')
-        all_labels = torch.unbind(labels, dim=-1)
-        all_loss_masks = torch.unbind(loss_mask, dim=-1)
+    def _prepare_embeddings(self, attrs, start_idx, device, genre, form, timestep):
+        # Corrected Logic: Supports arbitrary slices (e.g., 1 token for inference)
+        B, L_chunk, _ = attrs.shape
         
-        # We only have 5 attributes in labels
-        for i in range(NUM_VOICE_ATTRIBUTES):
-            if all_loss_masks[i].any():
-                loss_count += 1
-                logits_flat = all_logits[i].reshape(-1, self.vocab_sizes[i])
-                labels_flat = all_labels[i].reshape(-1)
-                mask_flat = all_loss_masks[i].reshape(-1).float()
-                raw_loss = loss_fct(logits_flat, labels_flat)
-                masked_loss = raw_loss * mask_flat
-                attribute_loss = masked_loss.sum() / (mask_flat.sum() + 1e-9)
-                total_loss += attribute_loss
-        return total_loss, loss_count
+        # 1. Unbind attributes (Compound token)
+        unbound = torch.unbind(attrs, dim=-1)
+        # Embed compound tokens (Instrument, Pitch, Vel, Onset, Dur)
+        x = self.input_embed(unbound[0], unbound[1], unbound[2], unbound[3], unbound[4])
+        
+        # 2. Positional Embeddings
+        # Generate global position indices for this chunk
+        pos_ids = torch.arange(start_idx, start_idx + L_chunk, device=device).unsqueeze(0).expand(B, L_chunk)
+        x = torch.cat([x, self.pos_embed(pos_ids)], dim=-1)
+        
+        # 3. Conditions
+        cond_emb = (self.genre_embed(genre) + self.form_embed(form)).unsqueeze(1)
+        time_emb = self.time_embed(timestep).unsqueeze(1)
+        
+        x = x + cond_emb + time_emb
+        return x
 
     def forward(
         self, 
-        input_attributes_main,
-        input_attributes_accom,
+        input_attributes_encoder, 
+        input_attributes_decoder, 
         genre,
         form,
+        timestep, 
         labels_main=None,
         labels_accom=None,
-        loss_mask_main=None,
-        loss_mask_accom=None,
-        cache: Optional[list] = None, 
+        past_key_values=None, 
         return_dict=None
     ):
-        B, L, A = input_attributes_main.shape
-        assert A == NUM_VOICE_ATTRIBUTES, f"Input tensors must have {NUM_VOICE_ATTRIBUTES} attributes"
-        assert L == self.seq_len, f"Input sequence length ({L}) doesn't match config.seq_len ({self.seq_len})"
+        device = input_attributes_encoder.device
+        B = input_attributes_encoder.shape[0]
         
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        # --- 1. Encoder Pass (Bidirectional) ---
+        x_enc = self._prepare_embeddings(input_attributes_encoder, start_idx=0, device=device, genre=genre, form=form, timestep=timestep)
         
-        # --- 1. Embedding and Conditioning ---
-        main_attrs = torch.unbind(input_attributes_main, dim=-1)
-        accom_attrs = torch.unbind(input_attributes_accom, dim=-1)
+        # MRA Attributes for Encoder
+        L_enc = input_attributes_encoder.shape[1]
+        seq_idx_enc = torch.arange(0, L_enc, device=device).unsqueeze(0).expand(B, L_enc).unsqueeze(-1)
         
-        # --- MODIFICATION: Create 6th attribute (seq_index) ---
-        # (B, L) tensor with values [0, 1, ..., L-1]
-        seq_indices_main = torch.arange(L, device=self.device).unsqueeze(0).expand(B, L)
-        # (B, L) tensor with values [L, L+1, ..., 2L-1]
-        seq_indices_accom = torch.arange(L, 2*L, device=self.device).unsqueeze(0).expand(B, L)
+        mra_attrs_enc = torch.cat([
+            input_attributes_encoder[..., :5].float(),
+            seq_idx_enc.float()
+        ], dim=-1)
 
-        # Get 5-attr embedding: (B, L, C * 5/6)
-        x_main_5 = self.input_embed(main_attrs[0], main_attrs[1], main_attrs[2], main_attrs[3], main_attrs[4])
-        x_accom_5 = self.input_embed(accom_attrs[0], accom_attrs[1], accom_attrs[2], accom_attrs[3], accom_attrs[4])
-
-        # Get 6th attr embedding: (B, L, C * 1/6)
-        pos_emb_main = self.pos_embed(seq_indices_main)
-        pos_emb_accom = self.pos_embed(seq_indices_accom)
-        
-        # Concatenate to full C dimension: (B, L, C)
-        x_main = torch.cat([x_main_5, pos_emb_main], dim=-1)
-        x_accom = torch.cat([x_accom_5, pos_emb_accom], dim=-1)
-        
-        g_emb = self.genre_embed(genre).unsqueeze(1)
-        f_emb = self.form_embed(form).unsqueeze(1)
-        cond_emb = g_emb + f_emb
-        x_main = x_main + cond_emb
-        x_accom = x_accom + cond_emb
-        
-        # --- 2. Concatenate Streams ---
-        x_combined = torch.cat([x_main, x_accom], dim=1) # (B, 2*L, C)
-        
-        # --- MODIFICATION: Build 6-attribute tensor for MRA ---
-        attributes_main_5 = input_attributes_main.float()
-        attributes_accom_5 = input_attributes_accom.float()
-        
-        # Add 6th attribute (seq_index)
-        attrs_main_6d = torch.cat([attributes_main_5, seq_indices_main.float().unsqueeze(-1)], dim=-1)
-        attrs_accom_6d = torch.cat([attributes_accom_5, seq_indices_accom.float().unsqueeze(-1)], dim=-1)
-        
-        attrs_combined = torch.cat([attrs_main_6d, attrs_accom_6d], dim=1) # (B, 2*L, 6)
-
-        # --- 3. Transformer Stack with Cache Logic ---
-        use_cache = not self.training
-        
-        if use_cache:
-            if cache is None:
-                cache = [None] * self.config.num_layers
-            new_cache_list = []
-        else:
-            cache = [None] * self.config.num_layers
-
-        for i, block in enumerate(self.transformer_blocks):
-            if use_cache:
-                x_combined, new_cache = block(
-                    x_combined, 
-                    attrs_combined, 
-                    cache=cache[i], 
-                    update_ratio=self.config.adaptive_update_ratio
+        # --- Cleaned Encoder Loop ---
+        for block in self.encoder_blocks:
+            if self.config.gradient_checkpointing and self.training:
+                # Directly pass 'block' as the function
+                x_enc = torch.utils.checkpoint.checkpoint(
+                    block,
+                    x_enc,
+                    mra_attrs_enc,
+                    None, # attention_mask
+                    use_reentrant=False
                 )
-                new_cache_list.append(new_cache)
-            else: 
-                if self.gradient_checkpointing and self.training:
-                    output_tuple = checkpoint(block, x_combined, attrs_combined, None, self.config.adaptive_update_ratio, use_reentrant=False)
-                    x_combined = output_tuple[0]
+            else:
+                x_enc = block(x_enc, attributes=mra_attrs_enc)
+            
+        encoder_hidden_states = x_enc
+
+        # --- 2. Decoder Pass (Causal) ---
+        if past_key_values is not None:
+            start_idx = past_key_values[0][0][0].shape[1]
+        else:
+            start_idx = 0
+            
+        x_dec = self._prepare_embeddings(input_attributes_decoder, start_idx=start_idx, device=device, genre=genre, form=form, timestep=timestep)
+        
+        L_dec_slice = input_attributes_decoder.shape[1]
+        seq_idx_dec = torch.arange(start_idx, start_idx + L_dec_slice, device=device).unsqueeze(0).expand(B, L_dec_slice).unsqueeze(-1)
+        
+        mra_attrs_dec = torch.cat([
+            input_attributes_decoder[..., :5].float(),
+            seq_idx_dec.float()
+        ], dim=-1)
+
+        if past_key_values is None:
+            causal_mask = torch.triu(torch.ones(L_dec_slice, L_dec_slice, device=device) * float('-inf'), diagonal=1)
+        else:
+            causal_mask = None 
+
+        new_past_key_values = []
+        
+        # --- Cleaned Decoder Loop ---
+        for i, block in enumerate(self.decoder_blocks):
+            layer_cache = past_key_values[i] if past_key_values is not None else None
+            
+            if self.config.gradient_checkpointing and self.training:
+                # Note: Checkpointing is usually incompatible with caching because
+                # caching breaks the computation graph needed for re-computation.
+                if layer_cache is not None:
+                     x_dec, new_cache = block(
+                        x_dec,
+                        attributes=mra_attrs_dec,
+                        encoder_hidden_states=encoder_hidden_states,
+                        self_attention_mask=causal_mask,
+                        past_key_value=layer_cache
+                    )
                 else:
-                    output_tuple = block(x_combined, attrs_combined, cache=None, update_ratio=self.config.adaptive_update_ratio)
-                    x_combined = output_tuple[0]
+                    # Directly pass 'block'
+                    # Block returns (x, cache), checkpoint handles tuple returns automatically
+                    x_dec, new_cache = torch.utils.checkpoint.checkpoint(
+                        block,
+                        x_dec,
+                        mra_attrs_dec,
+                        encoder_hidden_states,
+                        causal_mask, # self_attention_mask
+                        None,        # cross_attention_mask
+                        None,        # past_key_value
+                        use_reentrant=False
+                    )
+            else:
+                x_dec, new_cache = block(
+                    x_dec,
+                    attributes=mra_attrs_dec,
+                    encoder_hidden_states=encoder_hidden_states,
+                    self_attention_mask=causal_mask,
+                    past_key_value=layer_cache
+                )
             
-        # --- 4. Final Norm and Split ---
-        x_combined_norm = self.final_norm(x_combined)
-        x_main_norm, x_accom_norm = x_combined_norm.chunk(2, dim=1)
+            new_past_key_values.append(new_cache)
+
+        # --- 3. Heads ---
+        x_final = self.final_norm(x_dec)
         
-        # --- 5. Get Logits ---
-        logits_main = tuple(head(x_main_norm) for head in self.output_heads_main)
-        logits_accom = tuple(head(x_accom_norm) for head in self.output_heads_accom)
+        L_total = self.config.seq_len * 2
         
-        # --- 6. Calculate Loss ---
+        if x_final.shape[1] == L_total:
+            x_main_out, x_accom_out = x_final.chunk(2, dim=1)
+            logits_main = tuple(head(x_main_out) for head in self.output_heads_main)
+            logits_accom = tuple(head(x_accom_out) for head in self.output_heads_accom)
+        else:
+            logits_main = tuple(head(x_final) for head in self.output_heads_main)
+            logits_accom = tuple(head(x_final) for head in self.output_heads_accom)
+
         total_loss = None
-        if labels_main is not None:
-            loss_main, count_main = self._calculate_loss(logits_main, labels_main, loss_mask_main)
-            loss_accom, count_accom = self._calculate_loss(logits_accom, labels_accom, loss_mask_accom)
-            total_loss_value = loss_main + loss_accom
-            total_count = count_main + count_accom
-            total_loss = total_loss_value / total_count if total_count > 0 else torch.tensor(0.0, device=x_combined_norm.device)
-        
-        # --- 7. Return Output ---
-        output = {
-            "logits_main": logits_main,
-            "logits_accom": logits_accom
-        }
-        if total_loss is not None:
-            output["loss"] = total_loss
-        if use_cache:
-            output["cache"] = new_cache_list
+        if labels_main is not None and x_final.shape[1] == L_total:
+            loss_fct = nn.CrossEntropyLoss()
+            loss_main = sum([loss_fct(logits_main[i].view(-1, self.config.vocab_sizes[i]), labels_main[:, :, i].view(-1)) for i in range(NUM_VOICE_ATTRIBUTES)])
+            loss_accom = sum([loss_fct(logits_accom[i].view(-1, self.config.vocab_sizes[i]), labels_accom[:, :, i].view(-1)) for i in range(NUM_VOICE_ATTRIBUTES)])
+            total_loss = loss_main + loss_accom
+
         if not return_dict:
-            list_output = []
-            if total_loss is not None: list_output.append(output["loss"])
-            list_output.extend([output["logits_main"], output["logits_accom"]])
-            if use_cache: list_output.append(output["cache"])
-            return tuple(list_output)
-        
-        return output
-
-# ---
-# --- TEST SCRIPT (MODIFIED for Non-FIT ImprovNet) ---
-# ---
-if __name__ == "__main__":
-    
-    # --- 1. Model Configuration ---
-    NUM_MRA_HEADS = 5 
-    HIDDEN_SIZE = 80
-    NUM_LAYERS = 4
-    FFN_DIM = 320 # 80 * 4
-    BATCH_SIZE = 2
-    SEQ_LEN = 128
-    
-    # [instrument, pitch, velocity, onset, duration]
-    VOCAB_SIZES = [129, 128, 128, 1024, 1024]
-    NUM_GENRES = 10
-    NUM_FORMS = 5 
-    
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    # --- 2. Dual Stream Dummy Inputs ---
-    def create_stream_data(B, L, vocabs):
-        return torch.stack([
-            torch.randint(0, vocabs[0], (B, L)),
-            torch.randint(0, vocabs[1], (B, L)),
-            torch.randint(0, vocabs[2], (B, L)),
-            torch.randint(0, vocabs[3], (B, L)),
-            torch.randint(0, vocabs[4], (B, L))
-        ], dim=-1).to(device)
-
-    input_attributes_main = create_stream_data(BATCH_SIZE, SEQ_LEN, VOCAB_SIZES) # Shape: (B, L, 5)
-    input_attributes_accom = create_stream_data(BATCH_SIZE, SEQ_LEN, VOCAB_SIZES) # Shape: (B, L, 5)
-    genre = torch.randint(0, NUM_GENRES, (BATCH_SIZE,)).to(device)
-    form = torch.randint(0, NUM_FORMS, (BATCH_SIZE,)).to(device)
-    
-    labels_main = input_attributes_main.clone()
-    labels_accom = input_attributes_accom.clone()
-    loss_mask_main = (torch.rand(BATCH_SIZE, SEQ_LEN, NUM_ATTRIBUTES) > 0.8).to(device)
-    loss_mask_accom = (torch.rand(BATCH_SIZE, SEQ_LEN, NUM_ATTRIBUTES) > 0.8).to(device)
-    loss_mask_main[0, 0, 0] = True 
-    loss_mask_accom[0, 0, 0] = True
-
-    print(f"--- Testing NON-FIT ImprovNet (Flash MRA, SwiGLU, HF) ---")
-    print(f"Device: {device}")
-    
-    # --- 3. Instantiate via Config ---
-    config = ImprovNetConfig(
-        hidden_size=HIDDEN_SIZE,
-        num_heads=NUM_MRA_HEADS,
-        num_layers=NUM_LAYERS,
-        ffn_dim=FFN_DIM,
-        vocab_sizes=VOCAB_SIZES,
-        seq_len=SEQ_LEN,
-        num_genres=NUM_GENRES,
-        num_forms=NUM_FORMS,
-        gradient_checkpointing=True,
-        no_bias=True
-    )
-    
-    model = ImprovNet(config=config).to(device)
-    model.train() 
-
-    try:
-        # --- 4. Run Forward Pass ---
-        output = model(
-            input_attributes_main=input_attributes_main,
-            input_attributes_accom=input_attributes_accom,
-            genre=genre,
-            form=form,
-            labels_main=labels_main,
-            labels_accom=labels_accom,
-            loss_mask_main=loss_mask_main,
-            loss_mask_accom=loss_mask_accom,
-            return_dict=True
-        )
-        
-        print("\nForward pass SUCCESSFUL!")
-        print(f"Computed Loss: {output['loss'].item():.4f}")
-        
-        # --- 5. Test Saving and Loading ---
-        print("\n--- Testing .save_pretrained() & .from_pretrained() ---")
-        save_directory = "./improvnet_model"
-        
-        model.save_pretrained(save_directory)
-        print(f"Model saved to {save_directory}")
-        
-        loaded_model = ImprovNet.from_pretrained(save_directory).to(device)
-        loaded_model.eval()
-        print("Model successfully loaded with .from_pretrained()")
-
-        with torch.no_grad():
-            output_loaded = loaded_model(
-                input_attributes_main=input_attributes_main,
-                input_attributes_accom=input_attributes_accom,
-                genre=genre,
-                form=form
-            )
-        
-        assert "loss" not in output_loaded
-        assert "logits_main" in output_loaded
-        print("Loaded model forward pass successful.")
-        
-        # Check logits shape
-        logits_main = output_loaded["logits_main"]
-        assert isinstance(logits_main, tuple) and len(logits_main) == NUM_ATTRIBUTES
-        assert list(logits_main[0].shape) == [BATCH_SIZE, SEQ_LEN, VOCAB_SIZES[0]]
-        print(f"Logits shape check PASSED.")
-
+            return (logits_main, logits_accom, new_past_key_values)
             
-    except Exception as e:
-        print(f"\nForward pass FAILED: {e}")
-        import traceback
-        traceback.print_exc()
+        return {
+            "loss": total_loss,
+            "logits_main": logits_main,
+            "logits_accom": logits_accom,
+            "past_key_values": new_past_key_values
+        }

@@ -22,10 +22,11 @@ from improvnet.utils.utils import ProcessData, read_jsonl_files, setup_distribut
 
 # --- MODIFICATION: Import the new ImprovNet model and config ---
 # Make sure 'improvnet.model.model' points to the file with your latest ImprovNet class
-from improvnet.model.model import AmortizedImprovNet, ImprovNetConfig, NUM_ATTRIBUTES
+from improvnet.model.model_with_cache import ImprovNet, ImprovNetConfig, NUM_ATTRIBUTES
 
 # -----------------------
-# Dataset Class
+# Audio Text Dataset
+# (This class is unchanged as its output is what we'll adapt to)
 # -----------------------
 class ImprovnetDataset(Dataset):
     def __init__(self, data, split="train", train_type="pretraining"):
@@ -51,10 +52,12 @@ class ImprovnetDataset(Dataset):
 
     def filter_data_by_training_type(self, training_type):
         if training_type == "pretraining":
-            # Example filter logic
-            self.data = [item for item in self.data if "My Old FlameGM.mid" not in item['midi_filepath']]
-        else:
+            self.data = [item for item in self.data if "My Old FlameGM.mid" not in item['midi_filepath'] and "Whilewereyoung.mid" not in item['midi_filepath']]
+        elif training_type == "finetuning":
+            # Finetuning is not implemented in this script
             pass
+        else:
+            raise ValueError(f"Unknown training type: {training_type}")
 
     def __getitem__(self, idx):
         item = self.data[idx]
@@ -62,116 +65,149 @@ class ImprovnetDataset(Dataset):
         genre = item.get('genre', None)
         form = item.get('form', None)
         try:
-            # Call the new Amortized Pipeline in utils.py
-            # It returns 7 items: (enc_main, enc_accom, dec_main, dec_accom, genre, form, timestep)
-            (
-                enc_main, enc_accom, 
-                dec_main, dec_accom, 
-                genre_tok, form_tok, 
-                timestep
-            ) = self.processor.pretraining_pipeline(
-                filepath, genre=genre, form=form, 
-                segment_length=MAX_LEN,
-                apply_pitch_augmentation=self.apply_augmentation
-            )
-            
-            return {
-                "enc_main": enc_main,
-                "enc_accom": enc_accom,
-                "dec_main": dec_main,
-                "dec_accom": dec_accom,
-                "genre": genre_tok,
-                "form": form_tok,
-                "timestep": timestep
-            }
+            if self.train_type == "pretraining":
+                (
+                    corrupted_tokens, corrupted_accomp_tokens, 
+                    changed_indices, changed_accomp_indices, 
+                    original_tokens, accomp_tokens, 
+                    genre_token, form_token
+                ) = self.processor.pretraining_pipeline(
+                    filepath, genre=genre, form=form, 
+                    corruption_type='random',
+                    segment_length=MAX_LEN,
+                    mask_token='<MASK>',
+                    apply_pitch_augmentation=self.apply_augmentation
+                )
+            elif self.train_type == "finetuning":
+                # This script is set for pretraining, but you would call your
+                # finetuning pipeline here if TRAIN_TYPE was 'finetuning'
+                raise NotImplementedError("Finetuning pipeline not fully implemented in this script")
+            else:
+                raise ValueError(f"Unknown training type: {self.train_type}")
         except Exception as e:
             print(f"Error processing file {filepath}: {e}", file=sys.stderr)
+            # Return None to be filtered by collate_fn
             return None
 
+        # Return all parts from the pipeline
+        return {
+            "corrupted_input": corrupted_tokens,
+            "corrupted_accomp_input": corrupted_accomp_tokens,
+            "changed_indices": changed_indices,
+            "changed_accomp_indices": changed_accomp_indices,
+            "original_input": original_tokens,
+            "original_accomp_input": accomp_tokens,
+            "genre": genre_token,
+            "form": form_token
+        }
+
 # -----------------------
-# Collate Function
+# MODIFICATION: New Collate Function
 # -----------------------
 def collate_fn(batch):
     """
-    Collates data for AmortizedImprovNet.
-    Concatenates Main + Accom into [B, 2*L, 5] tensors for Encoder/Decoder inputs.
-    Creates labels with -100 masking for padding.
+    Collates data from the ImprovnetDataset for the new ImprovNet model.
+    Handles padding/trimming and dictionary-to-tensor conversion.
     """
-    # Filter failed samples
+    # Filter out None values from failed __getitem__ calls
     batch = [item for item in batch if item is not None]
     if not batch:
         return {}
         
+    # --- Attribute order MUST match the model's input ---
+    # [instrument, pitch, velocity, onset, duration]
     ATTR_ORDER = ['instrument', 'pitch', 'velocity', 'onset', 'duration']
     
-    def _process_stream(token_dicts, pad_val=2):
-        """Helper to stack dicts of tensors into a single [B, L, 5] tensor with padding."""
+    def _process_stream(token_dicts, label_dicts, mask_tensors):
+        """Helper to process one stream (main or accom)."""
         inputs_list = []
-        for token_dict in token_dicts:
+        labels_list = []
+        masks_list = []
+
+        for token_dict, label_dict, mask in zip(token_dicts, label_dicts, mask_tensors):
+            # 1. Convert dict of tensors to (L, 5) tensor
+            # This is crucial: it stacks the individual attribute tensors
             try:
-                # Stack attributes [L, 5]
                 input_tensor = torch.stack([token_dict[attr] for attr in ATTR_ORDER], dim=1)
-            except (KeyError, RuntimeError) as e:
-                print(f"Collate Error: {e}", file=sys.stderr)
+                label_tensor = torch.stack([label_dict[attr] for attr in ATTR_ORDER], dim=1)
+            except KeyError as e:
+                print(f"Collate Error: Missing key {e}. Token dict keys: {token_dict.keys()}", file=sys.stderr)
+                continue
+            except RuntimeError as e:
+                # This happens if tensors in the dict have different lengths
+                print(f"Collate Error: Mismatched tensor lengths. {e}", file=sys.stderr)
+                print(f"Lengths: {[len(token_dict[attr]) for attr in ATTR_ORDER]}", file=sys.stderr)
                 continue
                 
+            # 2. Get length and compute padding
             seq_len = input_tensor.shape[0]
             pad_len = MAX_LEN - seq_len
             
+            # 3. Pad or trim all three tensors
             if pad_len > 0:
-                # Pad
-                input_pad = torch.full((pad_len, len(ATTR_ORDER)), pad_val, dtype=torch.long)
+                # Pad inputs with 2 (assuming 2 is a <PAD> token ID)
+                input_pad = torch.full((pad_len, len(ATTR_ORDER)), 2, dtype=torch.long)
                 inputs_list.append(torch.cat([input_tensor, input_pad], dim=0))
-            else:
-                # Trim (though pipeline usually handles crop, this is a safety net)
+                
+                # Pad labels with -100 (ignored by loss function)
+                label_pad = torch.full((pad_len, len(ATTR_ORDER)), -100, dtype=torch.long)
+                labels_list.append(torch.cat([label_tensor, label_pad], dim=0))
+                
+                # Pad mask with False (0)
+                mask_pad = torch.full((pad_len, len(ATTR_ORDER)), False, dtype=torch.bool)
+                masks_list.append(torch.cat([mask, mask_pad], dim=0))
+                
+            else: # seq_len >= MAX_LEN, so we trim
                 inputs_list.append(input_tensor[:MAX_LEN])
+                labels_list.append(label_tensor[:MAX_LEN])
+                masks_list.append(mask[:MAX_LEN])
 
         if not inputs_list:
-            return None
-        return torch.stack(inputs_list) # (B, MAX_LEN, 5)
+            return None, None, None
 
-    # 1. Process Encoder Streams (Main & Accom) -> Noisy Inputs
-    # enc_main/enc_accom are dicts of tensors from pretraining_pipeline
-    enc_main_tens = _process_stream([item['enc_main'] for item in batch])
-    enc_accom_tens = _process_stream([item['enc_accom'] for item in batch])
+        # 4. Stack into a batch
+        return (
+            torch.stack(inputs_list),  # (B, MAX_LEN, 5)
+            torch.stack(labels_list),  # (B, MAX_LEN, 5)
+            torch.stack(masks_list)    # (B, MAX_LEN, 5)
+        )
+
+    # --- Process Main Stream ---
+    main_inputs, main_labels, main_masks = _process_stream(
+        [item['corrupted_input'] for item in batch],
+        [item['original_input'] for item in batch],
+        [item['changed_indices'] for item in batch]
+    )
+
+    # --- Process Accompaniment Stream ---
+    accom_inputs, accom_labels, accom_masks = _process_stream(
+        [item['corrupted_accomp_input'] for item in batch],
+        [item['original_accomp_input'] for item in batch],
+        [item['changed_accomp_indices'] for item in batch]
+    )
     
-    # 2. Process Decoder Streams (Main & Accom) -> Clean Targets
-    dec_main_tens = _process_stream([item['dec_main'] for item in batch])
-    dec_accom_tens = _process_stream([item['dec_accom'] for item in batch])
-
-    if enc_main_tens is None or dec_main_tens is None:
+    # If any stream failed (e.g., all items in batch had errors for that stream)
+    if main_inputs is None or accom_inputs is None:
         return {}
 
-    # 3. Concatenate [Main; Accom] -> (B, 2*MAX_LEN, 5)
-    # The model expects a single concatenated sequence for Encoder and Decoder inputs
-    input_attributes_encoder = torch.cat([enc_main_tens, enc_accom_tens], dim=1)
-    input_attributes_decoder = torch.cat([dec_main_tens, dec_accom_tens], dim=1)
-    
-    # 4. Create Labels (for Decoder)
-    # Clone decoder input, but replace PAD tokens (2) with -100 to ignore in loss
-    labels_main = dec_main_tens.clone()
-    labels_main[labels_main == 2] = -100
-    
-    labels_accom = dec_accom_tens.clone()
-    labels_accom[labels_accom == 2] = -100
-
-    # 5. Metadata
+    # --- Process Genre/Form Tokens ---
+    # .squeeze(1) to remove the (1,) dim from the util function
     try:
         genre_tokens = torch.stack([item['genre'] for item in batch]).squeeze(1)
         form_tokens = torch.stack([item['form'] for item in batch]).squeeze(1)
-        timesteps = torch.stack([item['timestep'] for item in batch]).squeeze(1)
     except Exception as e:
-        print(f"Error collating meta: {e}", file=sys.stderr)
+        print(f"Error collating genre/form tokens: {e}", file=sys.stderr)
         return {}
 
     return {
-        "input_attributes_encoder": input_attributes_encoder,
-        "input_attributes_decoder": input_attributes_decoder,
-        "labels_main": labels_main, 
-        "labels_accom": labels_accom,
+        "input_attributes_main": main_inputs,
+        "labels_main": main_labels,
+        "loss_mask_main": main_masks,
+        "input_attributes_accom": accom_inputs,
+        "labels_accom": accom_labels,
+        "loss_mask_accom": accom_masks,
         "genre": genre_tokens,
-        "form": form_tokens,
-        "timestep": timesteps
+        "form": form_tokens
     }
 
 
@@ -263,11 +299,10 @@ def main(rank, local_rank, device, train_loader, val_loader, args):
     config = ImprovNetConfig(
         hidden_size=args.embed_dim,
         num_heads=args.heads,
-        num_decoder_layers=args.num_decoder_layers, 
-        num_encoder_layers=args.num_encoder_layers,
+        num_layers=args.num_layers,
         ffn_dim=args.embed_dim * args.mlp_mult,
-        vocab_sizes=vocab_sizes,
-        seq_len=args.max_seq_len, 
+        vocab_sizes=vocab_sizes,      # This is the list of 5 vocabs
+        seq_len=args.max_seq_len,     # This is L (e.g., 2048)
         num_genres=num_genres,
         num_forms=num_forms,
         no_bias=args.no_bias,
@@ -277,11 +312,11 @@ def main(rank, local_rank, device, train_loader, val_loader, args):
     # Load model if resuming
     if args.resume and os.path.exists(args.checkpoint_dir):
         model, training_state, start_epoch, best_val_loss, ema_loss = load_checkpoint(
-            args.checkpoint_dir, AmortizedImprovNet, device, rank
+            args.checkpoint_dir, ImprovNet, device, rank
         )
         print(f"[Rank {rank}] Resumed from epoch {start_epoch + 1}")
     else:
-        model = AmortizedImprovNet(config).to(device)
+        model = ImprovNet(config).to(device)
         training_state, start_epoch, best_val_loss, ema_loss = {}, 0, float("inf"), None
 
     print(f"[Rank {rank}] Model has {sum(p.numel() for p in model.parameters())} parameters")
@@ -293,7 +328,7 @@ def main(rank, local_rank, device, train_loader, val_loader, args):
     optimizer = AdamW(model.parameters(), lr=args.lr)
     num_update_steps_per_epoch = len(train_loader)
     max_train_steps = int(args.num_epochs * num_update_steps_per_epoch / args.grad_accum_steps)
-    num_warmup_steps = int(0.03 * max_train_steps)
+    num_warmup_steps = int(0.01 * max_train_steps)
     lr_scheduler = get_scheduler(
         name="cosine",
         optimizer=optimizer,
@@ -323,31 +358,33 @@ def main(rank, local_rank, device, train_loader, val_loader, args):
             if not batch: # Skip empty batches if collate_fn filtered all items
                 continue
                 
-            # Move to device
-            input_enc = batch["input_attributes_encoder"].to(device)
-            input_dec = batch["input_attributes_decoder"].to(device)
+            # --- MODIFICATION: Load all data from collate_fn ---
+            input_main = batch["input_attributes_main"].to(device)
             labels_main = batch["labels_main"].to(device)
+            mask_main = batch["loss_mask_main"].to(device)
+            input_accom = batch["input_attributes_accom"].to(device)
             labels_accom = batch["labels_accom"].to(device)
+            mask_accom = batch["loss_mask_accom"].to(device)
             genre = batch['genre'].to(device)
             form = batch['form'].to(device)
-            timestep = batch['timestep'].to(device)
 
-            # Forward Pass
+            # --- MODIFICATION: New model forward pass ---
             with torch.amp.autocast(dtype=torch.bfloat16, device_type='cuda'):
                 output = model(
-                    input_attributes_encoder=input_enc,
-                    input_attributes_decoder=input_dec,
+                    input_attributes_main=input_main,
+                    input_attributes_accom=input_accom,
                     genre=genre,
                     form=form,
-                    timestep=timestep,
-                    labels_main=labels_main,   # Passed for internal loss calc
-                    labels_accom=labels_accom, # Passed for internal loss calc
+                    labels_main=labels_main,
+                    labels_accom=labels_accom,
+                    loss_mask_main=mask_main,
+                    loss_mask_accom=mask_accom,
                     return_dict=True
                 )
                 loss = output["loss"]
 
             loss_val = loss.item()
-            train_loss_sum += loss_val * input_enc.size(0)
+            train_loss_sum += loss_val * input_main.size(0)
             ema_loss = loss_val if ema_loss is None else (0.98 * ema_loss + 0.02 * loss_val)
 
             scaler.scale(loss).backward()
@@ -368,7 +405,7 @@ def main(rank, local_rank, device, train_loader, val_loader, args):
                     tb_writer.add_scalar("Train/LearningRate", optimizer.param_groups[0]["lr"], global_step)
 
         # Clear memory
-        del batch, input_enc, labels_main, input_dec, labels_accom, genre, form, timestep
+        del batch, input_main, labels_main, mask_main, input_accom, labels_accom, mask_accom, genre, form
         torch.cuda.empty_cache()
 
         # ---- Validation ----
@@ -382,25 +419,32 @@ def main(rank, local_rank, device, train_loader, val_loader, args):
                 if not batch:
                     continue
                 
-                input_enc = batch["input_attributes_encoder"].to(device)
-                input_dec = batch["input_attributes_decoder"].to(device)
+                # --- MODIFICATION: Load all data from collate_fn ---
+                input_main = batch["input_attributes_main"].to(device)
                 labels_main = batch["labels_main"].to(device)
+                mask_main = batch["loss_mask_main"].to(device)
+                input_accom = batch["input_attributes_accom"].to(device)
                 labels_accom = batch["labels_accom"].to(device)
+                mask_accom = batch["loss_mask_accom"].to(device)
                 genre = batch['genre'].to(device)
                 form = batch['form'].to(device)
-                timestep = batch['timestep'].to(device)
 
+                # --- MODIFICATION: New model forward pass ---
                 with torch.amp.autocast(dtype=torch.bfloat16, device_type='cuda'):
                     output = model(
-                        input_attributes_encoder=input_enc,
-                        input_attributes_decoder=input_dec,
-                        genre=genre, form=form, timestep=timestep,
-                        labels_main=labels_main, labels_accom=labels_accom,
+                        input_attributes_main=input_main,
+                        input_attributes_accom=input_accom,
+                        genre=genre,
+                        form=form,
+                        labels_main=labels_main,
+                        labels_accom=labels_accom,
+                        loss_mask_main=mask_main,
+                        loss_mask_accom=mask_accom,
                         return_dict=True
                     )
                     loss = output["loss"]
-                val_loss_sum += loss.item() * input_enc.size(0)
-                val_samples_sum += input_enc.size(0)
+                val_loss_sum += loss.item() * input_main.size(0)
+                val_samples_sum += input_main.size(0)
 
         # Reduce metrics
         val_metrics_t = torch.tensor([val_loss_sum, val_samples_sum], device=device)
@@ -426,7 +470,7 @@ def main(rank, local_rank, device, train_loader, val_loader, args):
             save_checkpoint(model, optimizer, lr_scheduler, epoch + 1, metrics, args.checkpoint_dir, rank)
 
         # Free memory
-        del batch, input_enc, labels_main, input_dec, labels_accom, genre, form, timestep
+        del batch, input_main, labels_main, mask_main, input_accom, labels_accom, mask_accom, genre, form
         torch.cuda.empty_cache()
 
     if tb_writer:
@@ -440,8 +484,7 @@ if __name__ == "__main__":
         embed_dim = EMBED_DIM
         heads = HEADS
         mlp_mult = MLP_MULT
-        num_decoder_layers = NUM_DECODER_LAYERS 
-        num_encoder_layers = NUM_ENCODER_LAYERS         
+        num_layers = NUM_LAYERS # Corrected from num_global_layers
         no_bias = NO_BIAS
         
         lr = LR
@@ -460,11 +503,11 @@ if __name__ == "__main__":
     print("--- Validating Configuration ---")
     if args.heads % NUM_ATTRIBUTES != 0:
         print(f"🔴 CONFIG ERROR: HEADS ({args.heads}) must be divisible by NUM_ATTRIBUTES ({NUM_ATTRIBUTES}).")
-        print(f"Please change HEADS in training_config.py to a multiple of 6 (e.g., 12, 18, 30).")
+        print(f"Please change HEADS in training_config.py to a multiple of 6 (e.g., 12, 18).")
         sys.exit(1)
     if args.embed_dim % NUM_ATTRIBUTES != 0:
         print(f"🔴 CONFIG ERROR: EMBED_DIM ({args.embed_dim}) must be divisible by NUM_ATTRIBUTES ({NUM_ATTRIBUTES}).")
-        print(f"Please change EMBED_DIM in training_config.py to a multiple of 6 (e.g., 780, 1020).")
+        print(f"Please change EMBED_DIM in training_config.py to a multiple of 6 (e.g., 1020, 780).")
         sys.exit(1)
     if args.embed_dim % args.heads != 0:
         print(f"🔴 CONFIG ERROR: EMBED_DIM ({args.embed_dim}) must be divisible by HEADS ({args.heads}).")
@@ -478,9 +521,8 @@ if __name__ == "__main__":
     
     if DEBUG:
         args.use_tensorboard = False
-        # Reduce data for debug
-        train_files = train_files[:1000] if len(train_files) > 1000 else train_files
-        validation_files = validation_files[:100] if len(validation_files) > 100 else validation_files
+        train_files = train_files[:1000]
+        validation_files = validation_files[:100]
 
     # Setup distributed training
     rank, local_rank, world_size = setup_distributed()
@@ -505,10 +547,9 @@ if __name__ == "__main__":
         collate_fn=collate_fn,
         pin_memory=True,
     )
-    # Validation batch size can be larger since no backward pass
     val_loader = DataLoader(
         val_dataset,
-        batch_size=BATCH_SIZE//4, 
+        batch_size=BATCH_SIZE//4,
         sampler=val_sampler,
         num_workers=NUM_WORKERS,
         collate_fn=collate_fn,

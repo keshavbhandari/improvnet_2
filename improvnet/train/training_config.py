@@ -21,17 +21,18 @@ CHECKPOINTS_DIR = f"improvnet/artifacts/{TRAIN_TYPE}/checkpoint"      # Director
 
 # Configuration for the training
 MAX_LEN = 2048 #8192                              # Maximum length of token sequences
-EMBED_DIM = 1020                               # Dimension of token embeddings
-NUM_LAYERS = 24                               # Number of transformer layers
-HEADS = 30                                      # Number of attention heads
-MLP_MULT = 6                                   # Multiplier for the feedforward network dimension
+EMBED_DIM = 1152                               # Dimension of token embeddings
+NUM_DECODER_LAYERS = 14                               # Number of transformer decoder layers
+NUM_ENCODER_LAYERS = 6                                # Number of transformer encoder layers
+HEADS = 18                                      # Number of attention heads
+MLP_MULT = 4                                   # Multiplier for the feedforward network dimension
 NO_BIAS = False                               # Whether to use no bias in Linear layers
 USE_CHECKPOINTING = True                       # Whether to use gradient checkpointing
 
-BATCH_SIZE = 64 #8                                # Batch size for training
+BATCH_SIZE = 32 #8                                # Batch size for training
 NUM_WORKERS = 4                                 # Number of workers for data loading
-LR = 8e-4                                       # Learning rate for the optimizer
-NUM_EPOCHS = 15                                 # Number of epochs for training
+LR = 5e-4                                       # Learning rate for the optimizer
+NUM_EPOCHS = 10                                 # Number of epochs for training
 GRADIENT_ACCUMULATION_STEPS = 1                 # Number of gradient accumulation steps
 GRADIENT_CHECKPOINTING = True                   # Whether to use gradient checkpointing
 LOAD_FROM_CHECKPOINT = False                     # Whether to load weights from a checkpoint
