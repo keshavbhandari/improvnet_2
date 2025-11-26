@@ -439,41 +439,41 @@ class AmortizedImprovNet(PreTrainedModel):
         # --- 4. Loss Calculation with SHIFTING ---
         total_loss = None
         if labels_main is not None and x_final.shape[1] == L_total:
-            loss_fct = nn.CrossEntropyLoss()
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
             
-            # Shift so that tokens < n predict n
-            # Logits: Remove the last token (we don't have a label for the next one)
-            # Labels: Remove the first token (we don't predict the start token)
-            
-            # Apply Shifting Logic
             shift_labels_main = labels_main[:, 1:, :] # [B, L-1, 5]
             shift_labels_accom = labels_accom[:, 1:, :] # [B, L-1, 5]
             
-            loss_main = 0
+            loss_main = 0.0
             for i in range(NUM_VOICE_ATTRIBUTES):
-                # Logits: [B, L, Vocab] -> Slice to [B, L-1, Vocab]
                 shift_logits = logits_main[i][:, :-1, :].contiguous()
                 shift_labels = shift_labels_main[:, :, i].contiguous()
                 
-                # Flatten
-                loss_main += loss_fct(
-                    shift_logits.view(-1, self.config.vocab_sizes[i]), 
-                    shift_labels.view(-1)
-                )
+                # SAFETY CHECK: Only calculate loss if there are valid tokens
+                if (shift_labels != -100).any():
+                    loss_main += loss_fct(
+                        shift_logits.view(-1, self.config.vocab_sizes[i]), 
+                        shift_labels.view(-1)
+                    )
 
-            loss_accom = 0
+            loss_accom = 0.0
             for i in range(NUM_VOICE_ATTRIBUTES):
-                # Logits: [B, L, Vocab] -> Slice to [B, L-1, Vocab]
                 shift_logits = logits_accom[i][:, :-1, :].contiguous()
                 shift_labels = shift_labels_accom[:, :, i].contiguous()
                 
-                # Flatten
-                loss_accom += loss_fct(
-                    shift_logits.view(-1, self.config.vocab_sizes[i]), 
-                    shift_labels.view(-1)
-                )
+                # SAFETY CHECK: Only calculate loss if there are valid tokens
+                # This prevents NaN when the entire batch is Solo (Empty Accompaniment)
+                if (shift_labels != -100).any():
+                    loss_accom += loss_fct(
+                        shift_logits.view(-1, self.config.vocab_sizes[i]), 
+                        shift_labels.view(-1)
+                    )
 
             total_loss = loss_main + loss_accom
+            
+            # Final safety: if total_loss is 0.0 (e.g. complete silence), make it a tensor
+            if isinstance(total_loss, float):
+                total_loss = torch.tensor(total_loss, device=device, requires_grad=True)
 
         if not return_dict:
             return (logits_main, logits_accom, new_past_key_values)

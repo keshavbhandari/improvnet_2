@@ -328,3 +328,23 @@ class ProcessData:
             genre_form_dict['form'],
             timestep_tensor
         )
+    
+    def inference_pipeline(self, file_path: str, genre: str | None, form: str | None):
+        """
+        Reads a MIDI file and prepares the FULL sequence without cropping.
+        Returns lists of tokens (not tensors) to be sliced by the generator.
+        """
+        # 1. Read
+        midi_dict = self.read_midi(file_path)
+        tokens = self.midi_to_tokens(midi_dict)
+        
+        # 2. Split (No Augmentation or Cropping)
+        main_tokens, accomp_tokens, _ = self.split_instrument_tokens(tokens)
+        
+        if main_tokens is None: main_tokens = []
+        if accomp_tokens is None: accomp_tokens = []
+
+        # 3. Prepare Conditions
+        genre_form = self.genre_form_to_tensor(genre, form)
+        
+        return main_tokens, accomp_tokens, genre_form['genre'], genre_form['form']

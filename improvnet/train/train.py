@@ -390,15 +390,16 @@ def main(rank, local_rank, device, train_loader, val_loader, args):
                 form = batch['form'].to(device)
                 timestep = batch['timestep'].to(device)
 
-                with torch.amp.autocast(dtype=torch.bfloat16, device_type='cuda'):
-                    output = model(
-                        input_attributes_encoder=input_enc,
-                        input_attributes_decoder=input_dec,
-                        genre=genre, form=form, timestep=timestep,
-                        labels_main=labels_main, labels_accom=labels_accom,
-                        return_dict=True
-                    )
-                    loss = output["loss"]
+                with torch.no_grad():
+                    with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                        output = model(
+                            input_attributes_encoder=input_enc,
+                            input_attributes_decoder=input_dec,
+                            genre=genre, form=form, timestep=timestep,
+                            labels_main=labels_main, labels_accom=labels_accom,
+                            return_dict=True
+                        )
+                        loss = output["loss"]
                 val_loss_sum += loss.item() * input_enc.size(0)
                 val_samples_sum += input_enc.size(0)
 
