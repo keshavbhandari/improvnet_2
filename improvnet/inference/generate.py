@@ -1,279 +1,358 @@
-import tqdm
 import torch
 import torch.nn.functional as F
-from typing import Optional, Tuple
+import tqdm
 import sys
-from improvnet.model.model import ImprovNet, ImprovNetConfig # Imports updated model
-from improvnet.utils.utils import ProcessData
+import math
+import os
+
+from improvnet.model.model import AmortizedImprovNet, ImprovNetConfig
+from improvnet.utils.utils import ProcessData, MAX_DIFFUSION_STEPS
 from improvnet.train.training_config import *
 
+# --- Constants ---
 ATTR_ORDER = ['instrument', 'pitch', 'velocity', 'onset', 'duration']
 NUM_ATTRIBUTES = 5
 PAD_TOKEN_ID = 2 
+MASK_TOKEN_ID = 6 # Ensure this matches your tokenizer!
+EOS_TOKEN_ID = 1   
+
+def tokens_to_tensor(processor, tokens, device):
+    """Converts list of tokens to [1, L, 5] tensor."""
+    if not tokens:
+        # Return empty valid tensor for logic consistency
+        return torch.zeros((1, 0, NUM_ATTRIBUTES), dtype=torch.long, device=device)
+    
+    t_dict = processor.tokens_to_tensor(tokens)
+    t_stack = torch.stack([t_dict[attr] for attr in ATTR_ORDER], dim=1)
+    return t_stack.unsqueeze(0).to(device)
+
+def tensor_to_tokens(processor, tensor):
+    """Converts [1, L, 5] tensor back to list of tokens."""
+    if tensor.shape[1] == 0:
+        return []
+    t = tensor.squeeze(0)
+    d = {ATTR_ORDER[i]: t[:, i].cpu() for i in range(NUM_ATTRIBUTES)}
+    return processor.tensor_to_tokens(d)
+
+def pad_tensor_to_len(tensor, target_len, pad_val=PAD_TOKEN_ID):
+    """Pads [1, L, 5] to [1, target_len, 5]."""
+    curr_len = tensor.shape[1]
+    if curr_len >= target_len:
+        return tensor[:, :target_len, :]
+    
+    pad_len = target_len - curr_len
+    pad_t = torch.full((1, pad_len, NUM_ATTRIBUTES), pad_val, dtype=torch.long, device=tensor.device)
+    return torch.cat([tensor, pad_t], dim=1)
 
 @torch.no_grad()
-def generate_with_cache(
-    model: ImprovNet,
-    initial_main: torch.Tensor,
-    initial_accom: torch.Tensor,
-    mask_main: torch.Tensor,
-    mask_accom: torch.Tensor,
-    steps: int = 12,
-    temperature: float = 1.0,
-    genre_tokens: Optional[torch.Tensor] = None,
-    form_tokens: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def decode_stream(
+    model: AmortizedImprovNet,
+    heads: torch.nn.ModuleList, 
+    encoder_hidden_states: torch.Tensor, 
+    context_seq: torch.Tensor, 
+    target_len: int,           
+    start_idx_offset: int,     
+    genre, form, timestep,
+    past_key_values,           
+    temperature=1.0, 
+    top_k=50
+):
+    """
+    Autoregressive Decoder Loop with KV Cache and EOS Stopping.
+    """
+    device = context_seq.device
+    curr_seq = context_seq.clone()
+    
+    current_cache = past_key_values
+    
+    # Progress Bar configuration
+    steps_to_gen = target_len - curr_seq.shape[1]
+    
+    if steps_to_gen > 0:
+        with tqdm.tqdm(total=steps_to_gen, desc=f"Decoding (Offset {start_idx_offset})", leave=False) as pbar:
+            
+            while curr_seq.shape[1] < target_len:
+                # 1. Prepare Input (Last token only if caching)
+                if current_cache is not None:
+                    dec_input = curr_seq[:, -1:, :]
+                    curr_global_idx = start_idx_offset + curr_seq.shape[1] - 1
+                else:
+                    dec_input = curr_seq
+                    curr_global_idx = start_idx_offset
 
+                # 2. Embeddings
+                x_dec = model._prepare_embeddings(
+                    dec_input, start_idx=curr_global_idx, device=device, 
+                    genre=genre, form=form, timestep=timestep
+                )
+                
+                # 3. MRA Attributes
+                L_slice = dec_input.shape[1]
+                seq_idx = torch.arange(curr_global_idx, curr_global_idx + L_slice, device=device).unsqueeze(0).expand(1, L_slice).unsqueeze(-1)
+                mra_attrs = torch.cat([dec_input[..., :5].float(), seq_idx.float()], dim=-1)
+                
+                # 4. Mask
+                if current_cache is None:
+                    causal_mask = torch.triu(torch.ones(L_slice, L_slice, device=device) * float('-inf'), diagonal=1)
+                else:
+                    causal_mask = None
+
+                # 5. Forward through Blocks
+                new_kv_list = []
+                for i, block in enumerate(model.decoder_blocks):
+                    layer_cache = current_cache[i] if current_cache is not None else None
+                    
+                    x_dec, new_kv = block(
+                        x_dec,
+                        attributes=mra_attrs,
+                        encoder_hidden_states=encoder_hidden_states,
+                        self_attention_mask=causal_mask,
+                        past_key_value=layer_cache
+                    )
+                    new_kv_list.append(new_kv)
+                
+                current_cache = new_kv_list
+                
+                # 6. Sampling
+                x_final = model.final_norm(x_dec) 
+                
+                next_tok_attrs = []
+                for i in range(NUM_ATTRIBUTES):
+                    logits = heads[i](x_final)[:, -1, :] 
+                    logits = logits / temperature
+                    
+                    if top_k > 0:
+                        # Safety: Clamp top_k to vocab size
+                        vocab_size = logits.shape[-1]
+                        effective_k = min(top_k, vocab_size)
+                        v, _ = torch.topk(logits, effective_k)
+                        logits[logits < v[:, [-1]]] = -float('Inf')
+                    
+                    probs = F.softmax(logits, dim=-1)
+                    next_val = torch.multinomial(probs, 1)
+                    next_tok_attrs.append(next_val)
+                    
+                next_token_t = torch.cat(next_tok_attrs, dim=-1).unsqueeze(1) # [1, 1, 5]
+                
+                # 7. Check for EOS
+                if (next_token_t[0, 0, 0] == EOS_TOKEN_ID):
+                    curr_seq = torch.cat([curr_seq, next_token_t], dim=1)
+                    pbar.update(1)
+                    break
+                    
+                curr_seq = torch.cat([curr_seq, next_token_t], dim=1)
+                pbar.update(1)
+        
+    return curr_seq, current_cache
+
+def generate_segment(
+    model, processor, 
+    main_fixed_t, accom_fixed_t, 
+    main_new_init_t, accom_new_init_t, 
+    genre, form, 
+    inference_steps, 
+    segment_len, 
+    start_ratio, 
+    temperature,
+    device
+):
+    # 1. Setup Schedule
+    start_t = int(MAX_DIFFUSION_STEPS * start_ratio)
+    timesteps = torch.linspace(start_t, 0, inference_steps + 1).long().to(device)
+    
+    len_main_new = main_new_init_t.shape[1]
+    len_accom_new = accom_new_init_t.shape[1]
+    
+    # Initialize "Clean Estimates" with Original Data (Style Transfer)
+    # or Empty if lengths are 0
+    curr_main_new = main_new_init_t.clone()
+    curr_accom_new = accom_new_init_t.clone()
+    
+    gen_main = len_main_new > 0
+    gen_accom = len_accom_new > 0
+
+    # --- DIFFUSION LOOP ---
+    for i in range(inference_steps):
+        curr_t = timesteps[i]
+        print(f"    Step {i+1}/{inference_steps} (t={curr_t.item()})")
+        
+        # Use BF16 for speed
+        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+            
+            # --- A. Noising / Re-composition ---
+            mask_prob = processor.get_mask_prob_for_timestep(curr_t.item())
+            
+            def apply_mask(clean_est, prob):
+                if clean_est.shape[1] == 0: return clean_est
+                # Independent attribute masking on the CURRENT ESTIMATE
+                mask = torch.rand(clean_est.shape, device=device) < prob
+                noisy = clean_est.clone()
+                noisy[mask] = MASK_TOKEN_ID
+                return noisy
+                
+            noisy_main_new = apply_mask(curr_main_new, mask_prob)
+            noisy_accom_new = apply_mask(curr_accom_new, mask_prob)
+            
+            # Concatenate [Fixed; Noisy_New]
+            enc_input_main = torch.cat([main_fixed_t, noisy_main_new], dim=1)
+            enc_input_accom = torch.cat([accom_fixed_t, noisy_accom_new], dim=1)
+            
+            # PAD to segment_len for the Encoder (Required for Pos Emb Match)
+            enc_input_main_pad = pad_tensor_to_len(enc_input_main, segment_len)
+            enc_input_accom_pad = pad_tensor_to_len(enc_input_accom, segment_len)
+            
+            # Combine [Main; Accom]
+            enc_input_full = torch.cat([enc_input_main_pad, enc_input_accom_pad], dim=1)
+            
+            # --- B. Encoder Pass ---
+            x_enc = model._prepare_embeddings(enc_input_full, 0, device, genre, form, curr_t.unsqueeze(0))
+            
+            L_enc = enc_input_full.shape[1]
+            seq_idx_enc = torch.arange(0, L_enc, device=device).unsqueeze(0).expand(1, L_enc).unsqueeze(-1)
+            mra_attrs_enc = torch.cat([enc_input_full[..., :5].float(), seq_idx_enc.float()], dim=-1)
+            
+            for blk in model.encoder_blocks:
+                x_enc = blk(x_enc, attributes=mra_attrs_enc)
+            encoder_context = x_enc
+            
+            # --- C. Decoder Phase ---
+            
+            # 1. Generate Main
+            if gen_main:
+                target_len = main_fixed_t.shape[1] + len_main_new
+                full_main, past_kv = decode_stream(
+                    model, model.output_heads_main, encoder_context,
+                    context_seq=main_fixed_t, 
+                    target_len=target_len,
+                    start_idx_offset=0,
+                    genre=genre, form=form, timestep=curr_t.unsqueeze(0),
+                    past_key_values=None, temperature=temperature
+                )
+                # Update Estimate for next step
+                curr_main_new = full_main[:, main_fixed_t.shape[1]:, :]
+            else:
+                # If not generating Main, we MUST still prefill the cache with Fixed Main
+                # so Accom can attend to it.
+                if gen_accom:
+                     _, past_kv = decode_stream(
+                        model, model.output_heads_main, encoder_context,
+                        context_seq=main_fixed_t,
+                        target_len=main_fixed_t.shape[1], # Prefill only
+                        start_idx_offset=0,
+                        genre=genre, form=form, timestep=curr_t.unsqueeze(0),
+                        past_key_values=None, temperature=temperature
+                    )
+                else:
+                    past_kv = None
+                    full_main = main_fixed_t 
+
+            # 2. Generate Accom
+            if gen_accom:
+                target_len = accom_fixed_t.shape[1] + len_accom_new
+                full_accom, _ = decode_stream(
+                    model, model.output_heads_accom, encoder_context,
+                    context_seq=accom_fixed_t,
+                    target_len=target_len,
+                    start_idx_offset=MAX_LEN, # Important: Accom Offset
+                    genre=genre, form=form, timestep=curr_t.unsqueeze(0),
+                    past_key_values=past_kv, # Attend to Main
+                    temperature=temperature
+                )
+                curr_accom_new = full_accom[:, accom_fixed_t.shape[1]:, :]
+    
+    return curr_main_new, curr_accom_new
+
+def run_cascaded_generation(
+    model_path, input_midi, output_path,
+    genre_str="classical", form_str="unknown",
+    segment_len=MAX_LEN, overlap_ratio=0.20,
+    inference_steps=3, start_ratio=0.99,
+    temperature=1.0
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # --- 1. Load Model (BF16) ---
+    print(f"Loading model from {model_path} in BF16...")
+    model = AmortizedImprovNet.from_pretrained(
+        model_path, 
+        torch_dtype=torch.bfloat16
+    ).to(device)
+    
     model.eval()
-    device = next(model.parameters()).device
-    B, L, _ = initial_main.shape
-
-    # --- 1. PREPARE MASKS ---
-    per_token_mask_main = mask_main.any(dim=-1).bool()
-    per_token_mask_accom = mask_accom.any(dim=-1).bool()
-    static_mask_main = ~mask_main.bool()
-    static_mask_accom = ~mask_accom.bool()
+    processor = ProcessData()
     
-    original_static_main = initial_main.clone()
-    original_static_accom = initial_accom.clone()
-    xt_main = initial_main.clone()
-    xt_accom = initial_accom.clone()
-
-    # --- 2. SCHEDULING ---
-    t_values = torch.linspace(0, 1, steps + 1, device=device).unsqueeze(0)
-    gamma = torch.cos(t_values * torch.pi / 2.0)
-    num_masked_main = per_token_mask_main.sum(dim=-1).float().unsqueeze(-1)
-    num_masked_accom = per_token_mask_accom.sum(dim=-1).float().unsqueeze(-1)
-    num_masked_per_step_main = (gamma * num_masked_main).round().long()
-    num_masked_per_step_accom = (gamma * num_masked_accom).round().long()
+    # 2. Read Full MIDI
+    main_toks_full, accom_toks_full, g_tens, f_tens = processor.inference_pipeline(input_midi, genre_str, form_str)
+    g_tens, f_tens = g_tens.to(device), f_tens.to(device)
     
-    current_iter_mask_main = per_token_mask_main.clone()
-    current_iter_mask_accom = per_token_mask_accom.clone()
-
-    # --- 3. CACHE LOOP ---
-    cache = None # This will be populated on the first step
-
-    for k in tqdm.tqdm(range(steps), desc="Denoising Steps", ncols=80):
-
-        # --- A. Predict Clean Sequence (x0_pred) ---
-        # On k=0, cache=None, the block runs in "Initialization" mode
-        # On k=1..N, cache is not None, the block runs in "Adaptive Update" mode
-        output = model(
-            input_attributes_main=xt_main,
-            input_attributes_accom=xt_accom,
-            genre=genre_tokens,
-            form=form_tokens,
-            cache=cache, 
-            return_dict=True
+    # 3. Check Streams
+    has_main = len(main_toks_full) > 0
+    has_accom = len(accom_toks_full) > 0
+    
+    # 4. Setup Windows
+    overlap_len = int(segment_len * overlap_ratio)
+    stride = segment_len - overlap_len 
+    total_len = max(len(main_toks_full), len(accom_toks_full))
+    num_windows = math.ceil(total_len / stride)
+    
+    final_main_seq = []
+    final_accom_seq = []
+    
+    # Initial Context (Fixed Prompt from File)
+    final_main_seq.extend(main_toks_full[:overlap_len])
+    final_accom_seq.extend(accom_toks_full[:overlap_len])
+    
+    print(f"Starting Style Transfer ({num_windows} windows, Start Ratio={start_ratio})...")
+    
+    for w in range(num_windows):
+        print(f"--- Window {w+1}/{num_windows} ---")
+        
+        ctx_main = final_main_seq[-overlap_len:]
+        ctx_accom = final_accom_seq[-overlap_len:]
+        
+        start_idx = overlap_len + (w * stride)
+        end_idx = start_idx + stride
+        
+        # Get Original Data for "New" part (to be transformed)
+        raw_main_new = main_toks_full[start_idx:end_idx] if has_main else []
+        raw_accom_new = accom_toks_full[start_idx:end_idx] if has_accom else []
+        
+        t_ctx_main = tokens_to_tensor(processor, ctx_main, device)
+        t_ctx_accom = tokens_to_tensor(processor, ctx_accom, device)
+        t_raw_main = tokens_to_tensor(processor, raw_main_new, device)
+        t_raw_accom = tokens_to_tensor(processor, raw_accom_new, device)
+        
+        # Run Diffusion on this Segment
+        gen_main_t, gen_accom_t = generate_segment(
+            model, processor,
+            t_ctx_main, t_ctx_accom,
+            t_raw_main, t_raw_accom,
+            g_tens, f_tens,
+            inference_steps, segment_len, start_ratio, temperature, device
         )
         
-        logits_main = output["logits_main"]
-        logits_accom = output["logits_accom"]
-        # cache = output["cache"] # Get the new cache for the next step
-        
-        # (Rest of sampling logic is unchanged)
-        x0_pred_main_list = []
-        x0_pred_accom_list = []
-        log_probs_main_list = []
-        log_probs_accom_list = []
-
-        # for i in range(NUM_ATTRIBUTES):
-        #     probs_main = F.softmax(logits_main[i] / temperature, dim=-1)
-        #     sampled_main = torch.multinomial(probs_main.view(-1, probs_main.shape[-1]), 1).view(B, L)
-        #     x0_pred_main_list.append(sampled_main)
-        #     probs_accom = F.softmax(logits_accom[i] / temperature, dim=-1)
-        #     sampled_accom = torch.multinomial(probs_accom.view(-1, probs_accom.shape[-1]), 1).view(B, L)
-        #     x0_pred_accom_list.append(sampled_accom)
-        #     log_probs_main = F.log_softmax(logits_main[i], dim=-1)
-        #     log_probs_accom = F.log_softmax(logits_accom[i], dim=-1)
-        #     log_probs_main_list.append(torch.gather(log_probs_main, -1, sampled_main.unsqueeze(-1)).squeeze(-1))
-        #     log_probs_accom_list.append(torch.gather(log_probs_accom, -1, sampled_accom.unsqueeze(-1)).squeeze(-1))
-
-        for i in range(NUM_ATTRIBUTES):
-            # Get the logits for the current attribute
-            attr_logits_main = logits_main[i]
-            attr_logits_accom = logits_accom[i]
-
-            # Set logits for tokens < 9 to -infinity to prevent sampling
-            attr_logits_main[..., :9] = -float('inf')
-            attr_logits_accom[..., :9] = -float('inf')
-
-            # Now, use the *modified* logits for sampling and log_probs
-            probs_main = F.softmax(attr_logits_main / temperature, dim=-1)
-            sampled_main = torch.multinomial(probs_main.view(-1, probs_main.shape[-1]), 1).view(B, L)
-            x0_pred_main_list.append(sampled_main)
+        if has_main:
+            new_main_toks = tensor_to_tokens(processor, gen_main_t)
+            final_main_seq.extend(new_main_toks)
             
-            probs_accom = F.softmax(attr_logits_accom / temperature, dim=-1)
-            sampled_accom = torch.multinomial(probs_accom.view(-1, probs_accom.shape[-1]), 1).view(B, L)
-            x0_pred_accom_list.append(sampled_accom)
-            
-            log_probs_main = F.log_softmax(attr_logits_main, dim=-1)
-            log_probs_accom = F.log_softmax(attr_logits_accom, dim=-1)
-            
-            log_probs_main_list.append(torch.gather(log_probs_main, -1, sampled_main.unsqueeze(-1)).squeeze(-1))
-            log_probs_accom_list.append(torch.gather(log_probs_accom, -1, sampled_accom.unsqueeze(-1)).squeeze(-1))
+        if has_accom:
+            new_accom_toks = tensor_to_tokens(processor, gen_accom_t)
+            final_accom_seq.extend(new_accom_toks)
 
-        x0_pred_main = torch.stack(x0_pred_main_list, dim=-1)
-        x0_pred_accom = torch.stack(x0_pred_accom_list, dim=-1)
-
-        # --- B. Decide Which Dynamic Tokens to Unmask ---
-        confidence_main = torch.stack(log_probs_main_list, dim=-1).sum(dim=-1)
-        confidence_accom = torch.stack(log_probs_accom_list, dim=-1).sum(dim=-1)
-        confidence_main[~current_iter_mask_main] = -float('inf')
-        confidence_accom[~current_iter_mask_accom] = -float('inf')
-
-        num_to_unmask_main = num_masked_per_step_main[:, k] - num_masked_per_step_main[:, k+1]
-        num_to_unmask_accom = num_masked_per_step_accom[:, k] - num_masked_per_step_accom[:, k+1]
-
-        max_main = current_iter_mask_main.sum(dim=-1)
-        max_accom = current_iter_mask_accom.sum(dim=-1)
-        min_val_tensor = torch.tensor(0, device=device, dtype=num_to_unmask_main.dtype)
+    # 5. Save
+    print("Decoding and Saving...")
+    if has_main:
+        midi_main = processor.tokens_to_midi(final_main_seq)
+        processor.save_midi(midi_main, output_path.replace(".mid", "_main.mid"))
+        print(f"Saved Main track.")
         
-        num_to_unmask_main = torch.clamp(num_to_unmask_main, min=min_val_tensor, max=max_main)
-        num_to_unmask_accom = torch.clamp(num_to_unmask_accom, min=min_val_tensor, max=max_accom)
-        
-        batch_indices = torch.arange(B, device=device).unsqueeze(-1)
-
-        if num_to_unmask_main.max() > 0:
-            k_main = num_to_unmask_main[0].item()
-            if k_main > 0:
-                top_k_indices_main = torch.topk(confidence_main, k=k_main, dim=-1).indices
-                xt_main[batch_indices, top_k_indices_main] = x0_pred_main[batch_indices, top_k_indices_main]
-                current_iter_mask_main[batch_indices, top_k_indices_main] = False
-
-        if num_to_unmask_accom.max() > 0:
-            k_accom = num_to_unmask_accom[0].item()
-            if k_accom > 0:
-                top_k_indices_accom = torch.topk(confidence_accom, k=k_accom, dim=-1).indices
-                xt_accom[batch_indices, top_k_indices_accom] = x0_pred_accom[batch_indices, top_k_indices_accom]
-                current_iter_mask_accom[batch_indices, top_k_indices_accom] = False
-
-        # --- C. **MANUALLY RESTORE STATIC TOKENS** ---
-        xt_main = torch.where(static_mask_main, original_static_main, xt_main)
-        xt_accom = torch.where(static_mask_accom, original_static_accom, xt_accom)
-
-    model.train() 
-    print("--- Generation Complete ---")
-    return xt_main, xt_accom
-
-
-def _collate_stream_for_inference(token_dict, mask_tensor, max_len, pad_id):
-    # (Unchanged)
-    try:
-        input_tensor = torch.stack([token_dict[attr] for attr in ATTR_ORDER], dim=1)
-    except KeyError as e:
-        print(f"Collate Error: Missing key {e}. Token dict keys: {token_dict.keys()}", file=sys.stderr)
-        raise
-    except RuntimeError as e:
-        print(f"Collate Error: Mismatched tensor lengths in dict. {e}", file=sys.stderr)
-        raise
-    seq_len = input_tensor.shape[0]
-    pad_len = max_len - seq_len
-    if pad_len > 0:
-        input_pad = torch.full((pad_len, NUM_ATTRIBUTES), pad_id, dtype=torch.long)
-        final_input = torch.cat([input_tensor, input_pad], dim=0)
-        mask_pad = torch.full((pad_len, NUM_ATTRIBUTES), False, dtype=torch.bool)
-        final_mask = torch.cat([mask_tensor, mask_pad], dim=0)
-    else:
-        final_input = input_tensor[:max_len]
-        final_mask = mask_tensor[:max_len]
-    return final_input, final_mask
-
+    if has_accom:
+        midi_accom = processor.tokens_to_midi(final_accom_seq)
+        processor.save_midi(midi_accom, output_path.replace(".mid", "_accom.mid"))
+        print(f"Saved Accom track.")
 
 if __name__ == "__main__":
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # --- 1. Load Model ---
-    model = ImprovNet.from_pretrained(CHECKPOINTS_DIR)
-    model.eval() # Set to eval mode
-    model.to(device)
-    print("Model loaded.")
-
-    processor = ProcessData()
-
-    # --- 2. Load and Process Data ---
-    (
-        corrupted_main_dict,
-        corrupted_accom_dict,
-        mask_main_tensor,
-        mask_accom_tensor,
-        original_main_dict,
-        original_accom_dict,
-        genre_token,
-        form_token
-    ) = processor.pretraining_pipeline(
-        file_path="/keshav/improvnet_2/improvnet/inference/debussy-clair-de-lune_original.mid", 
-        genre="classical", 
-        form="unknown", 
-        corruption_type="onset_duration_mask",
-        segment_length=MAX_LEN,
-        ratio=0.8,
-        apply_pitch_augmentation=False
-    )
-    print("Input data processed.")
-
-    # --- 3. Collate and Pad ---
-    corrupted_main, mask_main = _collate_stream_for_inference(
-        corrupted_main_dict, mask_main_tensor, MAX_LEN, PAD_TOKEN_ID
-    )
-    corrupted_accom, mask_accom = _collate_stream_for_inference(
-        corrupted_accom_dict, mask_accom_tensor, MAX_LEN, PAD_TOKEN_ID
-    )
-    corrupted_main = corrupted_main.unsqueeze(0).to(device)
-    mask_main = mask_main.unsqueeze(0).to(device)
-    corrupted_accom = corrupted_accom.unsqueeze(0).to(device)
-    mask_accom = mask_accom.unsqueeze(0).to(device)
-    genre_token = genre_token.to(device)
-    form_token = form_token.to(device)
-    
-    # --- 4. Generate ---
-    # MODIFICATION: Call the renamed function
-    generated_main, generated_accom = generate_with_cache(
-        model=model,
-        initial_main=corrupted_main,
-        initial_accom=corrupted_accom,
-        mask_main=mask_main,
-        mask_accom=mask_accom,
-        steps=128,
-        temperature=0.97,
-        genre_tokens=genre_token,
-        form_tokens=form_token
-    )
-    
-    generated_main = generated_main.squeeze(0)
-    generated_accom = generated_accom.squeeze(0)
-
-    # --- 5. Decode and Save ---
-    generated_main_dict = {ATTR_ORDER[i]: generated_main[:, i] for i in range(NUM_ATTRIBUTES)}
-    generated_accom_dict = {ATTR_ORDER[i]: generated_accom[:, i] for i in range(NUM_ATTRIBUTES)}
-    generated_sequence_main = processor.tensor_to_tokens(generated_main_dict)
-    generated_sequence_accom = processor.tensor_to_tokens(generated_accom_dict)
-
-    print("--- Generated Main Sequence (Head) ---")
-    print(generated_sequence_main[0:1024])
-    print("...")
-    # Write generated_sequence_main as a text file for inspection
-    with open("/keshav/improvnet_2/improvnet/inference/generated_main.txt", "w") as f:
-        for token in generated_sequence_main:
-            f.write(f"{token}\n")
-    print("Saved generated_main.txt")
-
-    midi_tokens_main = processor.tokens_to_midi(generated_sequence_main)
-    processor.save_midi(midi_tokens_main, "/keshav/improvnet_2/improvnet/inference/generated_main.mid")
-    print("Saved generated_main.mid")
-    
-    is_accom_empty = (generated_accom == PAD_TOKEN_ID).all()
-    
-    if not is_accom_empty:
-        print("Accompaniment stream found, decoding and saving...")
-        generated_accom_dict = {ATTR_ORDER[i]: generated_accom[:, i] for i in range(NUM_ATTRIBUTES)}
-        generated_sequence_accom = processor.tensor_to_tokens(generated_accom_dict)
-        print("--- Generated Accompaniment Sequence (Head) ---")
-        print(generated_sequence_accom[:15])
-        print("...")
-        midi_tokens_accom = processor.tokens_to_midi(generated_sequence_accom)
-        processor.save_midi(midi_tokens_accom, "/keshav/improvnet_2/improvnet/inference/generated_accom.mid")
-        print("Saved generated_accom.mid")
+    if len(sys.argv) > 3:
+        run_cascaded_generation(sys.argv[1], sys.argv[2], sys.argv[3])
     else:
-        print("Accompaniment stream is empty (all PAD tokens). Only saving main stream.")
+        print("Usage: python generate.py <ckpt> <input_mid> <output_mid>")

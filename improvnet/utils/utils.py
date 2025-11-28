@@ -43,11 +43,21 @@ def read_jsonl_files(data_dirs, split="train"):
 class ProcessData:
     def __init__(self):
         self.tokenizer = AbsTokenizer()
-        # Precompute suffix products for efficient masking (Linear schedule)
+        # --- MODIFICATION: Standard Cosine Schedule ---
+        # We precompute the mask probability for each step t directly.
+        # This represents the % of tokens masked in the "Composite" view.
+        # t=0 -> 0% masked (Clean)
+        # t=T -> 100% masked (Noise)
         steps = torch.arange(MAX_DIFFUSION_STEPS + 1, dtype=torch.float32)
-        mask_probs = steps / MAX_DIFFUSION_STEPS
-        # suffix_prod[t] = Product(alpha_t ... alpha_T)
-        self.suffix_prod = torch.cumprod(mask_probs.flip(0), dim=0).flip(0)
+        
+        # Cosine schedule (standard for diffusion)
+        # f(t) = cos((t/T + s) / (1+s) * pi/2)^2
+        # mask_ratio = 1 - f(t) / f(0)
+        # Simplified "Cosine-like" linear mapping for Discrete tokens often works well too, 
+        # but let's use a simple linear map for transparency first, or Cosine if preferred.
+        # Let's use Linear for predictability in debugging. 
+        # prob[t] = t / T
+        self.mask_probs = steps / MAX_DIFFUSION_STEPS
 
     def read_midi(self, file_path: str) -> MidiDict:
         try:
@@ -188,41 +198,35 @@ class ProcessData:
 
         return original_tokens, accompaniment_tokens, selected_instrument
 
+    def get_mask_prob_for_timestep(self, timestep: int) -> float:
+        """Returns the mask probability for a specific timestep."""
+        t_idx = min(max(0, int(timestep)), MAX_DIFFUSION_STEPS)
+        # Directly lookup the schedule value (Linear or Cosine)
+        return self.mask_probs[t_idx].item()
+    
     def apply_diffusion_mask(self, tokens: list, timestep: int, mask_token: str = "<MASK>") -> list:
         """
-        Applies Trajectory Re-composition Masking.
-        - Masks each attribute INDEPENDENTLY based on the effective probability.
-        - SKIPS masking for:
-            1. Start Token (<S>)
-            2. Prefix Tokens (('prefix', ...))
-        - Masks ALL other tokens (Notes, <E>, <T>, etc.)
+        Applies masking.
+        - Masks each attribute INDEPENDENTLY based on the schedule probability.
+        - SKIPS masking for Start Token (<S>) and Prefix Tokens.
         """
-        t_idx = min(timestep, MAX_DIFFUSION_STEPS)
-        effective_prob = self.suffix_prod[t_idx].item()
+        effective_prob = self.get_mask_prob_for_timestep(timestep)
         
         masked_tokens = []
         for tok in tokens:
-            # --- Safety Check ---
             if not isinstance(tok, tuple) or len(tok) == 0:
                 masked_tokens.append(tok)
                 continue
 
             first_field = tok[0]
-
-            # --- 1. Check for Exclusion (Start Token) ---
-            # Checks if the tuple is ('<S>', '<S>', ...)
             is_start_token = (first_field == '<S>')
-
-            # --- 2. Check for Exclusion (Prefix Token) ---
-            # Checks if the first field is (('prefix', ...), ...)
             is_prefix_token = (isinstance(first_field, tuple) and len(first_field) > 0 and first_field[0] == 'prefix')
 
             if is_start_token or is_prefix_token:
                 masked_tokens.append(tok)
                 continue
 
-            # --- 3. Apply Independent Attribute Masking ---
-            # This applies to Notes, <E>, and any other structural tokens not excluded above
+            # Apply Independent Attribute Masking
             new_tok = []
             for attr in tok:
                 if random.random() < effective_prob:
