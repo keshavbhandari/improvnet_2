@@ -1,5 +1,6 @@
 import os
 import sys
+import gc
 
 import torch
 import torch.distributed as dist
@@ -301,12 +302,31 @@ def main(rank, local_rank, device, train_loader, val_loader, args):
         num_training_steps=max_train_steps,
     )
 
-    # Restore optimizer/scheduler states
+    # # Restore optimizer/scheduler states
+    # if "optimizer" in training_state:
+    #     optimizer.load_state_dict(training_state["optimizer"])
+    # if "scheduler" in training_state:
+    #     lr_scheduler.load_state_dict(training_state["scheduler"])
+    # del training_state
+    
+    # Restore optimizer state (Keep Momentum)
     if "optimizer" in training_state:
         optimizer.load_state_dict(training_state["optimizer"])
-    if "scheduler" in training_state:
-        lr_scheduler.load_state_dict(training_state["scheduler"])
+        
+        # --- CRITICAL FIX: OVERRIDE LR MANUALLY ---
+        # This ensures momentum is kept, but the step size is reduced
+        print(f"[Rank {rank}] Overriding optimizer LR from checkpoint to {args.lr}")
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = args.lr  # Sets it to 2e-4 (from your config)
+
+    # SKIP restoring scheduler state
+    # We want a NEW scheduler curve that starts at 2e-4, not the old one
+    # if "scheduler" in training_state:
+    #    lr_scheduler.load_state_dict(training_state["scheduler"])
+    
     del training_state
+    gc.collect()                  # Force Python to free RAM
+    torch.cuda.empty_cache()      # Force PyTorch to free VRAM
 
     scaler = torch.amp.GradScaler()
     tb_writer = SummaryWriter(args.tensorboard_dir) if rank == 0 and args.use_tensorboard else None

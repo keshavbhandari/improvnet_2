@@ -29,13 +29,13 @@ MLP_MULT = 4                                   # Multiplier for the feedforward 
 NO_BIAS = False                               # Whether to use no bias in Linear layers
 USE_CHECKPOINTING = True                       # Whether to use gradient checkpointing
 
-BATCH_SIZE = 32 #8                                # Batch size for training
+BATCH_SIZE = 30 #8                                # Batch size for training
 NUM_WORKERS = 4                                 # Number of workers for data loading
-LR = 5e-4                                       # Learning rate for the optimizer
+LR = 2e-4                                       # Learning rate for the optimizer
 NUM_EPOCHS = 10                                 # Number of epochs for training
-GRADIENT_ACCUMULATION_STEPS = 1                 # Number of gradient accumulation steps
+GRADIENT_ACCUMULATION_STEPS = 2                 # Number of gradient accumulation steps
 GRADIENT_CHECKPOINTING = True                   # Whether to use gradient checkpointing
-LOAD_FROM_CHECKPOINT = False                     # Whether to load weights from a checkpoint
+LOAD_FROM_CHECKPOINT = True                     # Whether to load weights from a checkpoint
 USE_TENSORBOARD = True                          # Whether to use TensorBoard for logging
 LOG_STEP = 5                                    # Step interval for logging training progress
 DEBUG = False                                   # Whether to run in debug mode

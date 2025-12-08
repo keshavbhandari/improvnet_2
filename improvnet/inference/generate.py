@@ -266,7 +266,7 @@ def run_cascaded_generation(
     model_path, input_midi, output_path,
     genre_str="classical", form_str="unknown",
     segment_len=MAX_LEN, overlap_ratio=0.20,
-    inference_steps=3, start_ratio=0.99,
+    inference_steps=3, start_ratio=0.8,
     temperature=1.0
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
