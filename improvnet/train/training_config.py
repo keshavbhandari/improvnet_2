@@ -29,11 +29,13 @@ MLP_MULT = 4                                   # Multiplier for the feedforward 
 NO_BIAS = False                               # Whether to use no bias in Linear layers
 USE_CHECKPOINTING = True                       # Whether to use gradient checkpointing
 
-BATCH_SIZE = 30 #8                                # Batch size for training
+# 30 (BS) * 4 (GPUs) * 2 (Gradient Acc.) = 240 ---> This is how we trained on 4 A100 80GB GPUs. You need to adjust based on your hardware.
+
+BATCH_SIZE = 15                                 # Batch size for training
 NUM_WORKERS = 4                                 # Number of workers for data loading
 LR = 2e-4                                       # Learning rate for the optimizer
 NUM_EPOCHS = 10                                 # Number of epochs for training
-GRADIENT_ACCUMULATION_STEPS = 2                 # Number of gradient accumulation steps
+GRADIENT_ACCUMULATION_STEPS = 5                 # Number of gradient accumulation steps
 GRADIENT_CHECKPOINTING = True                   # Whether to use gradient checkpointing
 LOAD_FROM_CHECKPOINT = True                     # Whether to load weights from a checkpoint
 USE_TENSORBOARD = True                          # Whether to use TensorBoard for logging

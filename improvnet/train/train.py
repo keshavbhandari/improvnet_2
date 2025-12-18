@@ -206,40 +206,66 @@ def save_checkpoint(model, optimizer, scheduler, epoch, metrics, ckpt_dir, rank)
 
 
 def load_checkpoint(ckpt_dir, model_cls, device, rank):
-    """Load model + optimizer + scheduler + training metadata."""
+    """
+    Load model + optimizer + scheduler + training metadata.
+    Optimized to avoid OOM by NOT broadcasting the massive optimizer state.
+    """
     print(f"[Rank {rank}] 🔍 Loading checkpoint from {ckpt_dir}")
 
-    # --- Step 1: Synchronize Model Loading ---
+    # --- Step 1: Synchronize Model Loading (Weights) ---
+    # Ensure Rank 0 downloads/caches the model first if needed
     if rank != 0:
         dist.barrier()
     
+    # Load model weights (RAM efficient if safe_tensors/sharding is used by HF)
     model = model_cls.from_pretrained(ckpt_dir).to(device)
 
     if rank == 0:
         dist.barrier()
 
-    # --- Step 2: Load Training State (DDP-safe) ---
+    # --- Step 2: Handle Training State (Optimizer/Epoch) ---
     training_state_path = os.path.join(ckpt_dir, "training_state.pt")
     
+    # Initialize defaults
+    state = {}
+    epoch = 0
+    best_val_loss = float("inf")
+    ema_loss = None
+
     if os.path.exists(training_state_path):
+        # A. Broadcast ONLY Metadata (Tiny RAM footprint)
+        # We let Rank 0 peek at the file to get epoch/loss info
         if rank == 0:
-            print(f"[Rank 0] Loading 'training_state.pt' from disk...")
-            state = torch.load(training_state_path, map_location='cpu')
-            obj_list = [state]
+            print(f"[Rank 0] Reading training state metadata...")
+            # We load to CPU. 
+            # NOTE: If this file is truly massive (10GB+), even loading it once 
+            # might be tight. But we avoid the broadcast copy.
+            temp_state = torch.load(training_state_path, map_location='cpu')
+            
+            epoch = temp_state.get("epoch", 0)
+            best_val_loss = temp_state.get("best_val_loss", float("inf"))
+            ema_loss = temp_state.get("ema_train_loss", None)
+            
+            # Pack metadata into a list
+            metadata = [epoch, best_val_loss, ema_loss]
+            del temp_state # Free the temp reference immediately
+            gc.collect()   # Force cleanup
         else:
-            obj_list = [None]
+            metadata = [None, None, None]
+
+        # Broadcast small metadata (Negligible RAM usage)
+        dist.broadcast_object_list(metadata, src=0)
+        epoch, best_val_loss, ema_loss = metadata
         
-        dist.broadcast_object_list(obj_list, src=0)
-        state = obj_list[0]
-        
-        epoch = state.get("epoch", 0)
-        best_val_loss = state.get("best_val_loss", float("inf"))
-        ema_loss = state.get("ema_train_loss", None)
-        print(f"[Rank {rank}] Successfully loaded training state in memory.")
+        # B. Load Full State Individually
+        # Instead of broadcasting the huge dict, every rank loads it from disk.
+        # This prevents the "Pickling" memory spike.
+        print(f"[Rank {rank}] Loading full training state from disk...")
+        state = torch.load(training_state_path, map_location='cpu')
+        print(f"[Rank {rank}] State loaded successfully.")
     
     else:
         print(f"[Rank {rank}] No 'training_state.pt' found. Starting fresh.")
-        state, epoch, best_val_loss, ema_loss = {}, 0, float("inf"), None
 
     return model, state, epoch, best_val_loss, ema_loss
 
@@ -509,7 +535,11 @@ if __name__ == "__main__":
 
     # Create datasets and dataloaders
     train_dataset = ImprovnetDataset(train_files, split="train", train_type=args.train_type)
+    del train_files
+    gc.collect()
     val_dataset = ImprovnetDataset(validation_files, split="validation", train_type=args.train_type)
+    del validation_files
+    gc.collect()
     
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         train_dataset, num_replicas=world_size, rank=rank, shuffle=True
