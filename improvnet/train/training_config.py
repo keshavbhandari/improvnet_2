@@ -30,6 +30,7 @@ NO_BIAS = False                               # Whether to use no bias in Linear
 USE_CHECKPOINTING = True                       # Whether to use gradient checkpointing
 
 # Hardware-specific setting: Adjust BATCH_SIZE based on your GPU memory
+# 30 (BS) * 4 (GPUs) * 2 (Gradient Acc.) = 240 ---> This is how we trained on 4 A100 80GB GPUs. You need to adjust based on your hardware.
 BATCH_SIZE = 15                                 # Batch size for training
 NUM_WORKERS = 4                                 # Number of workers for data loading
 LR = 2e-4                                       # Learning rate for the optimizer
