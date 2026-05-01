@@ -266,7 +266,7 @@ def run_cascaded_generation(
     model_path, input_midi, output_path,
     genre_str="classical", form_str="unknown",
     segment_len=MAX_LEN, overlap_ratio=0.20,
-    inference_steps=3, start_ratio=0.8,
+    inference_steps=10, start_ratio=0.8,
     temperature=1.0
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -352,7 +352,7 @@ def run_cascaded_generation(
         print(f"Saved Accom track.")
 
 if __name__ == "__main__":
-    if len(sys.argv) > 3:
-        run_cascaded_generation(sys.argv[1], sys.argv[2], sys.argv[3])
-    else:
-        print("Usage: python generate.py <ckpt> <input_mid> <output_mid>")
+    model_path = "/gpfs/scratch/acw769/improvnet_new/pretraining/checkpoint/"
+    input_midi = "/data/home/acw769/improvnet_2/improvnet/inference/debussy-clair-de-lune_original.mid"
+    output_path = "/data/home/acw769/improvnet_2/improvnet/inference/output.mid"
+    run_cascaded_generation(model_path, input_midi, output_path)

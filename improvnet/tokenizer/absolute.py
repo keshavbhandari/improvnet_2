@@ -478,9 +478,10 @@ class AbsTokenizer(Tokenizer):
             add_dim_tok=add_dim_tok,
             add_eos_tok=add_eos_tok,
         )
-    
+
+
     def tokenize_compound(self, tokenized_seq: list[Token]) -> list[Token]:
-        """Converts tokenized sequence to compound token format.
+        """Converts tokenized sequence to compound token format, omitting prefixes.
 
         Args:
             tokenized_seq (list[Token]): Sequence of tokens to convert.
@@ -488,13 +489,11 @@ class AbsTokenizer(Tokenizer):
         Returns:
             list[Token]: Converted sequence of tokens.
         """
-
         compound_seq: list[Token] = []
         idx = 0
         while idx < len(tokenized_seq):
             tok = tokenized_seq[idx]
             if isinstance(tok, str):  # Special token
-                # compound_seq.append(tok)
                 compound_seq.append((tok, tok, tok, tok, tok))
                 idx += 1
             elif (
@@ -531,11 +530,8 @@ class AbsTokenizer(Tokenizer):
                     )
                 )
                 idx += 1
-            elif isinstance(tok, tuple) and "prefix" in tok:
-                # compound_seq.append(tok)
-                compound_seq.append(
-                    (tok, "<BLANK>", "<BLANK>", "<BLANK>", "<BLANK>")
-                )
+            elif isinstance(tok, tuple) and len(tok) > 0 and tok[0] == "prefix":
+                # Drop prefix tokens
                 idx += 1             
             else:
                 raise ValueError(f"Unexpected token format: {tok}")
@@ -574,8 +570,6 @@ class AbsTokenizer(Tokenizer):
         return self.tokenize_compound(tokenized_seq)
 
     def _detokenize_midi_dict(self, tokenized_seq: list[Token]) -> MidiDict:
-        # NOTE: These values chosen so that 1000 ticks = 1000ms, allowing us to
-        # skip converting between ticks and ms
         instrument_programs = self.config["instrument_programs"]
         TICKS_PER_BEAT: Final[int] = 500
         TEMPO: Final[int] = 500000
@@ -587,188 +581,138 @@ class AbsTokenizer(Tokenizer):
         pedal_msgs: list[PedalMessage] = []
         instrument_msgs: list[InstrumentMessage] = []
 
+        # 1. Dynamically scan standard sequence for unique instruments
         instrument_to_channel: dict[str, int] = {}
-
-        # Add non-drum instrument_msgs, breaks at first note token
         channel_idx = 0
-        curr_tick = 0
-        for idx, tok in enumerate(tokenized_seq):
-            if channel_idx == 9:  # Skip channel reserved for drums
-                channel_idx += 1
+        for tok in tokenized_seq:
+            if type(tok) is tuple and len(tok) >= 2:
+                _tok_type = tok[0]
+                if _tok_type == "drum":
+                    if "drum" not in instrument_to_channel:
+                        instrument_to_channel["drum"] = 9
+                        instrument_msgs.append(
+                            {"type": "instrument", "data": 0, "tick": 0, "channel": 9}
+                        )
+                elif _tok_type in self.instruments_nd:
+                    if _tok_type not in instrument_to_channel:
+                        if channel_idx == 9:  # Skip channel 9 (reserved for drums)
+                            channel_idx += 1
+                        instrument_to_channel[_tok_type] = channel_idx
+                        instrument_msgs.append(
+                            {"type": "instrument", "data": instrument_programs[_tok_type], "tick": 0, "channel": channel_idx}
+                        )
+                        channel_idx += 1
 
-            if tok in self.special_tokens:
-                if tok == self.time_tok:
-                    curr_tick += self.abs_time_step_ms
-                continue
-            elif (
-                tok[0] == "prefix"
-                and tok[1] == "instrument"
-                and tok[2] in self.instruments_wd
-            ):
-                # Process instrument prefix tokens
-                if tok[2] in instrument_to_channel.keys():
-                    logger.warning(f"Duplicate prefix {tok[2]}")
-                    continue
-                elif tok[2] == "drum":
-                    instrument_msgs.append(
-                        {
-                            "type": "instrument",
-                            "data": 0,
-                            "tick": 0,
-                            "channel": 9,
-                        }
-                    )
-                    instrument_to_channel["drum"] = 9
-                else:
-                    instrument_msgs.append(
-                        {
-                            "type": "instrument",
-                            "data": instrument_programs[tok[2]],
-                            "tick": 0,
-                            "channel": channel_idx,
-                        }
-                    )
-                    instrument_to_channel[tok[2]] = channel_idx
-                    channel_idx += 1
-            elif tok in self.prefix_tokens:
-                continue
-            else:
-                # Note, wait, or duration token
-                start = idx
-                break
-
-        if self.include_pedal:
+        if self.include_pedal and len(instrument_msgs) > 0:
             assert len(instrument_msgs) == 1
             assert instrument_msgs[0]["data"] == 0  # Piano
 
-        # Note messages
+        # 2. Extract messages based on chunked tracking via index loops
         note_msgs: list[NoteMessage] = []
-        for tok_1, tok_2, tok_3 in zip(
-            tokenized_seq[start:],
-            tokenized_seq[start + 1 :],
-            tokenized_seq[start + 2 :],
-        ):
-            if tok_1 in self.special_tokens:
-                _tok_type_1 = "special"
-            else:
-                _tok_type_1 = tok_1[0]
-            if tok_2 in self.special_tokens:
-                _tok_type_2 = "special"
-            else:
-                _tok_type_2 = tok_2[0]
-            if tok_3 in self.special_tokens:
-                _tok_type_3 = "special"
-            else:
-                _tok_type_3 = tok_3[0]
+        curr_tick = 0
+        idx = 0
+        
+        while idx < len(tokenized_seq):
+            tok_1 = tokenized_seq[idx]
 
-            if tok_1 == self.time_tok:
-                curr_tick += self.abs_time_step_ms
-            elif (
-                _tok_type_1 == "special"
-                or _tok_type_1 == "prefix"
-                or _tok_type_1 == "onset"
-                or _tok_type_1 == "dur"
-            ):
+            # Special Tokens
+            if tok_1 in self.special_tokens:
+                if tok_1 == self.time_tok:
+                    curr_tick += self.abs_time_step_ms
+                idx += 1
                 continue
-            elif tok_1 in {self.ped_on_tok, self.ped_off_tok}:
-                assert isinstance(
-                    tok_2[1], int
-                ), f"Expected int for onset, got {tok_2[1]}"
+                
+            # Fallback if prefixes somehow bleed in
+            if type(tok_1) is tuple and tok_1[0] == "prefix":
+                idx += 1
+                continue
+
+            # Pedal Events (Takes 2 blocks)
+            if tok_1 in {self.ped_on_tok, self.ped_off_tok}:
+                if idx + 1 >= len(tokenized_seq):
+                    break
+                tok_2 = tokenized_seq[idx + 1]
+                assert tok_2[0] == "onset", f"Expected onset after pedal, got {tok_2}"
+                assert isinstance(tok_2[1], int), f"Expected int for onset, got {tok_2[1]}"
 
                 _data = 1 if tok_1 == self.ped_on_tok else 0
                 _tick: int = curr_tick + tok_2[1]
                 pedal_msgs.append(
-                    {
-                        "type": "pedal",
-                        "data": _data,
-                        "tick": _tick,
-                        "channel": 0,
-                    }
+                    {"type": "pedal", "data": _data, "tick": _tick, "channel": 0}
                 )
-            elif _tok_type_1 == "drum" and _tok_type_2 == "onset":
-                assert isinstance(
-                    tok_2[1], int
-                ), f"Expected int for onset, got {tok_2[1]}"
-                assert isinstance(
-                    tok_1[1], int
-                ), f"Expected int for pitch, got {tok_1[1]}"
+                idx += 2
+                continue
 
-                _pitch: int = tok_1[1]
-                _channel = instrument_to_channel["drum"]
-                _velocity: int = self.config["drum_velocity"]
-                _start_tick: int = curr_tick + tok_2[1]
-                _end_tick: int = _start_tick + self.time_step_ms
+            # Note Events
+            if type(tok_1) is tuple:
+                _tok_type_1 = tok_1[0]
+                
+                # Drum Case (Takes 2 blocks)
+                if _tok_type_1 == "drum":
+                    if idx + 1 >= len(tokenized_seq):
+                        break
+                    tok_2 = tokenized_seq[idx + 1]
+                    if tok_2[0] != "onset":
+                        idx += 1
+                        continue
+                        
+                    assert isinstance(tok_2[1], int), f"Expected int for onset, got {tok_2[1]}"
+                    assert isinstance(tok_1[1], int), f"Expected int for pitch, got {tok_1[1]}"
 
-                if "drum" not in instrument_to_channel.keys():
-                    logger.warning(
-                        f"Tried to decode note message for unexpected instrument: drum"
-                    )
-                else:
+                    _pitch: int = tok_1[1]
                     _channel = instrument_to_channel["drum"]
-                    note_msgs.append(
-                        {
+                    _velocity: int = self.config["drum_velocity"]
+                    _start_tick: int = curr_tick + tok_2[1]
+                    _end_tick: int = _start_tick + self.time_step_ms
+
+                    note_msgs.append({
+                        "type": "note",
+                        "data": {"pitch": _pitch, "start": _start_tick, "end": _end_tick, "velocity": _velocity},
+                        "tick": _start_tick,
+                        "channel": _channel,
+                    })
+                    idx += 2
+                    continue
+                    
+                # Note Case (Takes 3 blocks)
+                elif _tok_type_1 in self.instruments_nd:
+                    if idx + 2 >= len(tokenized_seq):
+                        break
+                    tok_2 = tokenized_seq[idx + 1]
+                    tok_3 = tokenized_seq[idx + 2]
+                    
+                    if tok_2[0] != "onset" or tok_3[0] != "dur":
+                        idx += 1
+                        continue
+
+                    assert isinstance(tok_1[1], int), f"Expected int for pitch, got {tok_1[1]}"
+                    assert isinstance(tok_1[2], int), f"Expected int for velocity, got {tok_1[2]}"
+                    assert isinstance(tok_2[1], int), f"Expected int for onset, got {tok_2[1]}"
+                    assert isinstance(tok_3[1], int), f"Expected int for duration, got {tok_3[1]}"
+
+                    _instrument = tok_1[0]
+                    _pitch = tok_1[1]
+                    _velocity = tok_1[2]
+                    _start_tick = curr_tick + tok_2[1]
+                    _end_tick = _start_tick + tok_3[1]
+
+                    if _instrument in instrument_to_channel:
+                        _channel = instrument_to_channel[_instrument]
+                        note_msgs.append({
                             "type": "note",
-                            "data": {
-                                "pitch": _pitch,
-                                "start": _start_tick,
-                                "end": _end_tick,
-                                "velocity": _velocity,
-                            },
+                            "data": {"pitch": _pitch, "start": _start_tick, "end": _end_tick, "velocity": _velocity},
                             "tick": _start_tick,
                             "channel": _channel,
-                        }
-                    )
+                        })
+                    else:
+                        logger.warning(
+                            f"Tried to decode note message for unexpected instrument: {_instrument}"
+                        )
+                    idx += 3
+                    continue
 
-            elif (
-                _tok_type_1 in self.instruments_nd
-                and _tok_type_2 == "onset"
-                and _tok_type_3 == "dur"
-            ):
-                assert isinstance(
-                    tok_1[0], str
-                ), f"Expected str for instrument, got {tok_1[0]}"
-                assert isinstance(
-                    tok_1[1], int
-                ), f"Expected int for pitch, got {tok_1[1]}"
-                assert isinstance(
-                    tok_1[2], int
-                ), f"Expected int for velocity, got {tok_1[2]}"
-                assert isinstance(
-                    tok_2[1], int
-                ), f"Expected int for onset, got {tok_2[1]}"
-                assert isinstance(
-                    tok_3[1], int
-                ), f"Expected int for duration, got {tok_3[1]}"
-
-                _instrument = tok_1[0]
-                _pitch = tok_1[1]
-                _velocity = tok_1[2]
-                _start_tick = curr_tick + tok_2[1]
-                _end_tick = _start_tick + tok_3[1]
-
-                if _instrument not in instrument_to_channel.keys():
-                    logger.warning(
-                        f"Tried to decode note message for unexpected instrument: {_instrument} "
-                    )
-                else:
-                    _channel = instrument_to_channel[_instrument]
-                    note_msgs.append(
-                        {
-                            "type": "note",
-                            "data": {
-                                "pitch": _pitch,
-                                "start": _start_tick,
-                                "end": _end_tick,
-                                "velocity": _velocity,
-                            },
-                            "tick": _start_tick,
-                            "channel": _channel,
-                        }
-                    )
-            else:
-                logger.warning(
-                    f"Unexpected token sequence: {tok_1}, {tok_2}, {tok_3}"
-                )
+            logger.warning(f"Unexpected token sequence at index {idx}: {tok_1}")
+            idx += 1
 
         return MidiDict(
             meta_msgs=meta_msgs,
@@ -779,7 +723,7 @@ class AbsTokenizer(Tokenizer):
             ticks_per_beat=TICKS_PER_BEAT,
             metadata={},
         )
-    
+
     def detokenize_compound(self, tokenized_seq: list[Token]) -> list[Token]:
         """Converts compound token format back to standard token format.
 
@@ -789,14 +733,13 @@ class AbsTokenizer(Tokenizer):
         Returns:
             list[Token]: Converted sequence of standard tokens.
         """
-
         standard_seq: list[Token] = []
         for tok in tokenized_seq:
             if isinstance(tok[0], str):  # Special token
                 standard_seq.append(tok[0])
-            elif isinstance(tok[0], tuple):  # Prefix token
+            elif isinstance(tok[0], tuple):  
                 if tok[0][0] == "prefix":
-                    standard_seq.append(tok[0])
+                    continue # Safely skip if present
                 elif tok[0][0] == "instrument" and tok[0][1] == "drum":
                     standard_seq.append(("drum", tok[1][1])) # drum, pitch
                     standard_seq.append(("onset", tok[3][1])) # onset
@@ -804,6 +747,8 @@ class AbsTokenizer(Tokenizer):
                     standard_seq.append((tok[0][1], tok[1][1], tok[2][1])) # instrument, pitch, velocity
                     standard_seq.append(("onset", tok[3][1])) # onset
                     standard_seq.append(("dur", tok[4][1])) # duration
+                else:
+                    raise ValueError(f"Unexpected token format: {tok}")
             else:
                 raise ValueError(f"Unexpected token format: {tok}")
 

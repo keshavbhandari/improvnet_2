@@ -9,7 +9,7 @@ from typing import Optional, Tuple, List
 
 # --- IMPORTANT ---
 # Make sure this import points to your model file
-from model_with_cache import ImprovNet, ImprovNetConfig
+from improvnet_2.improvnet.model.model_with_cache_old import ImprovNet, ImprovNetConfig
 
 # --- Constants for this Test ---
 NUM_ATTRIBUTES = 6

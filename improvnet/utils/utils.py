@@ -3,29 +3,9 @@ import copy
 import os
 import json
 import torch
-import math
-import torch.distributed as dist
 from improvnet.tokenizer.midi import MidiDict
 from improvnet.tokenizer.absolute import AbsTokenizer
 
-# Constants for Diffusion
-MAX_DIFFUSION_STEPS = 1000 
-
-def setup_distributed():
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count()))
-    else:
-        rank = 0
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        world_size = 1
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl", init_method="env://")
-    return rank, local_rank, world_size
-
-def cleanup():
-    dist.destroy_process_group()
 
 def read_jsonl_files(data_dirs, split="train"):
     files = []
@@ -43,21 +23,6 @@ def read_jsonl_files(data_dirs, split="train"):
 class ProcessData:
     def __init__(self):
         self.tokenizer = AbsTokenizer()
-        # --- MODIFICATION: Standard Cosine Schedule ---
-        # We precompute the mask probability for each step t directly.
-        # This represents the % of tokens masked in the "Composite" view.
-        # t=0 -> 0% masked (Clean)
-        # t=T -> 100% masked (Noise)
-        steps = torch.arange(MAX_DIFFUSION_STEPS + 1, dtype=torch.float32)
-        
-        # Cosine schedule (standard for diffusion)
-        # f(t) = cos((t/T + s) / (1+s) * pi/2)^2
-        # mask_ratio = 1 - f(t) / f(0)
-        # Simplified "Cosine-like" linear mapping for Discrete tokens often works well too, 
-        # but let's use a simple linear map for transparency first, or Cosine if preferred.
-        # Let's use Linear for predictability in debugging. 
-        # prob[t] = t / T
-        self.mask_probs = steps / MAX_DIFFUSION_STEPS
 
     def read_midi(self, file_path: str) -> MidiDict:
         try:
@@ -127,115 +92,90 @@ class ProcessData:
                 event.append(id_to_tok[tok_id])
             compound_tokens.append(tuple(event))
         return compound_tokens
-
-    def genre_form_to_tensor(self, genre: str | None, form: str | None) -> dict[str, torch.Tensor]:
-        genre_token = genre if genre is not None else 'unknown'
-        form_token = form if form is not None else 'unknown'
-        genre_id = self.tokenizer.tok_to_id_genre.get(genre_token, self.tokenizer.tok_to_id_genre['unknown'])
-        form_id = self.tokenizer.tok_to_id_form.get(form_token, self.tokenizer.tok_to_id_form['unknown'])
-        return {
-            'genre': torch.tensor([genre_id], dtype=torch.long),
-            'form': torch.tensor([form_id], dtype=torch.long)
-        }
-
-    def split_instrument_tokens(self, tokens: list) -> tuple[list, list | None, str | None]:
-        """
-        Splits a compound token sequence into two groups based on a randomly chosen instrument.
         
-        Routes:
-        1. Prefix tokens -> Only to the channel of that specific instrument.
-        2. Note tokens -> Only to the channel of that specific instrument.
-        3. Structural tokens (<S>, <E>) -> To BOTH channels (to maintain valid sequence structure).
+    def skyline_groundline(self, tokens: list, algorithm: str) -> list:
         """
-        
-        # 1. Identify instruments present in the NOTES
-        # We scan note events, not prefixes, to ensure we split based on actual content
-        unique_instruments = {
-            tok[0][1] for tok in tokens
-            if isinstance(tok, tuple) and len(tok) > 0 
-            and isinstance(tok[0], tuple) and len(tok[0]) == 2 
-            and tok[0][0] == "instrument"
-        }
-
-        # If 0 or 1 instrument, return as Main, with None for Accompaniment
-        if len(unique_instruments) <= 1:
-            return tokens, None, None
-
-        selected_instrument = random.choice(list(unique_instruments))
-        accompaniment_tokens = []
-        original_tokens = []
-
-        for tok in tokens:
-            if not isinstance(tok, tuple) or len(tok) == 0:
-                continue 
-            
-            first_field = tok[0]
-
-            # --- Case A: Prefix Token ---
-            # Format: (('prefix', 'instrument', 'Name'), ...)
-            if isinstance(first_field, tuple) and len(first_field) == 3 and first_field[0] == "prefix":
-                inst_name = first_field[2]
-                if inst_name == selected_instrument:
-                    accompaniment_tokens.append(tok)
-                else:
-                    original_tokens.append(tok)
-
-            # --- Case B: Note Token ---
-            # Format: (('instrument', 'Name'), ...)
-            elif isinstance(first_field, tuple) and len(first_field) == 2 and first_field[0] == "instrument":
-                inst_name = first_field[1]
-                if inst_name == selected_instrument:
-                    accompaniment_tokens.append(tok)
-                else:
-                    original_tokens.append(tok)
-
-            # --- Case C: Structural Tokens (<S>, <E>, etc.) ---
-            # Format: ('<S>', '<S>', ...)
-            else:
-                # Send structural tokens to BOTH streams so they remain valid sequences
-                accompaniment_tokens.append(tok)
-                original_tokens.append(tok)
-
-        return original_tokens, accompaniment_tokens, selected_instrument
-
-    def get_mask_prob_for_timestep(self, timestep: int) -> float:
-        """Returns the mask probability for a specific timestep."""
-        t_idx = min(max(0, int(timestep)), MAX_DIFFUSION_STEPS)
-        # Directly lookup the schedule value (Linear or Cosine)
-        return self.mask_probs[t_idx].item()
-    
-    def apply_diffusion_mask(self, tokens: list, timestep: int, mask_token: str = "<MASK>") -> list:
+        Keeps only the highest pitch note from each chord (skyline) or masks it (groundline).
+        Replaces masked notes completely with <BLANK> across all 5 attributes.
         """
-        Applies masking.
-        - Masks each attribute INDEPENDENTLY based on the schedule probability.
-        - SKIPS masking for Start Token (<S>) and Prefix Tokens.
+        blank_tuple = ('<BLANK>', '<BLANK>', '<BLANK>', '<BLANK>', '<BLANK>')
+        notes = []
+        
+        for i, t in enumerate(tokens):
+            # Ensure it's a standard note compound token (not a special string token like <S>)
+            if isinstance(t, tuple) and len(t) == 5 and isinstance(t[0], tuple) and t[0][0] == 'instrument':
+                notes.append({
+                    "pitch": t[1][1],
+                    "onset": t[3][1] if t[3][1] is not None else 0,
+                    "orig_idx": i
+                })
+
+        if not notes:
+            return list(tokens)
+
+        # Group notes into chords (notes with onset within 50ms)
+        chords = []
+        i = 0
+        k = len(notes)
+        WINDOW_MS = 50
+        
+        while i < k:
+            start = notes[i]["onset"]
+            chord = [notes[i]]
+            j = i + 1
+            while j < k and abs(notes[j]["onset"] - start) <= WINDOW_MS:
+                chord.append(notes[j])
+                j += 1
+            chords.append(chord)
+            i = j  # BUG FIX: Skip ahead past the notes we just grouped
+
+        # Choose melody per chord (highest pitch)
+        melody_pitch_indices = set()
+        for chord in chords:
+            max_pitch = max(n["pitch"] for n in chord)
+            candidates = [n for n in chord if n["pitch"] == max_pitch]
+            # Choose the first one encountered (earliest in original sequence)
+            chosen = min(candidates, key=lambda n: n["orig_idx"])
+            melody_pitch_indices.add(chosen["orig_idx"])
+
+        out_tokens = list(tokens)
+        for note in notes:
+            idx = note["orig_idx"]
+            if algorithm == "skyline" and idx not in melody_pitch_indices:
+                # Mask non-melody notes
+                out_tokens[idx] = blank_tuple
+            elif algorithm == "groundline" and idx in melody_pitch_indices:
+                # Mask melody notes
+                out_tokens[idx] = blank_tuple
+
+        return out_tokens
+
+    def extract_rhythm(self, tokens: list, ratio: float = 1.0) -> list:
         """
-        effective_prob = self.get_mask_prob_for_timestep(timestep)
-        
-        masked_tokens = []
-        for tok in tokens:
-            if not isinstance(tok, tuple) or len(tok) == 0:
-                masked_tokens.append(tok)
-                continue
+        Masks instrument, pitch, and velocity fields in selected notes with <BLANK>.
+        Leaves onset and duration intact.
+        """
+        augmented_tokens = copy.deepcopy(tokens)
 
-            first_field = tok[0]
-            is_start_token = (first_field == '<S>')
-            is_prefix_token = (isinstance(first_field, tuple) and len(first_field) > 0 and first_field[0] == 'prefix')
+        # Find indices of valid note compound tokens
+        note_indices = [
+            i for i, event in enumerate(augmented_tokens)
+            if isinstance(event, tuple) and len(event) == 5 and isinstance(event[0], tuple) and event[0][0] == 'instrument'
+        ]
 
-            if is_start_token or is_prefix_token:
-                masked_tokens.append(tok)
-                continue
+        # Select notes to mask
+        num_to_mask = int(len(note_indices) * ratio)
+        mask_notes = random.sample(note_indices, num_to_mask)
 
-            # Apply Independent Attribute Masking
-            new_tok = []
-            for attr in tok:
-                if random.random() < effective_prob:
-                    new_tok.append(mask_token)
-                else:
-                    new_tok.append(attr)
-            masked_tokens.append(tuple(new_tok))
-        
-        return masked_tokens
+        for i in mask_notes:
+            event_list = list(augmented_tokens[i])
+            for j, field in enumerate(event_list):
+                # Mask Instrument, Pitch, and Velocity
+                if isinstance(field, tuple) and field[0] in ('instrument', 'pitch', 'velocity'):
+                    event_list[j] = '<BLANK>'
+            augmented_tokens[i] = tuple(event_list)
+
+        return augmented_tokens
     
     def pitch_augmentation(self, tokens: list) -> list:
         semitone_shift = random.randint(-7, 7)
@@ -249,106 +189,52 @@ class ProcessData:
                     new_event[j] = ('pitch', new_pitch)
             augmented_tokens[i] = tuple(new_event)
         return augmented_tokens
-
+    
     def get_random_segment_from_data(self, tokens: list, segment_length: int) -> list:
         if len(tokens) <= segment_length:
             return tokens
         max_start = len(tokens) - segment_length
         start = random.randint(0, max_start)
         return tokens[start : start + segment_length]
-
-    def pretraining_pipeline(self, file_path: str, genre: str | None, form: str | None,
-                         segment_length: int, **kwargs) -> tuple:
-        """
-        New Pipeline for Amortized ImprovNet.
-        - Swaps channels 50% of the time (even for Solo).
-        - Pads empty channels with '2' (PAD) to match the length of the active channel.
-        """
-        # 1. Read and Preprocess
-        midi_dict = self.read_midi(file_path)
-        tokens = self.midi_to_tokens(midi_dict)
-        segment_tokens = self.get_random_segment_from_data(tokens, segment_length)
-
-        if kwargs.get('apply_pitch_augmentation', True):
-            segment_tokens = self.pitch_augmentation(segment_tokens)
-
-        # 2. Split Main vs Accompaniment
-        main_tokens, accomp_tokens, _ = self.split_instrument_tokens(segment_tokens)
-        
-        # Normalize None to []
-        if main_tokens is None: main_tokens = []
-        if accomp_tokens is None: accomp_tokens = []
-
-        # 3. Channel Swapping (Data Augmentation)
-        # Always swap 50% of the time, regardless of content
-        if random.random() < 0.5:
-            main_tokens, accomp_tokens = accomp_tokens, main_tokens
-
-        # 4. Sample Diffusion Timestep t ~ U[1, T]
-        timestep = random.randint(1, MAX_DIFFUSION_STEPS)
-
-        # 5. Create Encoder Input (Noisy)
-        # Apply mask to whatever is in the channel (could be empty)
-        encoder_main = self.apply_diffusion_mask(main_tokens, timestep)
-        encoder_accom = self.apply_diffusion_mask(accomp_tokens, timestep)
-
-        # 6. Convert to Tensors (with smart padding)
-        # If a channel is empty, we create a PAD tensor of the same length as the OTHER channel.
-        # This ensures the model sees [Active, PAD] or [PAD, Active].
-        
-        def to_tensors_or_pad(target_tokens, ref_tokens):
-            if target_tokens:
-                return self.tokens_to_tensor(target_tokens)
-            elif ref_tokens:
-                # Target is empty, but Ref has content -> Create PADs of len(Ref)
-                ref_tensors = self.tokens_to_tensor(ref_tokens)
-                # Fill with 2 (PAD ID)
-                return {k: torch.full_like(v, fill_value=2) for k, v in ref_tensors.items()}
-            else:
-                # Both empty? (Shouldn't happen with valid files, but safe fallback)
-                # Return single step PAD
-                dummy = torch.tensor([2], dtype=torch.long)
-                keys = ['instrument', 'pitch', 'velocity', 'onset', 'duration']
-                return {k: dummy for k in keys}
-
-        # Decoder Tensors (Clean Targets)
-        dec_main_tensors = to_tensors_or_pad(main_tokens, accomp_tokens)
-        dec_accom_tensors = to_tensors_or_pad(accomp_tokens, main_tokens)
-
-        # Encoder Tensors (Noisy Sources)
-        enc_main_tensors = to_tensors_or_pad(encoder_main, encoder_accom)
-        enc_accom_tensors = to_tensors_or_pad(encoder_accom, encoder_main)
-
-        # Conditions
-        genre_form_dict = self.genre_form_to_tensor(genre, form)
-        timestep_tensor = torch.tensor([timestep], dtype=torch.long)
-
-        return (
-            enc_main_tensors,
-            enc_accom_tensors,
-            dec_main_tensors,
-            dec_accom_tensors,
-            genre_form_dict['genre'],
-            genre_form_dict['form'],
-            timestep_tensor
-        )
     
-    def inference_pipeline(self, file_path: str, genre: str | None, form: str | None):
+    def format_into_patches(
+        self, 
+        token_tensors: dict[str, torch.Tensor], 
+        patch_size: int, 
+        n_patches: int
+    ) -> torch.Tensor:
         """
-        Reads a MIDI file and prepares the FULL sequence without cropping.
-        Returns lists of tokens (not tensors) to be sliced by the generator.
+        Pads sequences to the target length and reshapes them into patches.
+        Returns a tensor of shape [n_patches, patch_size, 5].
         """
-        # 1. Read
-        midi_dict = self.read_midi(file_path)
-        tokens = self.midi_to_tokens(midi_dict)
+        token_types = ['instrument', 'pitch', 'velocity', 'onset', 'duration']
+        target_len = patch_size * n_patches
+        seq_len = len(token_tensors['instrument'])
         
-        # 2. Split (No Augmentation or Cropping)
-        main_tokens, accomp_tokens, _ = self.split_instrument_tokens(tokens)
-        
-        if main_tokens is None: main_tokens = []
-        if accomp_tokens is None: accomp_tokens = []
+        stacked_tensors = []
+        for token_type in token_types:
+            tensor = token_tensors[token_type]
+            
+            # Truncate if somehow longer than the target length
+            if seq_len > target_len:
+                tensor = tensor[:target_len]
+            
+            # Pad if shorter than the target length
+            elif seq_len < target_len:
+                # Retrieve the specific padding ID for this attribute vocabulary
+                tok_to_id = getattr(self.tokenizer, f"tok_to_id_{token_type}")
+                pad_id = tok_to_id.get('<P>')
+                if pad_id is None:
+                    raise KeyError(f"Padding token '<P>' not found in vocab for '{token_type}'")
+                
+                padding = torch.full((target_len - seq_len,), pad_id, dtype=torch.long)
+                tensor = torch.cat([tensor, padding])
+                
+            stacked_tensors.append(tensor)
 
-        # 3. Prepare Conditions
-        genre_form = self.genre_form_to_tensor(genre, form)
+        # Stack into shape: [target_len, 5]
+        combined = torch.stack(stacked_tensors, dim=-1)
         
-        return main_tokens, accomp_tokens, genre_form['genre'], genre_form['form']
+        # Reshape into patches: [n_patches, patch_size, 5]
+        patched = combined.view(n_patches, patch_size, len(token_types))
+        return patched
