@@ -24,6 +24,19 @@ class ProcessData:
     def __init__(self):
         self.tokenizer = AbsTokenizer()
 
+    # Define the canonical order of the 40 instrument classes for the multi-hot vector
+    INSTRUMENT_CLASSES = [
+        "Acoustic Piano", "Electric Piano", "Chromatic Percussion", "Organ", 
+        "Acoustic Guitar", "Clean Electric Guitar", "Distorted Electric Guitar", 
+        "Acoustic Bass", "Electric Bass", "Violin", "Viola", "Cello", "Contrabass", 
+        "Orchestral Harp", "Timpani", "String Ensemble", "Synth Strings", 
+        "Choir and Voice", "Orchestra Hit", "Trumpet", "Trombone", "Tuba", 
+        "French Horn", "Brass Section", "Soprano/Alto Sax", "Tenor Sax", 
+        "Baritone Sax", "Oboe", "English Horn", "Bassoon", "Clarinet", "Piccolo", 
+        "Flute", "Pipe", "Synth Lead", "Synth Pad", "Synth Effect", "Ethnic", 
+        "Percussive", "Sound Effects"
+    ]
+
     def read_midi(self, file_path: str) -> MidiDict:
         try:
             midi_dict = MidiDict.from_midi(file_path)
@@ -190,51 +203,151 @@ class ProcessData:
             augmented_tokens[i] = tuple(new_event)
         return augmented_tokens
     
-    def get_random_segment_from_data(self, tokens: list, segment_length: int) -> list:
-        if len(tokens) <= segment_length:
-            return tokens
-        max_start = len(tokens) - segment_length
-        start = random.randint(0, max_start)
-        return tokens[start : start + segment_length]
+    # def get_random_segment_from_data(self, tokens: list, segment_length: int) -> list:
+    #     if len(tokens) <= segment_length:
+    #         return tokens
+    #     max_start = len(tokens) - segment_length
+    #     start = random.randint(0, max_start)
+    #     return tokens[start : start + segment_length]
     
-    def format_into_patches(
+    def get_aligned_random_segment(self, tokens: list, target_len: int) -> list:
+        """
+        Slices a segment of tokens, ensuring the slice always starts at the 
+        beginning of a 5-second window (onset == 0 or reset token).
+        """
+        total_len = len(tokens)
+        if total_len <= target_len:
+            return tokens
+            
+        # 1. Find all valid starting indices where a new 5-second window begins.
+        # Adjust the condition based on how your <T> tokens or onsets are formatted.
+        valid_start_indices = []
+        for i, event in enumerate(tokens):
+            # Assuming event is a tuple of tuples: (('instrument', '...'), ..., ('onset', val))
+            # We look for the onset value.
+            for attr in event:
+                if attr[0] == 'onset' and attr[1] == 0:
+                    valid_start_indices.append(i)
+                    break
+        
+        # Fallback to pure random if no 0-onsets are found (rare, but safe)
+        if not valid_start_indices:
+            start_idx = random.randint(0, total_len - target_len)
+            return tokens[start_idx : start_idx + target_len]
+            
+        # 2. Filter out indices that are too close to the end of the song
+        valid_start_indices = [idx for idx in valid_start_indices if idx <= total_len - target_len]
+        
+        # If the song is long but we only found windows near the very end, fallback to the last valid window
+        if not valid_start_indices:
+            start_idx = total_len - target_len
+            return tokens[start_idx : start_idx + target_len]
+            
+        # 3. Pick a random, aligned starting point!
+        start_idx = random.choice(valid_start_indices)
+        
+        return tokens[start_idx : start_idx + target_len]
+    
+    def format_sequence(
         self, 
         token_tensors: dict[str, torch.Tensor], 
-        patch_size: int, 
-        n_patches: int
+        seq_len: int
     ) -> torch.Tensor:
         """
-        Pads sequences to the target length and reshapes them into patches.
-        Returns a tensor of shape [n_patches, patch_size, 5].
+        Pads or truncates sequences to the exact seq_len and stacks them.
+        Returns a tensor of shape [seq_len, 5].
         """
         token_types = ['instrument', 'pitch', 'velocity', 'onset', 'duration']
-        target_len = patch_size * n_patches
-        seq_len = len(token_tensors['instrument'])
+        current_len = len(token_tensors['instrument'])
         
         stacked_tensors = []
         for token_type in token_types:
             tensor = token_tensors[token_type]
             
-            # Truncate if somehow longer than the target length
-            if seq_len > target_len:
-                tensor = tensor[:target_len]
+            # Truncate if longer than seq_len
+            if current_len > seq_len:
+                tensor = tensor[:seq_len]
             
-            # Pad if shorter than the target length
-            elif seq_len < target_len:
+            # Pad if shorter than seq_len
+            elif current_len < seq_len:
                 # Retrieve the specific padding ID for this attribute vocabulary
                 tok_to_id = getattr(self.tokenizer, f"tok_to_id_{token_type}")
                 pad_id = tok_to_id.get('<P>')
                 if pad_id is None:
                     raise KeyError(f"Padding token '<P>' not found in vocab for '{token_type}'")
                 
-                padding = torch.full((target_len - seq_len,), pad_id, dtype=torch.long)
+                padding = torch.full((seq_len - current_len,), pad_id, dtype=torch.long)
                 tensor = torch.cat([tensor, padding])
                 
             stacked_tensors.append(tensor)
 
-        # Stack into shape: [target_len, 5]
-        combined = torch.stack(stacked_tensors, dim=-1)
+        # Stack into shape: [seq_len, 5]
+        formatted_tensor = torch.stack(stacked_tensors, dim=-1)
+        return formatted_tensor
+    
+    def get_instrument_multihot(self, tokens: list) -> torch.Tensor:
+        """
+        Parses compound tokens to find active instruments and returns a 40-dim multi-hot tensor.
+        Assumes token structure: (('instrument', 'Oboe'), ('pitch', 74), ...)
+        """
+        active_instruments = set()
+        for event in tokens:
+            # Extract the string value from the first attribute tuple
+            inst_name = event[0][1] 
+            
+            # Map the specific GM instrument back to its broader category if necessary
+            # (Assuming inst_name matches the keys in your INSTRUMENT_CLASSES)
+            if inst_name in self.INSTRUMENT_CLASSES:
+                active_instruments.add(inst_name)
         
-        # Reshape into patches: [n_patches, patch_size, 5]
-        patched = combined.view(n_patches, patch_size, len(token_types))
-        return patched
+        # Build the 40-dim tensor
+        multi_hot = torch.zeros(len(self.INSTRUMENT_CLASSES), dtype=torch.float32)
+        for i, cls_name in enumerate(self.INSTRUMENT_CLASSES):
+            if cls_name in active_instruments:
+                multi_hot[i] = 1.0
+                
+        return multi_hot
+    
+    def extract_conditioning_segments(
+        self, 
+        tokens: list, 
+        min_notes: int = 4, 
+        max_notes: int = 128
+    ) -> dict:
+        """
+        Extracts independent random segments from the original piece for conditioning.
+        Applies specific masking/augmentations to each segment.
+        """
+        total_len = len(tokens)
+        
+        def _get_random_slice():
+            # Safely handle extremely short sequences
+            if total_len == 0:
+                return []
+                
+            # Ensure the minimum is never larger than the sequence itself
+            actual_min = min(min_notes, total_len)
+            actual_max = min(max_notes, total_len)
+            
+            seg_len = random.randint(actual_min, actual_max)
+            start_idx = random.randint(0, total_len - seg_len)
+            return tokens[start_idx : start_idx + seg_len]
+
+        # 1. Melody Segment (Skyline)
+        melody_slice = _get_random_slice()
+        melody_cond = self.skyline_groundline(melody_slice, algorithm="skyline")
+
+        # 2. Harmony Segment (Groundline + Pitch Augmentation)
+        harmony_slice = _get_random_slice()
+        harmony_base = self.skyline_groundline(harmony_slice, algorithm="groundline")
+        harmony_cond = self.pitch_augmentation(harmony_base)
+
+        # 3. Rhythm Segment (Extract Rhythm)
+        rhythm_slice = _get_random_slice()
+        rhythm_cond = self.extract_rhythm(rhythm_slice, ratio=1.0)
+        
+        return {
+            "melody": melody_cond,
+            "harmony": harmony_cond,
+            "rhythm": rhythm_cond
+        }

@@ -733,8 +733,20 @@ class AbsTokenizer(Tokenizer):
         Returns:
             list[Token]: Converted sequence of standard tokens.
         """
-        standard_seq: list[Token] = []
+
+        valid_seq = []
+        # If any compound note tuple contains '<T>' tokens but is has less than 5 '<T>' tokens, it's likely malformed and we should drop it
         for tok in tokenized_seq:
+            count_t_toks = tok.count("<T>")
+            count_d_toks = tok.count("<D>")
+            if count_t_toks > 0 and count_t_toks < 5:
+                continue
+            if count_d_toks > 0 and count_d_toks < 5:
+                continue
+            valid_seq.append(tok) 
+
+        standard_seq: list[Token] = []
+        for tok in valid_seq:
             if isinstance(tok[0], str):  # Special token
                 standard_seq.append(tok[0])
             elif isinstance(tok[0], tuple):  
@@ -750,7 +762,7 @@ class AbsTokenizer(Tokenizer):
                 else:
                     raise ValueError(f"Unexpected token format: {tok}")
             else:
-                raise ValueError(f"Unexpected token format: {tok}")
+                raise ValueError(f"Unexpected token format: {tok}")           
 
         return standard_seq
 
