@@ -5,9 +5,9 @@ import sys
 import math
 import os
 
-from improvnet.model.model import AmortizedImprovNet, ImprovNetConfig
-from improvnet.utils.utils import ProcessData, MAX_DIFFUSION_STEPS
-from improvnet.train.training_config import *
+from improvnet.archive.dd_model.model import AmortizedImprovNet, ImprovNetConfig
+from improvnet.utils.diffusion_utils import ProcessData, MAX_DIFFUSION_STEPS
+from improvnet.archive.train.training_config import *
 
 # --- Constants ---
 ATTR_ORDER = ['instrument', 'pitch', 'velocity', 'onset', 'duration']

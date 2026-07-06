@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from improvnet.model.config_fm import MAX_LATENT_SEQ_LEN
+from improvnet.flow_model.config_fm import MAX_LATENT_SEQ_LEN
 
 # ---------------------------------------------------------------------------
 # Flow Matching Utilities

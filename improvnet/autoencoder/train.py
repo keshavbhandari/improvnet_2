@@ -16,9 +16,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from improvnet.autoencoder.config import (
-    SEQ_LEN, BATCH_SIZE, ACCUM_STEPS, N_STEPS, WARMUP_STEPS, LOG_EVERY,
+    SEQ_LEN, TARGET_BETA, BATCH_SIZE, ACCUM_STEPS, N_STEPS, WARMUP_STEPS, LOG_EVERY,
     GRAD_CLIP, VAL_EVERY, SAVE_DIR, VAL_LOG_FILE, RESUME_TRAINING, 
-    JSONL_FILES, RUN_NAME, CONSISTENCY_WEIGHT
+    JSONL_FILES, RUN_NAME
 )
 from improvnet.autoencoder.model import ContinuousAutoencoder
 from improvnet.utils.utils import ProcessData
@@ -265,7 +265,7 @@ def train(n_steps: int = N_STEPS):
 
     writer = None
     if is_main_process:
-        print("=" * 70 + "\n1:1 Sequence FSQ Autoencoder\n" + "=" * 70)
+        print("=" * 70 + "\nContinuous VAE (Beta-VAE)\n" + "=" * 70)
         log_dir = os.path.join(SAVE_DIR, "runs", RUN_NAME)
         writer = SummaryWriter(log_dir=log_dir)
 
@@ -293,7 +293,7 @@ def train(n_steps: int = N_STEPS):
         start_step, best_val_loss = load_checkpoint(model, optimizer, scheduler, device)
 
     # Add trackers for the new loss components
-    running_loss, running_ce, running_cons, running_l2, running_acc, log_steps = 0.0, 0.0, 0.0, 0.0, 0.0, 0
+    running_loss, running_ce, running_kl, running_acc, log_steps = 0.0, 0.0, 0.0, 0.0, 0
     model.train()
     step, epoch = start_step, 0
 
@@ -306,12 +306,15 @@ def train(n_steps: int = N_STEPS):
             x = x.to(device)
             
             with amp_context(AMP_DTYPE):
-                # --- THE FIX: Trigger the Double-Decode ---
-                logits_noisy, logits_clean, z, z_raw = model(x, compute_consistency=True)
+                logits_list, mu, logvar = model(x)
                 
-                # Calculate the joint loss
+                # --- KL Annealing ---
+                # Linearly scale Beta from 0.0 to 0.05 over the first 20,000 steps
+                warmup_steps = 20000.0
+                current_beta = TARGET_BETA * min(1.0, step / warmup_steps)
+                
                 loss_dict = model.module.loss(
-                    logits_noisy, x, logits_clean_list=logits_clean, consistency_weight=CONSISTENCY_WEIGHT, z_raw=z_raw
+                    logits_list, x, mu=mu, logvar=logvar, beta=current_beta
                 )
                 raw_loss = loss_dict["loss"]
                 loss = raw_loss / ACCUM_STEPS
@@ -322,13 +325,12 @@ def train(n_steps: int = N_STEPS):
                 loss.backward()
 
             # Calculate accuracy on the primary (noisy) predictions
-            current_acc = model.module.calculate_accuracy(logits_noisy, x)
+            current_acc = model.module.calculate_accuracy(logits_list, x)
             
             # Accumulate metrics
             running_loss += raw_loss.item() 
             running_ce += loss_dict["ce_loss"].item()
-            running_cons += loss_dict["consistency_loss"].item() if isinstance(loss_dict["consistency_loss"], torch.Tensor) else loss_dict["consistency_loss"]
-            running_l2 += loss_dict["latent_l2_loss"].item() if isinstance(loss_dict["latent_l2_loss"], torch.Tensor) else loss_dict["latent_l2_loss"]
+            running_kl += loss_dict["kl_loss"].item() if isinstance(loss_dict["kl_loss"], torch.Tensor) else loss_dict["kl_loss"]
             running_acc += current_acc
             log_steps += 1
 
@@ -351,20 +353,20 @@ def train(n_steps: int = N_STEPS):
             if is_main_process and (step % LOG_EVERY == 0) and log_steps > 0:
                 avg_loss = running_loss / log_steps
                 avg_ce = running_ce / log_steps
-                avg_cons = running_cons / log_steps
-                avg_l2 = running_l2 / log_steps
+                avg_kl = running_kl / log_steps
                 avg_acc = running_acc / log_steps
                 
-                print(f"  Step {step:>6} | Loss: {avg_loss:>6.4f} (CE: {avg_ce:.4f}, Cons: {avg_cons:.4f}, L2: {avg_l2:.4f}) | Acc: {avg_acc*100:>6.2f}%")
+                # --- UPDATED: Console Print ---
+                print(f"  Step {step:>6} | Loss: {avg_loss:>6.4f} (CE: {avg_ce:.4f}, KL: {avg_kl:.4f}) | Acc: {avg_acc*100:>6.2f}%")
 
+                # --- UPDATED: Tensorboard Logging ---
                 writer.add_scalar('Train/Total_Loss', avg_loss, step)
                 writer.add_scalar('Train/CE_Loss', avg_ce, step)
-                writer.add_scalar('Train/Consistency_Loss', avg_cons, step)
-                writer.add_scalar('Train/Latent_L2_Loss', avg_l2, step)
+                writer.add_scalar('Train/KL_Loss', avg_kl, step)
                 writer.add_scalar('Train/Accuracy', avg_acc * 100, step)
                 writer.add_scalar('Hyperparameters/LR', optimizer.param_groups[0]['lr'], step)
 
-                running_loss, running_ce, running_cons, running_l2, running_acc, log_steps = 0.0, 0.0, 0.0, 0.0, 0.0, 0
+                running_loss, running_ce, running_kl, running_acc, log_steps = 0.0, 0.0, 0.0, 0.0, 0
 
             # Validation
             if step > 0 and step % VAL_EVERY == 0:
@@ -404,11 +406,12 @@ def evaluate_validation(model, val_loader, local_rank, device, max_batches: int 
         x = x.to(device)
         
         with amp_context(AMP_DTYPE):
-            # compute_consistency defaults to False, so it returns standard outputs
-            logits_list, z = model(x)
+            # --- VAE Forward Pass ---
+            # During eval, the reparameterization trick is disabled and it just returns mu
+            logits_list, mu, logvar = model(x)
             
-            # --- THE FIX: Extract loss from the dictionary ---
-            loss_dict = model_obj.loss(logits_list, x)
+            # --- VAE Loss ---
+            loss_dict = model_obj.loss(logits_list, x, mu=mu, logvar=logvar, beta=0.05)
             loss = loss_dict["loss"] 
             
             acc = model_obj.calculate_accuracy(logits_list, x)

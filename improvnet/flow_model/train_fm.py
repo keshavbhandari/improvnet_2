@@ -15,8 +15,8 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from improvnet.model.config_fm import *
-from improvnet.model.model_fm import FlowMatchingModel
+from improvnet.flow_model.config_fm import *
+from improvnet.flow_model.model_fm import FlowMatchingModel
 from improvnet.autoencoder.model import ContinuousAutoencoder
 from improvnet.utils.utils import ProcessData
 
@@ -176,7 +176,7 @@ def build_dataloader(
         jsonl_files=jsonl_files,
         processor=processor,
         max_target_len=MAX_LATENT_SEQ_LEN * PATCH_SIZE, # E.g., 2048 * 8 = 16,384 tokens
-        max_cond_len=128, #* PATCH_SIZE, # E.g., 1024 tokens for condition segments
+        max_cond_len=256 * PATCH_SIZE, # E.g., 256 * 8 = 2048 tokens for conditions
         patch_size=PATCH_SIZE
     )
     
@@ -361,7 +361,7 @@ def train(n_steps: int = N_STEPS):
                     # 1. Chunk the massive target sequence (16,384 tokens)
                     z_1 = chunked_encode(autoencoder, batch["target"], chunk_size=1024)
                     
-                    # 2. The conditions are short (max 1024 tokens), so they can be encoded instantly
+                    # 2. The conditions are short, so they can be encoded instantly
                     z_mel = autoencoder.encode_to_latents(batch["melody"])
                     z_har = autoencoder.encode_to_latents(batch["harmony"])
                     z_rhy = autoencoder.encode_to_latents(batch["rhythm"])

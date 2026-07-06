@@ -6,7 +6,7 @@ from torch.utils.checkpoint import checkpoint
 from improvnet.autoencoder.config import (
     VOCAB_SIZES, NUM_ATTRS, SEQ_LEN, EMBED_DIM, LATENT_DIM,
     N_HEADS, N_KV_HEADS, N_LAYERS, FFN_MULT, USE_CKPT,
-    DEFAULT_MRA_BASE_VALUES, IS_CAUSAL, ATTN_DROPOUT, FFN_DROPOUT, LATENT_NOISE, PATCH_SIZE
+    DEFAULT_MRA_BASE_VALUES, IS_CAUSAL, ATTN_DROPOUT, FFN_DROPOUT, PATCH_SIZE
 )
 
 # ---------------------------------------------------------------------------
@@ -331,75 +331,78 @@ class ContinuousAutoencoder(nn.Module):
         )
         
         self.encoder = TokenEncoder(**common)
+        self.fc_mu = nn.Linear(LATENT_DIM, LATENT_DIM)
+        self.fc_logvar = nn.Linear(LATENT_DIM, LATENT_DIM)
         self.decoder = TokenDecoder(**common, max_seq_len=SEQ_LEN)
         self.register_buffer("loss_weights", torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0]))
 
-    def forward(self, x: torch.Tensor, compute_consistency: bool = False):
-        # 1. Get raw, unbounded latents
-        z_raw = self.encoder(x)
-
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """The core of the VAE. Allows backpropagation through randomness."""
         if self.training:
-            # 2a. The Noisy Pass (Standard)
-            noise = torch.randn_like(z_raw) * LATENT_NOISE
-            z_noisy = torch.tanh(z_raw + noise)
-            logits_noisy_list = self.decoder(z_noisy)
-            
-            # 2b. The Clean Pass (For Consistency Regularization)
-            if compute_consistency:
-                z_clean = torch.tanh(z_raw)
-                logits_clean_list = self.decoder(z_clean)
-                # RETURN 4 ITEMS
-                return logits_noisy_list, logits_clean_list, z_noisy, z_raw
-                
-            # RETURN 4 ITEMS (with None for clean logits if not computed)
-            return logits_noisy_list, None, z_noisy, z_raw
-            
-        else:
-            # 3. Inference / Validation Pass (Always Clean)
-            z_clean = torch.tanh(z_raw)
-            logits_clean_list = self.decoder(z_clean)
-            return logits_clean_list, z_clean
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            return mu + eps * std
+        return mu # During inference, we just use the pure mean!
+
+    def forward(self, x: torch.Tensor):
+        # 1. Get raw hidden state from encoder
+        hidden = self.encoder(x)
+        
+        # 2. Project to Gaussian parameters
+        mu = self.fc_mu(hidden)
+        logvar = self.fc_logvar(hidden)
+        
+        # Clamp logvar to prevent extreme float16/bfloat16 explosions early in training
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
+        
+        # 3. Sample the latents! (No more tanh, no more manual noise injection)
+        z = self.reparameterize(mu, logvar)
+        
+        # 4. Decode
+        logits_list = self.decoder(z)
+        
+        return logits_list, mu, logvar
 
     def loss(self, 
-             logits_noisy_list: list[torch.Tensor], 
+             logits_list: list[torch.Tensor], 
              target_tensor: torch.Tensor, 
-             logits_clean_list: list[torch.Tensor] = None, 
-             consistency_weight: float = 0.1,
-             z_raw: torch.Tensor = None) -> dict:
+             mu: torch.Tensor,
+             logvar: torch.Tensor,
+             beta: float = 0.05) -> dict: # Beta controls KL strength
         """
-        Calculates Cross Entropy + Latent Consistency Loss + Latent L2.
+        Calculates Cross Entropy + KL Divergence.
         """
         criterion = nn.CrossEntropyLoss(ignore_index=2)
-        
         ce_loss = 0.0
-        consistency_loss = 0.0
-        latent_l2_loss = 0.0
         
-        for i, logits_noisy in enumerate(logits_noisy_list):
-            # 1. Standard Reconstruction Loss
-            logits_reshaped = logits_noisy.transpose(1, 2)
+        # 1. Standard Reconstruction Loss
+        for i, logits in enumerate(logits_list):
+            logits_reshaped = logits.transpose(1, 2)
             targets = target_tensor[:, :, i]
-            ce_loss += criterion(logits_reshaped, targets)
+            # Upcast to float32 for safety!
+            ce_loss += criterion(logits_reshaped.float(), targets)
             
-            # 2. Consistency Loss (Siamese Penalty)
-            if logits_clean_list is not None:
-                logits_clean = logits_clean_list[i]
-                consistency_loss += F.mse_loss(logits_noisy, logits_clean)
-
-        if z_raw is not None:
-            # Only penalize latents if their absolute value exceeds 3.0.
-            # If a latent is at 1.5, abs(1.5)-3.0 is negative, ReLU makes it 0.0 (No penalty).
-            # If a latent is at 4.0, abs(4.0)-3.0 is 1.0, penalty is applied!
-            boundary_exceedance = F.relu(torch.abs(z_raw) - 3.0)
-            latent_l2_loss = torch.mean(boundary_exceedance ** 2)
+        # 2. KL Divergence (Forces latents into a standard Gaussian sphere)
+        # --- THE FIX: Upcast to float32 to prevent bfloat16 roundoff errors ---
+        mu_fp32 = mu.float()
+        logvar_fp32 = logvar.float()
+        
+        # Exact Mathematical Formula
+        kl_raw = -0.5 * torch.sum(1 + logvar_fp32 - mu_fp32.pow(2) - logvar_fp32.exp())
+        
+        # --- Hard clamp to 0.0 to destroy floating point ghosts ---
+        kl_clamped = torch.clamp(kl_raw, min=0.0)
+        
+        # Average KL loss across the batch so it scales cleanly
+        kl_loss = kl_clamped / mu.shape[0] 
                 
-        total_loss = ce_loss + (consistency_weight * consistency_loss) + (1e-4 * latent_l2_loss)
+        # Total Loss (Beta-VAE configuration)
+        total_loss = ce_loss + (beta * kl_loss)
         
         return {
             "loss": total_loss,
             "ce_loss": ce_loss,
-            "consistency_loss": consistency_loss,
-            "latent_l2_loss": latent_l2_loss 
+            "kl_loss": kl_loss
         }
 
     def calculate_accuracy(self, logits_list, x):
@@ -425,12 +428,16 @@ class ContinuousAutoencoder(nn.Module):
     # --- DOWNSTREAM INFERENCE API ---
     @torch.no_grad()
     def encode_to_latents(self, x: torch.Tensor) -> torch.Tensor:
+        """Used by the Flow Matching model to get the target latents."""
         self.eval()
-        z_raw = self.encoder(x)
-        return torch.tanh(z_raw)
+        hidden = self.encoder(x)
+        mu = self.fc_mu(hidden)
+        # We drop the variance and the tanh! The Flow model gets the pure Gaussian Mean.
+        return mu 
 
     @torch.no_grad()
     def decode_from_latents(self, z: torch.Tensor) -> torch.Tensor:
+        """Used by the Flow Matching model to turn generated latents into music."""
         self.eval()
         logits_list = self.decoder(z)
         predicted_tokens = torch.stack([logits.argmax(-1) for logits in logits_list], dim=-1)

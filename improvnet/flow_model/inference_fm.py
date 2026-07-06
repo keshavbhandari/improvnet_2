@@ -3,9 +3,9 @@ import os
 from tqdm import tqdm
 from improvnet.utils.utils import ProcessData
 from improvnet.autoencoder.config import PATCH_SIZE
-from improvnet.model.config_fm import *
+from improvnet.flow_model.config_fm import *
 from improvnet.autoencoder.model import ContinuousAutoencoder
-from improvnet.model.model_fm import FlowMatchingModel
+from improvnet.flow_model.model_fm import FlowMatchingModel
 
 @torch.no_grad()
 def generate_music(
@@ -164,7 +164,7 @@ def generate_music(
 
     # Manually delete any hallucinated Pad or Start tokens from the middle of the song
     special_tokens = {'<P>', '<S>', '<E>', '<BLANK>'}
-    cleaned_tokens = [token for token in tokens if not any(
+    cleaned_tokens = [token for token in reconstructed_tokens if not any(
         (isinstance(item, tuple) and len(item) > 1 and item[1] in special_tokens) or 
         (isinstance(item, str) and item in special_tokens)
         for item in token
@@ -179,16 +179,16 @@ def generate_music(
 if __name__ == "__main__":
     generate_music(
         midi_filepath="/data/home/acw769/improvnet_2/improvnet/inference/debussy-clair-de-lune_original.mid",
-        output_filepath="/data/home/acw769/improvnet_2/improvnet/inference/clair_de_lune_generated.mid",
-        ae_checkpoint="/gpfs/scratch/acw769/improvnet/artifacts/autoencoder/best_model.pt",
-        fm_checkpoint="/gpfs/scratch/acw769/improvnet/artifacts/flow_matching/best_model.pt",
-        num_target_notes=1024, # Generate ~1.5 minutes of music
-        cond_notes=128,        # Condition on the first 128 notes of Debussy
+        output_filepath="/data/home/acw769/improvnet_2/improvnet/inference/generated.mid",
+        ae_checkpoint="/gpfs/scratch/acw769/improvnet/artifacts/autoencoder_v2_8patch_128latent_0.05noise/latest_checkpoint.pt",
+        fm_checkpoint="/gpfs/scratch/acw769/improvnet/artifacts/flow_matching_v2/latest_checkpoint.pt",
+        num_target_notes=2048, # Generate ~1.5 minutes of music
+        cond_notes=2048,        # Condition on the first n notes
         cfg_scales={
-            "melody": 1.0, 
+            "melody": 2.0, 
             "harmony": 1.0, 
             "rhythm": 1.0, 
-            "inst": 4.0
+            "inst": 3.0
         },
         inference_steps=100     # Number of Euler integration steps
     )

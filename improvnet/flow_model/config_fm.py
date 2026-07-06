@@ -1,7 +1,8 @@
 # ==========================================
 # STAGE 1: FROZEN AUTOENCODER SPECS
 # ==========================================
-AE_CHECKPOINT = "/gpfs/scratch/acw769/improvnet/artifacts/autoencoder/latest_checkpoint.pt"
+# AE_CHECKPOINT = "/gpfs/scratch/acw769/improvnet/artifacts/autoencoder/latest_checkpoint.pt"
+AE_CHECKPOINT = "/gpfs/scratch/acw769/improvnet/artifacts/autoencoder_v2_8patch_128latent_0.05noise/latest_checkpoint.pt"
 PATCH_SIZE = 8
 LATENT_DIM = 128
 
@@ -43,15 +44,15 @@ P_UNCOND = 0.10
 BATCH_SIZE = 64 
 ACCUM_STEPS = 1
 LR = 1e-4
-N_STEPS = 200_000
+N_STEPS = 1_000_000
 WARMUP_STEPS = 5000
 LOG_EVERY = 10
-VAL_EVERY = 5000
+VAL_EVERY = 10_000
 GRAD_CLIP = 1.0
 USE_CKPT = True  # Highly recommended at 16 layers/1024 dim
-RESUME_TRAINING = True   # Set to True to load from checkpoint
-SAVE_DIR = "/gpfs/scratch/acw769/improvnet/artifacts/flow_matching"
-RUN_NAME = "fm_conditional"
+RESUME_TRAINING = False   # Set to True to load from checkpoint
+SAVE_DIR = "/gpfs/scratch/acw769/improvnet/artifacts/flow_matching_v2"
+RUN_NAME = "fm_conditional_v2"
 JSONL_FILES = [
     # "/data/scratch/acw769/improvnet/artifacts/data/gigamidi_data.jsonl",
     # "/data/scratch/acw769/improvnet/artifacts/data/misc_data.jsonl"

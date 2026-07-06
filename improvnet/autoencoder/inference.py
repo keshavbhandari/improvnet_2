@@ -126,6 +126,7 @@ def reconstruct_midi(
     # 7. Detokenize and Save
     print("Converting dictionary back to MIDI format...")
     reconstructed_tokens = processor.tensor_to_tokens(reconstructed_dict)
+    print(reconstructed_tokens[0:100])
     
     os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
     reconstructed_midi_dict = processor.tokens_to_midi(reconstructed_tokens)
@@ -135,8 +136,8 @@ def reconstruct_midi(
 if __name__ == "__main__":
     # Example usage:
     reconstruct_midi(
-        midi_filepath="/data/home/acw769/improvnet_2/improvnet/inference/beethoven_string-trio_3_6_(nc)wittenburg.mid",
-        model_checkpoint="/gpfs/scratch/acw769/improvnet/artifacts/autoencoder/best_model.pt",
+        midi_filepath="/data/home/acw769/improvnet_2/improvnet/inference/debussy-clair-de-lune_original.mid",
+        model_checkpoint="/gpfs/scratch/acw769/improvnet/artifacts/autoencoder_8patch_1024latent/best_model.pt",
         output_filepath="/data/home/acw769/improvnet_2/improvnet/inference/reconstructed.mid",
         chunk_size=1024 
     )
