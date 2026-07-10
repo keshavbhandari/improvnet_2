@@ -27,6 +27,9 @@ class Tokenizer:
         self.pad_tok: Final[SpecialToken] = "<P>"
         self.unk_tok: Final[SpecialToken] = "<U>"
         self.dim_tok: Final[SpecialToken] = "<D>"
+        self.mask_tok: Final[SpecialToken] = "<MASK>"
+        self.blank_tok: Final[SpecialToken] = "<BLANK>"
+        self.sep_tok: Final[SpecialToken] = "<SEP>"
 
         self.special_tokens: list[SpecialToken] = [
             self.bos_tok,
@@ -34,6 +37,9 @@ class Tokenizer:
             self.pad_tok,
             self.unk_tok,
             self.dim_tok,
+            self.mask_tok,
+            self.blank_tok,
+            self.sep_tok,
         ]
 
         # These must be implemented in child class (abstract params)

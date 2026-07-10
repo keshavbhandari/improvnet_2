@@ -6,7 +6,7 @@ import random
 
 from pathlib import Path
 from collections import defaultdict
-from typing import Final, Callable, Any, Concatenate, cast
+from typing import Final, Callable, Any, Concatenate
 
 from improvnet.tokenizer.midi import (
     MidiDict,
@@ -99,12 +99,7 @@ class AbsTokenizer(Tokenizer):
             for k, v in self.config["ignore_instruments"].items()
             if v is False
         ]
-
-        self.include_drums = self.config["include_drums"]
-        if self.include_drums:
-            self.instruments_wd = self.instruments_nd + ["drum"]
-        else:
-            self.instruments_wd = self.instruments_nd
+        self.instruments_wd = self.instruments_nd + ["drum"]
 
         # Prefix tokens
         self.prefix_tokens: list[Token] = [
@@ -113,11 +108,11 @@ class AbsTokenizer(Tokenizer):
         self.composer_names: list[Token] = self.config["composer_names"]
         self.form_names: list[str] = self.config["form_names"]
         self.genre_names: list[str] = self.config["genre_names"]
-        self.prefix_tokens += [
-            ("prefix", "composer", x) for x in self.composer_names
-        ]
-        self.prefix_tokens += [("prefix", "form", x) for x in self.form_names]
-        self.prefix_tokens += [("prefix", "genre", x) for x in self.genre_names]
+        # self.prefix_tokens += [
+        #     ("prefix", "composer", x) for x in self.composer_names
+        # ]
+        # self.prefix_tokens += [("prefix", "form", x) for x in self.form_names]
+        # self.prefix_tokens += [("prefix", "genre", x) for x in self.genre_names]
 
         # Build vocab
         self.time_tok = "<T>"
@@ -127,29 +122,51 @@ class AbsTokenizer(Tokenizer):
         self.dur_tokens: list[Token] = [
             ("dur", i) for i in self.dur_time_quantizations
         ]
+        # self.drum_tokens: list[Token] = [("drum", i) for i in range(35, 82)]
 
-        if self.include_drums:
-            self.drum_tokens: list[Token] = [("drum", i) for i in range(35, 82)]
-            # self.drum_tokens: list[Token] = [("drum", i) for i in range(0, 127)]
-        else:
-            self.drum_tokens: list[Token] = []
+        self.instrument_tokens: list[Token] = [
+            ("instrument", i) for i in self.instruments_wd
+        ]
 
-        self.note_tokens: list[Token] = list(
-            itertools.product(
-                self.instruments_nd,
-                [i for i in range(128)],
-                self.velocity_quantizations,
-            )
-        )
+        self.pitch_tokens: list[Token] = [("pitch", i) for i in range(128)]
+
+        self.velocity_tokens: list[Token] = [("velocity", i) for i in self.velocity_quantizations]
 
         self.special_tokens.append(self.time_tok)
+
+        self.special_tokens += ['<MASK>', '<SEP>', '<BLANK>']
+
         self.add_tokens_to_vocab(
             self.special_tokens
             + self.prefix_tokens
-            + self.note_tokens
-            + self.drum_tokens
+            + self.instrument_tokens
+            + self.pitch_tokens
+            + self.velocity_tokens
             + self.dur_tokens
             + self.onset_tokens
+        )
+
+        self.genres = {'soundtrack', 'blues', 'jazz', 'classical', 'ambient', 'ragtime', 'atonal', 'folk', 'rock', 'pop', 'metal', 'game', 'unknown'}
+        self.forms = {'prelude and fugue', 'sonatine', 'hymn', 'fugue', 'impromptu', 'dance', 'romance', 
+                 'valse', 'minuet', 'rhapsody', 'waltz', 'toccata', 'medley', 'sonata', 'nocturne', 
+                 'ballade', 'concerto', 'fantasy', 'canon', 'etude', 'rondo', 'invention', 
+                 'variation', 'sonatina', 'intermezzo', 'suite', 'prelude', 'bagatelle', 'variations', 
+                 'cover', 'rag', 'barcarolle', 'arrangement', 'mazurka', 'scherzo', 'march', 'partita', 
+                 'improvisation', 'polonaise', 'unknown'}
+
+        self.add_tokens_to_compound_vocab(
+            tokens = {
+                "instrument": self.prefix_tokens + self.instrument_tokens,
+                "pitch": self.pitch_tokens,
+                "velocity": self.velocity_tokens,
+                "onset": self.onset_tokens,
+                "duration": self.dur_tokens,
+            }, 
+            genre_form_tokens = {
+                "genre": list(self.genres),
+                "form": list(self.forms)
+            },
+            extra_tokens=self.special_tokens
         )
         self.pad_id = self.tok_to_id[self.pad_tok]
 
@@ -157,14 +174,8 @@ class AbsTokenizer(Tokenizer):
         self.include_pedal = self.config["include_pedal"]
         self.ped_on_tok = "<PED_ON>"
         self.ped_off_tok = "<PED_OFF>"
-        if self.include_pedal is True:
+        if self.config["include_pedal"] is True:
             self.add_tokens_to_vocab([self.ped_on_tok, self.ped_off_tok])
-
-        self.include_delimiter = self.config["include_delimiter"]
-        self.delimiter_tok = "<X>"
-        if self.include_delimiter is True:
-            self.add_tokens_to_vocab([self.delimiter_tok])
-            self.special_tokens.append(self.delimiter_tok)
 
     def export_data_aug(self) -> list[Callable[[list[Token]], list[Token]]]:
         return [
@@ -202,18 +213,19 @@ class AbsTokenizer(Tokenizer):
         add_eos_tok: bool = True,
     ) -> list[Token]:
         # If unformatted_seq is longer than 150 tokens insert diminish tok
-        idx = -100 + random.randint(-10, 10)
+        idx = -30 + random.randint(-10, 10)
         if len(unformatted_seq) > 150 and add_dim_tok is True:
-            if (
-                unformatted_seq[idx][0] == "onset"
-            ):  # Don't want: note, <D>, onset, due
-                unformatted_seq.insert(idx - 1, self.dim_tok)
-            elif (
-                unformatted_seq[idx][0] == "dur"
-            ):  # Don't want: note, onset, <D>, dur
-                unformatted_seq.insert(idx - 2, self.dim_tok)
-            else:
-                unformatted_seq.insert(idx, self.dim_tok)
+            # if (
+            #     unformatted_seq[idx][0] == "onset"
+            # ):  # Don't want: note, <D>, onset, due
+            #     unformatted_seq.insert(idx - 1, self.dim_tok)
+            # elif (
+            #     unformatted_seq[idx][0] == "dur"
+            # ):  # Don't want: note, onset, <D>, dur
+            #     unformatted_seq.insert(idx - 2, self.dim_tok)
+            # else:
+            #     unformatted_seq.insert(idx, self.dim_tok)
+            unformatted_seq.insert(idx, self.dim_tok)
 
         if add_eos_tok is True:
             res = prefix + [self.bos_tok] + unformatted_seq + [self.eos_tok]
@@ -292,13 +304,7 @@ class AbsTokenizer(Tokenizer):
         remove_preceding_silence: bool = True,
         add_dim_tok: bool = True,
         add_eos_tok: bool = True,
-        extend_note_durations_with_pedal: bool = True,
     ) -> list[Token]:
-        # extend_note_durations_with_pedal=False provides a mode appropriate
-        # for Disklavier modelling, however in this case note-offsets require
-        # pedal tokens in order to be faithful to the original midi_dict.
-        assert extend_note_durations_with_pedal or self.include_pedal
-
         ticks_per_beat = midi_dict.ticks_per_beat
         midi_dict.remove_instruments(self.config["ignore_instruments"])
 
@@ -317,26 +323,26 @@ class AbsTokenizer(Tokenizer):
         # If non-drum channel is missing from instrument_msgs, default to piano
         for c in channels_used:
             if channel_to_instrument.get(c) is None and c != 9:
-                channel_to_instrument[c] = "piano"
+                channel_to_instrument[c] = "Acoustic Piano"
 
         if self.include_pedal:
             if len(channel_to_instrument.keys()) > 1:
                 warn_once(
                     logger_name=logger.name,
-                    message="AbsTokenizer config setting include_pedal=True "
+                    message=f"AbsTokenizer config setting include_pedal=True "
                     "does not officially support multiple channels. You must "
                     "manually ensure that channels don't overlap.",
                 )
-            assert set(channel_to_instrument.values()) == {"piano"}, (
-                "AbsTokenizer config setting include_pedal=True only supports piano"
-            )
+            assert set(channel_to_instrument.values()) == {
+                "Acoustic Piano"
+            }, "AbsTokenizer config setting include_pedal=True only supports piano"
 
         # Calculate prefix
         prefix: list[Token] = [
             ("prefix", "instrument", x)
             for x in set(channel_to_instrument.values())
         ]
-        if 9 in channels_used and self.include_drums:
+        if 9 in channels_used:
             prefix.append(("prefix", "instrument", "drum"))
         composer = midi_dict.metadata.get("composer")
         if composer and (composer in self.composer_names):
@@ -407,14 +413,12 @@ class AbsTokenizer(Tokenizer):
             # Special case instrument is a drum. This occurs exclusively when
             # MIDI channel is 9 when 0 indexing
             if _channel == 9:
-                if self.include_drums is False:
-                    continue
-
                 _note_onset = self._quantize_onset(
                     curr_time_since_onset % self.abs_time_step_ms
                 )
-                tokenized_seq.append(("drum", _pitch))
-                tokenized_seq.append(("onset", _note_onset))
+                # tokenized_seq.append(("drum", _pitch))
+                # tokenized_seq.append(("onset", _note_onset))
+                tokenized_seq.append({"instrument": "drum", "pitch": _pitch, "onset": _note_onset})
 
             elif _type == "pedal":
                 _pedal_onset = self._quantize_onset(
@@ -434,16 +438,15 @@ class AbsTokenizer(Tokenizer):
                 assert _velocity is not None
                 assert _end_tick is not None
 
-                if extend_note_durations_with_pedal:
-                    # Update _end_tick if affected by pedal
-                    for pedal_interval in channel_to_pedal_intervals[_channel]:
-                        pedal_start, pedal_end = (
-                            pedal_interval[0],
-                            pedal_interval[1],
-                        )
-                        if pedal_start < _end_tick < pedal_end:
-                            _end_tick = pedal_end
-                            break
+                # Update _end_tick if affected by pedal
+                for pedal_interval in channel_to_pedal_intervals[_channel]:
+                    pedal_start, pedal_end = (
+                        pedal_interval[0],
+                        pedal_interval[1],
+                    )
+                    if pedal_start < _end_tick < pedal_end:
+                        _end_tick = pedal_end
+                        break
 
                 _note_duration = get_duration_ms(
                     start_tick=_start_tick,
@@ -458,9 +461,16 @@ class AbsTokenizer(Tokenizer):
                 )
                 _note_duration = self._quantize_dur(_note_duration)
 
-                tokenized_seq.append((_instrument, _pitch, _velocity))
-                tokenized_seq.append(("onset", _note_onset))
-                tokenized_seq.append(("dur", _note_duration))
+                # tokenized_seq.append((_instrument, _pitch, _velocity))
+                # tokenized_seq.append(("onset", _note_onset))
+                # tokenized_seq.append(("dur", _note_duration))
+                tokenized_seq.append({
+                    "instrument": _instrument,
+                    "pitch": _pitch,
+                    "velocity": _velocity,
+                    "onset": _note_onset,
+                    "duration": _note_duration
+                })
 
         return self._format(
             prefix=[],#prefix,
@@ -469,13 +479,71 @@ class AbsTokenizer(Tokenizer):
             add_eos_tok=add_eos_tok,
         )
 
+
+    def tokenize_compound(self, tokenized_seq: list[Token]) -> list[Token]:
+        """Converts tokenized sequence to compound token format, omitting prefixes.
+
+        Args:
+            tokenized_seq (list[Token]): Sequence of tokens to convert.
+
+        Returns:
+            list[Token]: Converted sequence of tokens.
+        """
+        compound_seq: list[Token] = []
+        idx = 0
+        while idx < len(tokenized_seq):
+            tok = tokenized_seq[idx]
+            if isinstance(tok, str):  # Special token
+                compound_seq.append((tok, tok, tok, tok, tok))
+                idx += 1
+            elif (
+                isinstance(tok, dict)
+                and "instrument" in tok
+                and "pitch" in tok
+                and "velocity" in tok
+                and "onset" in tok
+                and "duration" in tok
+            ):
+                compound_seq.append(
+                    (
+                        ("instrument", tok["instrument"]),
+                        ("pitch", tok["pitch"]),
+                        ("velocity", tok["velocity"]),
+                        ("onset", tok["onset"]),
+                        ("dur", tok["duration"]),
+                    )
+                )
+                idx += 1
+            elif (
+                isinstance(tok, dict) # drum note token
+                and "instrument" in tok
+                and "pitch" in tok
+                and "onset" in tok
+            ):
+                compound_seq.append(
+                    (
+                        ("instrument", "drum"),
+                        ("pitch", tok["pitch"]),
+                        ("velocity", 0),
+                        ("onset", tok["onset"]),
+                        ("dur", 0),
+                    )
+                )
+                idx += 1
+            elif isinstance(tok, tuple) and len(tok) > 0 and tok[0] == "prefix":
+                # Drop prefix tokens
+                idx += 1             
+            else:
+                raise ValueError(f"Unexpected token format: {tok}")
+
+        return compound_seq
+
     def tokenize(
         self,
         midi_dict: MidiDict,
         remove_preceding_silence: bool = True,
         add_dim_tok: bool = True,
         add_eos_tok: bool = True,
-        extend_note_durations_with_pedal: bool = True,
         **kwargs: Any,
     ) -> list[Token]:
         """Tokenizes a MidiDict object into a sequence.
@@ -487,20 +555,20 @@ class AbsTokenizer(Tokenizer):
             add_dim_tok (bool): Add diminish token if appropriate. Defaults to
                 True.
             add_dim_tok (bool): Append end of sequence token. Defaults to True.
-            extend_note_durations_with_pedal (bool): Extend note durations to
-                pedal release. Defaults to True.
 
         Returns:
             list[Token]: A sequence of tokens representing the MIDI content.
         """
 
-        return self._tokenize_midi_dict(
+        tokenized_seq = self._tokenize_midi_dict(
             midi_dict=midi_dict,
             remove_preceding_silence=remove_preceding_silence,
             add_dim_tok=add_dim_tok,
             add_eos_tok=add_eos_tok,
-            extend_note_durations_with_pedal=extend_note_durations_with_pedal,
         )
+
+        return self.tokenize_compound(tokenized_seq)
+        # return tokenized_seq
 
     def _detokenize_midi_dict(self, tokenized_seq: list[Token]) -> MidiDict:
         instrument_programs = self.config["instrument_programs"]
@@ -657,6 +725,48 @@ class AbsTokenizer(Tokenizer):
             metadata={},
         )
 
+    def detokenize_compound(self, tokenized_seq: list[Token]) -> list[Token]:
+        """Converts compound token format back to standard token format.
+
+        Args:
+            tokenized_seq (list[Token]): Sequence of compound tokens to convert.
+
+        Returns:
+            list[Token]: Converted sequence of standard tokens.
+        """
+
+        valid_seq = []
+        # If any compound note tuple contains '<T>' tokens but is has less than 5 '<T>' tokens, it's likely malformed and we should drop it
+        for tok in tokenized_seq:
+            count_t_toks = tok.count("<T>")
+            count_d_toks = tok.count("<D>")
+            if count_t_toks > 0 and count_t_toks < 5:
+                continue
+            if count_d_toks > 0 and count_d_toks < 5:
+                continue
+            valid_seq.append(tok) 
+
+        standard_seq: list[Token] = []
+        for tok in valid_seq:
+            if isinstance(tok[0], str):  # Special token
+                standard_seq.append(tok[0])
+            elif isinstance(tok[0], tuple):  
+                if tok[0][0] == "prefix":
+                    continue # Safely skip if present
+                elif tok[0][0] == "instrument" and tok[0][1] == "drum":
+                    standard_seq.append(("drum", tok[1][1])) # drum, pitch
+                    standard_seq.append(("onset", tok[3][1])) # onset
+                elif tok[0][0] == "instrument" and tok[0][1] != "drum":
+                    standard_seq.append((tok[0][1], tok[1][1], tok[2][1])) # instrument, pitch, velocity
+                    standard_seq.append(("onset", tok[3][1])) # onset
+                    standard_seq.append(("dur", tok[4][1])) # duration
+                else:
+                    raise ValueError(f"Unexpected token format: {tok}")
+            else:
+                raise ValueError(f"Unexpected token format: {tok}")           
+
+        return standard_seq
+
     def detokenize(self, tokenized_seq: list[Token], **kwargs: Any) -> MidiDict:
         """Detokenizes a MidiDict object.
 
@@ -667,7 +777,9 @@ class AbsTokenizer(Tokenizer):
             MidiDict: A MidiDict reconstructed from the tokens.
         """
 
-        return self._detokenize_midi_dict(tokenized_seq=tokenized_seq)
+        # return self._detokenize_midi_dict(tokenized_seq=tokenized_seq)
+        standard_seq = self.detokenize_compound(tokenized_seq)
+        return self._detokenize_midi_dict(tokenized_seq=standard_seq)
 
     def export_pitch_aug(
         self, max_pitch_aug: int
@@ -708,17 +820,17 @@ class AbsTokenizer(Tokenizer):
                     return tok
                 else:
                     # Return augmented tok
-                    assert isinstance(tok, tuple) and len(tok) == 3, (
-                        "Invalid note token"
-                    )
+                    assert (
+                        isinstance(tok, tuple) and len(tok) == 3
+                    ), f"Invalid note token"
                     (_instrument, _pitch, _velocity) = tok
 
-                    assert isinstance(_pitch, int), (
-                        f"Expected int for pitch, got {_pitch}"
-                    )
-                    assert isinstance(_velocity, int), (
-                        f"Expected int for velocity, got {_velocity}"
-                    )
+                    assert isinstance(
+                        _pitch, int
+                    ), f"Expected int for pitch, got {_pitch}"
+                    assert isinstance(
+                        _velocity, int
+                    ), f"Expected int for velocity, got {_velocity}"
 
                     if 0 <= _pitch + _pitch_aug <= 127:
                         return (_instrument, _pitch + _pitch_aug, _velocity)
@@ -830,7 +942,6 @@ class AbsTokenizer(Tokenizer):
             Callable[[list[Token], float], list[Token]]: Exported function.
         """
 
-        # TODO: Potential issue with delimiter_tok at start
         def tempo_aug(
             src: list[Token],
             abs_time_step: int,
@@ -840,7 +951,6 @@ class AbsTokenizer(Tokenizer):
             eos_tok: str,
             time_tok: str,
             dim_tok: str,
-            delimiter_tok: str,
             pad_tok: str,
             unk_tok: str,
             ped_on_tok: str,
@@ -871,14 +981,13 @@ class AbsTokenizer(Tokenizer):
             res_prefix: list[Token] = []
             src_time_tok_cnt = 0
             dim_tok_seen_at: tuple[int, int] | None = None
-            delimiter_tok_seen_at: tuple[int, int] | None = None
             eos_tok_seen: bool = False
 
             idx = 0
             while idx < len(src):
                 tok = src[idx]
                 is_tuple = isinstance(tok, tuple)
-                if tok == bos_tok or (is_tuple and tok[0] == "prefix"):
+                if tok is bos_tok or (is_tuple and tok[0] == "prefix"):
                     res_prefix.append(tok)
                     idx += 1
                 else:
@@ -893,7 +1002,7 @@ class AbsTokenizer(Tokenizer):
                     idx += 1
                     continue
 
-                if tok == eos_tok:
+                if tok is eos_tok:
                     eos_tok_seen = True
                     idx += 1
                     continue
@@ -915,20 +1024,6 @@ class AbsTokenizer(Tokenizer):
                         else 0
                     )
                     dim_tok_seen_at = (last_time, last_onset)
-                    idx += 1
-                    continue
-                if tok == delimiter_tok:
-                    if delimiter_tok_seen_at is not None:
-                        logger.warning(
-                            "Multiple <X> tokens encountered in augmentation"
-                        )
-                    last_time = max(buffer.keys()) if buffer else 0
-                    last_onset = (
-                        max(buffer[last_time].keys())
-                        if buffer.get(last_time)
-                        else 0
-                    )
-                    delimiter_tok_seen_at = (last_time, last_onset)
                     idx += 1
                     continue
 
@@ -983,7 +1078,6 @@ class AbsTokenizer(Tokenizer):
                     continue
 
                 if current_onset != -1:
-                    current_onset = cast(int, current_onset)
                     buffer[src_time_tok_cnt][current_onset].append(
                         event_subsequence
                     )
@@ -1016,7 +1110,7 @@ class AbsTokenizer(Tokenizer):
                         first_tok = event[0]
                         # Note event with duration
                         if len(event) == 3:
-                            _src_dur_tok = cast(tuple[str, int], event[2])
+                            _src_dur_tok = event[2]
                             tgt_dur = _quantize_time(
                                 _src_dur_tok[1] * tempo_aug
                             )
@@ -1039,9 +1133,6 @@ class AbsTokenizer(Tokenizer):
                     if dim_tok_seen_at == (src_time_tok_cnt, src_onset):
                         res_events.append(dim_tok)
                         dim_tok_seen_at = None
-                    if delimiter_tok_seen_at == (src_time_tok_cnt, src_onset):
-                        res_events.append(delimiter_tok)
-                        delimiter_tok_seen_at = None
 
             # Re-assemble the final sequence
             final_res = res_prefix + res_events
@@ -1061,7 +1152,6 @@ class AbsTokenizer(Tokenizer):
                 eos_tok=self.eos_tok,
                 time_tok=self.time_tok,
                 dim_tok=self.dim_tok,
-                delimiter_tok=self.delimiter_tok,
                 pad_tok=self.pad_tok,
                 unk_tok=self.unk_tok,
                 ped_on_tok=self.ped_on_tok,

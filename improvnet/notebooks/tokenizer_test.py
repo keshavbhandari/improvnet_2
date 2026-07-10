@@ -1,32 +1,22 @@
-# from improvnet.tokenizer.midi import MidiDict
-# from improvnet.tokenizer.absolute import AbsTokenizer
+from improvnet.utils.utils import ProcessData
 
-# tokenizer = AbsTokenizer()
-# # filepath = "/mnt/data/improvnet_data/Final_GigaMIDI_V1.1_Final/training-V1.1-80%/no-drums/54/82a5729dfa8f665548f325e90bac08f5.mid"
-# # filepath = "/mnt/data/improvnet_data/doug_mcenzie_jazz/Time after Time 2.mid"
-# # filepath = "/keshav/improvnet_2/improvnet/notebooks/beethoven_string-trio_3_6_(nc)wittenburg.mid"
-# filepath = "/mnt/data/improvnet_data/Final_GigaMIDI_V1.1_Final/training-V1.1-80%/no-drums/24/58dfa7ff18afca6c6cf701d9e96d4432.mid"
-# midi_dict = MidiDict.from_midi(filepath)
-# tokens = tokenizer.tokenize(midi_dict)
-# print(len(tokens))
-# print(tokens)
+processor = ProcessData()
 
-# # Detokenize
-# midi_dict_reconstructed = tokenizer.detokenize(tokens)
-# midi_reconstructed = midi_dict_reconstructed.to_midi()
-# midi_reconstructed.save("/keshav/improvnet_2/improvnet/notebooks/reconstructed.mid")
+# Test the tokenizer with a sample MIDI file
+midi_dict = processor.read_midi("/data/home/acw769/improvnet_2/improvnet/inference/2_marche.mid")
+tokens = processor.midi_to_tokens(midi_dict)
+print(f"Tokenized MIDI: {tokens[:50]} ...")  # Print first n tokens for brevity
+print(f"Last tokens: {tokens[-50:]}")  # Print last n tokens for brevity
 
-# # # Save midi_dict to midi
-# # midi_reconstructed = midi_dict.to_midi()
-# # midi_reconstructed.save("/keshav/improvnet_2/improvnet/notebooks/reconstructed.mid")
+# Print vocabulary size
+print(f"Vocabulary sizes: {processor.tokenizer.vocab_size}")
+# Print tokens in vocab
+print(f"First tokens in vocab: {list(processor.tokenizer.id_to_tok.items())[:100]}")
+# Print id of special tokens
+print(f"<MASK> token id: {processor.tokenizer.tok_to_id['<MASK>']}")
+print(f"<BLANK> token id: {processor.tokenizer.tok_to_id['<BLANK>']}")
+print(f"<P> token id: {processor.tokenizer.tok_to_id['<P>']}")
+print(f"<SEP> token id: {processor.tokenizer.tok_to_id['<SEP>']}")
 
-# Import mido and read file
-import mido
-
-filepath = "/mnt/data/improvnet_data/Final_GigaMIDI_V1.1_Final/training-V1.1-80%/no-drums/24/58dfa7ff18afca6c6cf701d9e96d4432.mid"
-midi_original = mido.MidiFile(filepath)
-print("Original MIDI:")
-for i, track in enumerate(midi_original.tracks):
-    print(f"Track {i}: {track.name}")
-    for msg in track:
-        print(msg)
+detokenized_midi_dict = processor.tokens_to_midi(tokens)
+detokenized_midi_dict.save("/data/home/acw769/improvnet_2/improvnet/notebooks/reconstructed.mid")
