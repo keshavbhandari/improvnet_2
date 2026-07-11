@@ -141,7 +141,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="/gpfs/scratch/acw769/improvnet/artifacts/caddi_diffusion/small/best_model.pt")
     parser.add_argument("--input", type=str, default="/data/home/acw769/improvnet_2/improvnet/inference/debussy-clair-de-lune_original.mid")
     parser.add_argument("--output", type=str, default="/data/home/acw769/improvnet_2/improvnet/inference/generated.mid")
-    parser.add_argument("--genre", type=str, default="jazz")
+    parser.add_argument("--genre", type=str, default="classical")
     parser.add_argument("--keep_prompt_len", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=1.0)
     args = parser.parse_args()

@@ -60,24 +60,41 @@ class CaDDiDataset(Dataset):
         return self.file_handles[jsonl_path]
 
     def _lists_to_tuples(self, tokens_raw):
+        """Converts lists to tuples, properly flattening old 5D JSONL formats to the 1D Time Machine structure."""
         tokens = []
-        def deep_tuple(x):
-            if isinstance(x, list): return tuple(deep_tuple(i) for i in x)
-            return x
-
         for event in tokens_raw:
-            event_t = deep_tuple(event)
-            if isinstance(event_t, tuple) and len(event_t) > 0 and all(x == event_t[0] for x in event_t) and isinstance(event_t[0], str):
-                tokens.append(event_t[0])
-            elif isinstance(event_t, tuple) and len(event_t) == 5 and any(isinstance(x, tuple) for x in event_t):
-                for sub_event in event_t:
-                    if isinstance(sub_event, tuple) and len(sub_event) > 0 and all(x == sub_event[0] for x in sub_event) and isinstance(sub_event[0], str):
-                        collapsed = sub_event[0]
-                        if collapsed not in ('<PAD>', '<BLANK>'): tokens.append(collapsed)
+            # 1. Collapse repeating special tokens (e.g., ['<S>', '<S>', '<S>', '<S>', '<S>'] -> '<S>')
+            if isinstance(event, list) and len(event) > 0 and all(x == event[0] for x in event) and isinstance(event[0], str):
+                tokens.append(event[0])
+                
+            # 2. Translate old 5D JSONL arrays into the new flattened 1D sequence
+            elif isinstance(event, list) and len(event) == 5 and isinstance(event[0], list) and len(event[0]) == 2:
+                inst_val = event[0][1]
+                pitch_val = event[1][1]
+                vel_val = event[2][1]
+                onset_val = event[3][1]
+                dur_val = event[4][1]
+                
+                if inst_val in ('<PAD>', '<BLANK>', '<MASK>', '<S>', '<E>', '<T>'):
+                    if inst_val not in ('<PAD>', '<BLANK>'):
+                        tokens.append(inst_val)
+                else:
+                    # Break the 5D compound array into 3 sequential tokens!
+                    # Handle drums as 2-tuples (Instrument, Pitch) without velocity
+                    if inst_val == 'drum':
+                        tokens.append((inst_val, pitch_val))
                     else:
-                        if sub_event in self.processor.tokenizer.tok_to_id: tokens.append(sub_event)
+                        tokens.append((inst_val, pitch_val, vel_val))
+                    tokens.append(('onset', onset_val))
+                    tokens.append(('dur', dur_val))
+                    
+            # 3. Fallback for formats already in 1D
             else:
-                tokens.append(event_t)
+                if isinstance(event, list):
+                    tokens.append(tuple(event))
+                else:
+                    tokens.append(event)
+                    
         return tokens
 
     def __getitem__(self, idx):

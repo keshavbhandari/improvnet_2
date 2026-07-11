@@ -317,11 +317,11 @@ class CaDDiInference:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="/gpfs/scratch/acw769/improvnet/artifacts/caddi_diffusion/best_model.pt")
+    parser.add_argument("--model", type=str, default="/gpfs/scratch/acw769/improvnet/artifacts/caddi_diffusion/small/best_model.pt")
     parser.add_argument("--input", type=str, default="/data/home/acw769/improvnet_2/improvnet/inference/debussy-clair-de-lune_original.mid")
     parser.add_argument("--output", type=str, default="/data/home/acw769/improvnet_2/improvnet/inference/generated.mid")
     parser.add_argument("--genre", type=str, default="jazz")
-    parser.add_argument("--strategy", type=str, default="rhythm_then_pitch", choices=["completion", "rhythm_transfer", "rhythm_then_pitch"])
+    parser.add_argument("--strategy", type=str, default="rhythm_transfer", choices=["completion", "rhythm_transfer", "rhythm_then_pitch"])
     parser.add_argument("--keep_prompt_len", type=int, default=128, help="Number of prompt tokens to keep for completion strategy")
     parser.add_argument("--temperature", type=float, default=1.0)
     args = parser.parse_args()

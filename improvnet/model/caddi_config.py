@@ -2,13 +2,13 @@ import torch
 import os
 
 RUN_NAME = "caddi_ar_diffusion_v1_1d"
-SAVE_DIR = "/gpfs/scratch/acw769/improvnet/artifacts/caddi_diffusion"
+SAVE_DIR = "/gpfs/scratch/acw769/improvnet/artifacts/caddi_diffusion_small"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 RESUME_TRAINING = False
 
 # Flattened vocab size
-VOCAB_SIZE = 67680 
+VOCAB_SIZE = 67761 
 GENRES = ["classical", "jazz", "blues", "unknown"]
 NUM_GENRES = len(GENRES)
 

@@ -129,8 +129,8 @@ class AbsTokenizer(Tokenizer):
         ]
 
         if self.include_drums:
-            self.drum_tokens: list[Token] = [("drum", i) for i in range(35, 82)]
-            # self.drum_tokens: list[Token] = [("drum", i) for i in range(0, 127)]
+            # self.drum_tokens: list[Token] = [("drum", i) for i in range(35, 82)]
+            self.drum_tokens: list[Token] = [("drum", i) for i in range(0, 128)]
         else:
             self.drum_tokens: list[Token] = []
 
