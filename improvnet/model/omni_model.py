@@ -4,7 +4,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from flash_attn import flash_attn_func
-from improvnet.model.caddi_config import *
+from improvnet.model.omni_config import *
+
+NUM_INSTRUMENTS = 41 # Based on ProcessData.INSTRUMENT_CLASSES
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -73,7 +75,10 @@ class RotaryEmbedding(nn.Module):
         return (qk * cos) + (rotate_half(qk) * sin)
 
 
-class CausalGroupedQueryAttention(nn.Module):
+# ---------------------------------------------------------------------------
+# OMNI-DIRECTIONAL ATTENTION ROUTER
+# ---------------------------------------------------------------------------
+class OmniGroupedQueryAttention(nn.Module):
     def __init__(self, embed_dim, n_heads, n_kv_heads, dropout=0.0):
         super().__init__()
         self.n_heads = n_heads
@@ -90,7 +95,7 @@ class CausalGroupedQueryAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.rope = RotaryEmbedding(self.head_dim)
 
-    def forward(self, x, seq_pos, use_cache=False, kv_cache=None):
+    def forward(self, x, seq_pos, causal_prefix_len=0, draft_size=0, use_cache=False, kv_cache=None):
         B, T, C = x.shape
         
         q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim)
@@ -113,27 +118,65 @@ class CausalGroupedQueryAttention(nn.Module):
             new_kv_cache = None
 
         dropout_p = self.dropout.p if self.training else 0.0
+        
+        total_q_len = q.shape[1]
+        total_k_len = k.shape[1]
 
-        # PURE CAUSAL EVALUATION
-        # Every token sees only itself and the continuous tokens before it
-        is_causal = (T > 1)
-        attn_out = flash_attn_func(q, k, v, dropout_p=dropout_p, causal=is_causal)
+        # -------------------------------------------------------------------
+        # THE ATTENTION ROUTER
+        # -------------------------------------------------------------------
+        if total_q_len == 1:
+            # Inference Step: Pure token-by-token generation. It naturally attends to all past context.
+            attn_out = flash_attn_func(q, k, v, dropout_p=dropout_p, causal=False)
+            
+        elif causal_prefix_len > 0 and causal_prefix_len < total_q_len and draft_size > 0:
+            # Training / Parallel Block Step: MACRO-CAUSAL, MICRO-BIDIRECTIONAL
+            
+            # 1. Evaluate Prefix (Strictly Causal)
+            q_prefix = q[:, :causal_prefix_len]
+            k_prefix = k[:, :causal_prefix_len]
+            v_prefix = v[:, :causal_prefix_len]
+            out_prefix = flash_attn_func(q_prefix, k_prefix, v_prefix, dropout_p=dropout_p, causal=True)
+            
+            # 2. Evaluate Successive Drafts (Bidirectional internally, Causal externally)
+            q_drafts = []
+            curr_idx = causal_prefix_len
+            
+            while curr_idx < total_q_len:
+                next_idx = min(curr_idx + draft_size, total_q_len)
+                
+                q_d = q[:, curr_idx:next_idx]
+                k_d = k[:, :next_idx]  # Keys strictly bounded to the end of the CURRENT draft
+                v_d = v[:, :next_idx]
+                
+                # causal=False triggers full bidirectional visibility within the sliced window!
+                out_d = flash_attn_func(q_d, k_d, v_d, dropout_p=dropout_p, causal=False)
+                q_drafts.append(out_d)
+                
+                curr_idx = next_idx
+                
+            attn_out = torch.cat([out_prefix] + q_drafts, dim=1)
+            
+        else:
+            # Fallback for standard sequence generation (e.g., evaluating a pure causal prefix)
+            attn_out = flash_attn_func(q, k, v, dropout_p=dropout_p, causal=True)
 
         out = self.o_proj(attn_out.reshape(B, T, C))
         return out, new_kv_cache
 
 
-class CausalTransformerBlock(nn.Module):
+class OmniTransformerBlock(nn.Module):
     def __init__(self, embed_dim, n_heads, n_kv_heads, ffn_mult, dropout):
         super().__init__()
         self.norm1 = RMSNorm(embed_dim)
         self.norm2 = RMSNorm(embed_dim)
-        self.attn  = CausalGroupedQueryAttention(embed_dim, n_heads, n_kv_heads, dropout)
+        self.attn  = OmniGroupedQueryAttention(embed_dim, n_heads, n_kv_heads, dropout)
         self.ffn = SwiGLU(embed_dim, mult=ffn_mult, dropout=dropout)
 
-    def forward(self, x, seq_pos, use_cache=False, kv_cache=None):
+    def forward(self, x, seq_pos, causal_prefix_len=0, draft_size=0, use_cache=False, kv_cache=None):
         attn_out, new_kv_cache = self.attn(
-            self.norm1(x), seq_pos=seq_pos,
+            self.norm1(x), seq_pos=seq_pos, 
+            causal_prefix_len=causal_prefix_len, draft_size=draft_size,
             use_cache=use_cache, kv_cache=kv_cache
         )
         x = x + attn_out
@@ -147,11 +190,16 @@ class CaDDiModel(nn.Module):
         super().__init__()
         
         self.token_emb = nn.Embedding(VOCAB_SIZE, EMBED_DIM)
-        self.genre_emb = nn.Embedding(NUM_GENRES, EMBED_DIM)
         self.time_emb = TimestepEmbedder(EMBED_DIM)
         
+        # Omni-CaDDi Conditional Embeddings
+        self.genre_emb = nn.Embedding(NUM_GENRES, EMBED_DIM)
+        self.mode_emb = nn.Embedding(2, EMBED_DIM)       # 0: STRICT, 1: EDIT
+        self.len_emb = nn.Embedding(2, EMBED_DIM)        # 0: FIXED, 1: ELASTIC
+        self.multihot_proj = nn.Linear(NUM_INSTRUMENTS, EMBED_DIM, bias=False)
+        
         self.layers = nn.ModuleList([
-            CausalTransformerBlock(
+            OmniTransformerBlock(
                 EMBED_DIM, N_HEADS, N_KV_HEADS, ffn_mult=8/3, dropout=0.1
             ) for _ in range(N_LAYERS)
         ])
@@ -174,26 +222,42 @@ class CaDDiModel(nn.Module):
 
     def forward(
         self, target, timestep, genre, 
+        mode=None, length_ctrl=None, multi_hot=None,
+        causal_prefix_len=0, draft_size=0,
         seq_offset=0, use_cache=False, past_key_values=None
     ):
         B, T = target.shape
         device = target.device
 
+        # Handle optional controls gracefully
+        if mode is None: mode = torch.zeros(B, dtype=torch.long, device=device)
+        if length_ctrl is None: length_ctrl = torch.zeros(B, dtype=torch.long, device=device)
+        if multi_hot is None: multi_hot = torch.zeros((B, NUM_INSTRUMENTS), dtype=torch.float32, device=device)
+
         x = self.token_emb(target) 
         
-        # Inject dynamic Timestep embedding (applies the unique t values smoothly across the continuous sequence)
+        # Inject dynamic Timestep embedding smoothly across the continuous sequence
         e_time = self.time_emb(timestep)
         x = x + e_time
         
         is_first_step = past_key_values is None
         if is_first_step:
+            # Prepend the 4 structural condition vectors
             e_genre = self.genre_emb(genre).unsqueeze(1)
-            x = torch.cat([e_genre, x], dim=1) 
+            e_mode = self.mode_emb(mode).unsqueeze(1)
+            e_len = self.len_emb(length_ctrl).unsqueeze(1)
+            e_mh = self.multihot_proj(multi_hot).unsqueeze(1)
             
-            # The <Genre> token counts as the 0th index, so the sequence shifts right by 1
-            seq_pos = torch.arange(seq_offset, seq_offset + T + 1, device=device).unsqueeze(0).expand(B, -1)
+            x = torch.cat([e_genre, e_mode, e_len, e_mh, x], dim=1) 
+            
+            # The 4 control tokens count as the first 4 indices, sequence shifts right by 4
+            seq_pos = torch.arange(seq_offset, seq_offset + x.size(1), device=device).unsqueeze(0).expand(B, -1)
+            
+            # Update the causal router boundary to include the 4 new control tokens
+            actual_prefix_len = causal_prefix_len + 4 if causal_prefix_len > 0 else 4
         else:
             seq_pos = torch.arange(seq_offset, seq_offset + T, device=device).unsqueeze(0).expand(B, -1)
+            actual_prefix_len = 0 # Pure inference loop, handled by KV cache
             
         h = x
         next_key_values = [] if use_cache else None
@@ -203,6 +267,8 @@ class CaDDiModel(nn.Module):
             
             kwargs = {
                 "seq_pos": seq_pos,
+                "causal_prefix_len": actual_prefix_len,
+                "draft_size": draft_size,
                 "use_cache": use_cache,
                 "kv_cache": current_kv
             }
@@ -220,9 +286,10 @@ class CaDDiModel(nn.Module):
 
         h = self.out_norm(h)
         
-        # If we injected the Genre token at the start, drop it from the logits output
+        # If we injected the 4 Control tokens at the start, drop them from the output
+        # to ensure the logits array perfectly aligns with the target labels
         if is_first_step:
-            h = h[:, 1:, :]
+            h = h[:, 4:, :]
 
         logits = self.lm_head(h)
 
