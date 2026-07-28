@@ -1,30 +1,36 @@
 import torch
 import os
 
-RUN_NAME = "omni_caddi_diffusion_v1"
-SAVE_DIR = "/gpfs/scratch/acw769/improvnet/artifacts/omni_caddi"
+RUN_NAME = "twotower_caddi_hybrid_v1"
+SAVE_DIR = "/gpfs/scratch/acw769/improvnet/artifacts/twotower_hybrid"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 RESUME_TRAINING = False
 
 # --- VOCABULARY ---
-# Bumped to a multiple of 64 for Tensor Cores
-VOCAB_SIZE = 67761  
+VOCAB_SIZE = 67761 
 GENRES = ["classical", "jazz", "blues", "unknown"]
 NUM_GENRES = len(GENRES)
+NUM_INSTRUMENTS = 41 # Matches AR Context config
 
 # --- SEQUENCE MATH ---
-SEQ_LEN = 2048 
-BLOCK_SIZE = 512 
-PROMPT_MAX = 1024 
+# By shifting prefix to 1024, we leave ~1024 tokens for 4 sequential drafts
+BLOCK_SIZE = 256 
+PROMPT_MAX = 1024
+NUM_DRAFTS = 4 
 
-# 1D Special Token IDs
+# BLOCK_SIZE = 32 
+# PROMPT_MAX = 128
+# NUM_DRAFTS = 4 
+
+# Special Tokens
 PAD_ID = 2
 MASK_ID = 5
 BLANK_ID = 6
 SEP_ID = 7
 
 # --- ARCHITECTURE MATH ---
+# Must EXACTLY match the AR Context Tower so the KV caches align perfectly
 EMBED_DIM = 1024
 N_HEADS = 16       
 N_KV_HEADS = 4     
@@ -33,18 +39,18 @@ N_LAYERS = 20
 # ==========================================
 # TRAINING HYPERPARAMETERS
 # ==========================================
-BATCH_SIZE = 16
-ACCUM_STEPS = 1
+BATCH_SIZE = 8 
+ACCUM_STEPS = 4
 LR = 1e-4 
 WARMUP_STEPS = 5000 
-N_STEPS = 1_000_000 
+N_STEPS = 200000 
 GRAD_CLIP = 1.0
+DIFFUSION_STEPS = 16 
+
+AR_MODEL_PATH = "/gpfs/scratch/acw769/improvnet/artifacts/hybrid_ar_context/best_model.pt"
 
 LOG_EVERY = 10
 VAL_EVERY = 20000
-
-# Total number of diffusion steps to simulate (Smooth Trajectory)
-DIFFUSION_STEPS = 16 
 
 JSONL_FILES = [
     "/data/scratch/acw769/improvnet/artifacts/data/misc_data_tokenized.jsonl"
@@ -57,8 +63,5 @@ if torch.cuda.is_available():
         ACCUM_STEPS = 4
         RUN_NAME = RUN_NAME + "_small"
         SAVE_DIR = os.path.join(SAVE_DIR, "small")
-        print(f"Omni Config: Detected {vram_gb:.1f}GB VRAM. Scaling to BATCH_SIZE={BATCH_SIZE}, ACCUM_STEPS={ACCUM_STEPS}.")
-    else:
-        print(f"Omni Config: Detected {vram_gb:.1f}GB VRAM. Keeping defaults.")
 else:
-    print("Omni Config: CUDA not initialized yet.")
+    print("TwoTower Config: CUDA not initialized yet.")

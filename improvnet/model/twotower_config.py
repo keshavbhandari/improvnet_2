@@ -15,13 +15,13 @@ NUM_INSTRUMENTS = 41 # Matches AR Context config
 
 # --- SEQUENCE MATH ---
 # By shifting prefix to 1024, we leave ~1024 tokens for 4 sequential drafts
-# BLOCK_SIZE = 256 
-# PROMPT_MAX = 1024
-# NUM_DRAFTS = 4 
-
-BLOCK_SIZE = 32 
-PROMPT_MAX = 128
+BLOCK_SIZE = 256 
+PROMPT_MAX = 1024
 NUM_DRAFTS = 4 
+
+# BLOCK_SIZE = 32 
+# PROMPT_MAX = 128
+# NUM_DRAFTS = 4 
 
 # Special Tokens
 PAD_ID = 2
