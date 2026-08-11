@@ -38,7 +38,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, head_dim, base=10000.0):
+    def __init__(self, head_dim, base=500000.0):
         super().__init__()
         self.head_dim = head_dim
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
@@ -101,11 +101,25 @@ class CausalGroupedQueryAttention(nn.Module):
         return out, new_kv_cache
 
 class ARTransformerBlock(nn.Module):
-    def __init__(self, embed_dim, n_heads, n_kv_heads, ffn_mult, dropout, is_flash=False):
+    def __init__(self, embed_dim, n_heads, n_kv_heads, ffn_mult, dropout, layer_idx=0, is_flash=False):
         super().__init__()
         self.is_flash = is_flash
+        self.layer_idx = layer_idx
+        self.block_idx = layer_idx // 4
+        
         self.norm1 = RMSNorm(embed_dim)
         self.norm2 = RMSNorm(embed_dim)
+        
+        # --- FULL & BLOCK ATTENTION RESIDUALS (KimiK3) ---
+        # Linear projections to fuse historical attention states explicitly into current inputs
+        self.layer_attn_proj = nn.Linear(embed_dim, embed_dim, bias=False) if self.layer_idx > 0 else None
+        self.block_attn_proj = nn.Linear(embed_dim, embed_dim, bias=False) if self.block_idx > 0 else None
+        
+        # Zero-Init to ensure the network starts stable before learning to route the information!
+        if self.layer_attn_proj:
+            nn.init.zeros_(self.layer_attn_proj.weight)
+        if self.block_attn_proj:
+            nn.init.zeros_(self.block_attn_proj.weight)
         
         if is_flash:
             # The Anchor Point
@@ -120,28 +134,45 @@ class ARTransformerBlock(nn.Module):
             
         self.ffn = SwiGLU(embed_dim, mult=ffn_mult, dropout=dropout)
 
-    def forward(self, x, seq_pos, use_cache=False, kv_cache=None):
+    def forward(self, x, seq_pos, use_cache=False, kv_cache=None, layer_history_sum=None, block_history_sum=None):
         norm_x = self.norm1(x)
+        
+        # Explicitly route the accumulated history into the current attention block input
+        attn_input = norm_x
+        if self.layer_attn_proj is not None and layer_history_sum is not None:
+            attn_input = attn_input + self.layer_attn_proj(layer_history_sum)
+        if self.block_attn_proj is not None and block_history_sum is not None:
+            attn_input = attn_input + self.block_attn_proj(block_history_sum)
         
         if self.is_flash:
             attn_out, new_kv_cache = self.attn(
-                norm_x, seq_pos=seq_pos, use_cache=use_cache, kv_cache=kv_cache
+                attn_input, seq_pos=seq_pos, use_cache=use_cache, kv_cache=kv_cache
             )
         else:
             if use_cache:
-                attn_out, new_kv_cache = self.attn(norm_x, state=kv_cache)
+                # Capture the full output tuple safely without strict unpacking
+                out = self.attn(attn_input, state=kv_cache)
+                if isinstance(out, tuple):
+                    attn_out = out[0]
+                    new_kv_cache = out[-1] # The state is always the last element in fla
+                else:
+                    attn_out = out
+                    new_kv_cache = None
             else:
-                attn_out = self.attn(norm_x)
-                if isinstance(attn_out, tuple):
-                    attn_out = attn_out[0]
+                out = self.attn(attn_input)
+                if isinstance(out, tuple):
+                    attn_out = out[0]
+                else:
+                    attn_out = out
                 new_kv_cache = None
 
         x = x + attn_out
         x = x + self.ffn(self.norm2(x))
         
+        # Return attn_out alongside x to allow the ContextModel to accumulate it
         if use_cache: 
-            return x, new_kv_cache
-        return x
+            return x, new_kv_cache, attn_out
+        return x, attn_out
 
 class ARContextModel(nn.Module):
     def __init__(self):
@@ -155,6 +186,7 @@ class ARContextModel(nn.Module):
         self.layers = nn.ModuleList([
             ARTransformerBlock(
                 EMBED_DIM, N_HEADS, N_KV_HEADS, ffn_mult=8/3, dropout=0.1,
+                layer_idx=i,
                 is_flash=((i + 1) % 4 == 0)
             ) for i in range(N_LAYERS)
         ])
@@ -202,19 +234,38 @@ class ARContextModel(nn.Module):
         h = x
         next_key_values = [] if use_cache else None
         
+        # Tracking variables for Kimi K3 Attention Residuals
+        layer_history_sum = None
+        block_history_sum = None
+        
         for i, layer in enumerate(self.layers):
             current_kv = past_key_values[i] if not is_first_step else None
             
             if not use_cache and self.training:
-                layer_out = checkpoint(layer, h, seq_pos, use_cache, current_kv, use_reentrant=False)
+                # Correctly pass the new history arguments through the checkpoint function
+                layer_out = checkpoint(
+                    layer, h, seq_pos, use_cache, current_kv,
+                    layer_history_sum, block_history_sum,
+                    use_reentrant=False
+                )
+                h, attn_out = layer_out
             else:
-                layer_out = layer(h, seq_pos=seq_pos, use_cache=use_cache, kv_cache=current_kv)
+                layer_out = layer(
+                    h, seq_pos=seq_pos, use_cache=use_cache, kv_cache=current_kv,
+                    layer_history_sum=layer_history_sum, block_history_sum=block_history_sum
+                )
+                if use_cache:
+                    h, new_kv, attn_out = layer_out
+                    next_key_values.append(new_kv)
+                else:
+                    h, attn_out = layer_out
             
-            if use_cache:
-                h, new_kv = layer_out
-                next_key_values.append(new_kv)
-            else:
-                h = layer_out
+            # Update running histories directly
+            layer_history_sum = attn_out if layer_history_sum is None else layer_history_sum + attn_out
+            
+            # If this layer was a Flash Attention anchor, its output is permanently added to the Block History
+            if layer.is_flash:
+                block_history_sum = attn_out if block_history_sum is None else block_history_sum + attn_out
 
         h = self.out_norm(h)
         

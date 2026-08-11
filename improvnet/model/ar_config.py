@@ -14,7 +14,7 @@ NUM_GENRES = len(GENRES)
 
 # --- SEQUENCE MATH ---
 # We train the AR context model on full 2048-token sequences.
-SEQ_LEN = 2048 
+SEQ_LEN = 8192 
 
 # Special Tokens
 PAD_ID = 2
@@ -23,7 +23,7 @@ BLANK_ID = 6
 SEP_ID = 7
 
 # --- ARCHITECTURE MATH ---
-EMBED_DIM = 1024
+EMBED_DIM = 1536
 N_HEADS = 16       # 1024 / 16 = 64 head_dim
 N_KV_HEADS = 4     # Grouped Query Attention (4 queries per KV)
 N_LAYERS = 20
@@ -33,18 +33,19 @@ N_LAYERS = 20
 # ==========================================
 # AR training is highly efficient, so we can use larger batch sizes 
 # or sequences compared to the complex unrolled diffusion model.
-BATCH_SIZE = 32 
+BATCH_SIZE = 7 
 ACCUM_STEPS = 1
-LR = 1.0e-4 #1.5e-4 
+LR = 1.0e-4 
 WARMUP_STEPS = 10000 
-N_STEPS = 400000 
+N_STEPS = 800000 
 GRAD_CLIP = 1.0
 
 LOG_EVERY = 10
-VAL_EVERY = 20000
+VAL_EVERY = 10000
 
 JSONL_FILES = [
-    "/data/scratch/acw769/improvnet/artifacts/data/misc_data_tokenized.jsonl"
+    "/data/scratch/acw769/improvnet/artifacts/data/misc_data_tokenized.jsonl",
+    "/data/scratch/acw769/improvnet/artifacts/data/gigamidi_data_tokenized.jsonl"
 ]
 
 if torch.cuda.is_available():

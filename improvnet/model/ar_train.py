@@ -140,6 +140,25 @@ def build_dataloader(jsonl_files: list[str], split: str, batch_size: int, augmen
         collate_fn=collate_fn
     )
 
+def resume_epoch_loader(loader: DataLoader, start_batch_idx: int) -> DataLoader:
+    if start_batch_idx <= 0:
+        return loader
+    if loader.sampler is None:
+        return loader
+
+    start_sample_idx = start_batch_idx * loader.batch_size
+    remaining_indices = list(loader.sampler)[start_sample_idx:]
+
+    return DataLoader(
+        loader.dataset,
+        batch_size=loader.batch_size,
+        sampler=remaining_indices,
+        num_workers=loader.num_workers,
+        pin_memory=loader.pin_memory,
+        drop_last=loader.drop_last,
+        collate_fn=loader.collate_fn
+    )
+
 def setup_ddp():
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -149,7 +168,7 @@ def setup_ddp():
 def cleanup_ddp():
     dist.destroy_process_group()
 
-def save_checkpoint(model, optimizer, scheduler, step, best_val_loss, scaler=None, is_best=False):
+def save_checkpoint(model, optimizer, scheduler, step, best_val_loss, epoch, next_batch_idx, micro_step, scaler=None, is_best=False):
     os.makedirs(SAVE_DIR, exist_ok=True)
     model_to_save = model.module if isinstance(model, DDP) else model
     checkpoint = {
@@ -157,7 +176,10 @@ def save_checkpoint(model, optimizer, scheduler, step, best_val_loss, scaler=Non
         'model_state_dict': model_to_save.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
-        'best_val_loss': best_val_loss
+        'best_val_loss': best_val_loss,
+        'epoch': epoch,
+        'next_batch_idx': next_batch_idx,
+        'micro_step': micro_step
     }
     if scaler is not None:
         checkpoint['scaler_state_dict'] = scaler.state_dict()
@@ -180,8 +202,17 @@ def _lrs_match_config(checkpoint_lrs, config_lr: float) -> bool:
 def load_checkpoint(model, optimizer, scheduler, device, scaler=None):
     checkpoint_path = os.path.join(SAVE_DIR, "latest_checkpoint.pt")
     if not os.path.exists(checkpoint_path):
-        return 0, float('inf'), False, False, None
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+        return 0, float('inf'), False, False, None, None
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    has_resume_position = all(
+        key in checkpoint for key in ('epoch', 'next_batch_idx', 'micro_step')
+    )
+    resume_state = {
+        'has_resume_position': has_resume_position,
+        'epoch': checkpoint.get('epoch'),
+        'next_batch_idx': checkpoint.get('next_batch_idx'),
+        'micro_step': checkpoint.get('micro_step')
+    }
     model_to_load = model.module if isinstance(model, DDP) else model
     model_to_load.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -199,7 +230,13 @@ def load_checkpoint(model, optimizer, scheduler, device, scaler=None):
     if scaler is not None and 'scaler_state_dict' in checkpoint:
         scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
-    return checkpoint['step'], checkpoint['best_val_loss'], scheduler_restored, lr_changed, resume_start_lrs
+    step = checkpoint['step']
+    best_val_loss = checkpoint['best_val_loss']
+    del checkpoint
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
+    return step, best_val_loss, scheduler_restored, lr_changed, resume_start_lrs, resume_state
 
 def build_scheduler(optimizer, warmup_steps: int, total_steps: int, last_epoch: int = -1) -> LambdaLR:
     def lr_lambda(step: int) -> float:
@@ -253,13 +290,15 @@ def train(n_steps: int = N_STEPS):
     model = ARContextModel().to(device)
 
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    print(f"Model Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     optimizer = AdamW(model.parameters(), lr=LR, weight_decay=1e-2, betas=(0.9, 0.95))
     scaler = torch.amp.GradScaler('cuda', enabled=(AMP_DTYPE == torch.float16))
 
     update_step, best_val_loss = 0, float('inf')
+    resume_state = None
     scheduler = build_scheduler(optimizer, WARMUP_STEPS, n_steps)
     if RESUME_TRAINING:
-        update_step, best_val_loss, scheduler_restored, lr_changed, resume_start_lrs = load_checkpoint(model, optimizer, scheduler, device, scaler)
+        update_step, best_val_loss, scheduler_restored, lr_changed, resume_start_lrs, resume_state = load_checkpoint(model, optimizer, scheduler, device, scaler)
         if lr_changed and resume_start_lrs is not None:
             scheduler = build_resume_warmup_scheduler(
                 optimizer, resume_start_lrs, LR, WARMUP_STEPS, n_steps, update_step
@@ -267,8 +306,16 @@ def train(n_steps: int = N_STEPS):
         elif not scheduler_restored:
             scheduler = build_scheduler(optimizer, WARMUP_STEPS, n_steps, last_epoch=update_step - 1 if update_step > 0 else -1)
     
-    micro_step = update_step * ACCUM_STEPS 
-    start_epoch = micro_step // len(train_loader)
+    has_resume_position = resume_state is not None and resume_state['has_resume_position']
+    micro_step = resume_state['micro_step'] if has_resume_position else update_step * ACCUM_STEPS
+    start_epoch = resume_state['epoch'] if has_resume_position else micro_step // len(train_loader)
+    resume_batch_idx = resume_state['next_batch_idx'] if has_resume_position else 0
+
+    if is_main_process and resume_state is not None:
+        if has_resume_position:
+            print(f"Resuming from step {update_step}, epoch {start_epoch}, batch {resume_batch_idx}.")
+        else:
+            print(f"Resuming legacy checkpoint from step {update_step}; starting at epoch {start_epoch}, batch 0.")
     
     running_loss, log_steps = 0.0, 0
     model.train()
@@ -276,8 +323,9 @@ def train(n_steps: int = N_STEPS):
 
     while update_step < n_steps:
         if hasattr(train_loader.sampler, 'set_epoch'): train_loader.sampler.set_epoch(epoch)
+        epoch_loader = resume_epoch_loader(train_loader, resume_batch_idx)
         
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(epoch_loader, start=resume_batch_idx):
             if update_step >= n_steps: break
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
@@ -337,7 +385,13 @@ def train(n_steps: int = N_STEPS):
                         writer.add_scalar('Validation/AR_CE_Loss', val_loss, update_step)
                         is_best = val_loss < best_val_loss
                         if is_best: best_val_loss = val_loss
-                        save_checkpoint(model, optimizer, scheduler, update_step, best_val_loss, scaler, is_best)
+                        next_batch_idx = batch_idx + 1
+                        next_epoch = epoch
+                        if next_batch_idx >= len(train_loader):
+                            next_epoch += 1
+                            next_batch_idx = 0
+                        save_checkpoint(model, optimizer, scheduler, update_step, best_val_loss, next_epoch, next_batch_idx, micro_step, scaler, is_best)
+        resume_batch_idx = 0
         epoch += 1
 
     if is_main_process and writer: writer.close()

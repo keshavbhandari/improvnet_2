@@ -3,7 +3,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from flash_attn import flash_attn_func
+HAS_FLASH = False
+
+try:
+    from flash_attn import flash_attn_func
+
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+
+        # FlashAttention v2 requires Ampere (SM80+) or newer
+        HAS_FLASH = major >= 8
+    else:
+        HAS_FLASH = False
+
+except ImportError:
+    HAS_FLASH = False
 from improvnet.model.ar_config import *
 
 NUM_INSTRUMENTS = 41 # Matches the length of processor.INSTRUMENT_CLASSES
@@ -37,7 +51,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, head_dim, base=10000.0):
+    def __init__(self, head_dim, base=500000.0):
         super().__init__()
         self.head_dim = head_dim
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
@@ -50,6 +64,30 @@ class RotaryEmbedding(nn.Module):
         sin = emb.sin().unsqueeze(2).to(dtype=qk.dtype)
         return (qk * cos) + (rotate_half(qk) * sin)
 
+def sdpa_attn_func(q, k, v, dropout_p=0.0, causal=True):
+    """flash_attn_func-compatible fallback. q:(B,Tq,Hq,D) k,v:(B,Tk,Hkv,D)"""
+    B, Tq, Hq, D = q.shape
+    Tk, Hkv = k.shape[1], k.shape[2]
+
+    q, k, v = (t.transpose(1, 2) for t in (q, k, v))   # -> (B, H, T, D)
+
+    if Hq != Hkv:                                       # torch>=2.5: pass enable_gqa=True instead
+        k = k.repeat_interleave(Hq // Hkv, dim=1)
+        v = v.repeat_interleave(Hq // Hkv, dim=1)
+
+    attn_mask, is_causal = None, False
+    if causal and Tq > 1:
+        if Tq == Tk:
+            is_causal = True                            # fast path, no mask tensor
+        else:                                           # bottom-right aligned, matches flash-attn
+            qi = torch.arange(Tk - Tq, Tk, device=q.device).unsqueeze(1)
+            ki = torch.arange(Tk, device=q.device).unsqueeze(0)
+            attn_mask = ki <= qi
+
+    o = F.scaled_dot_product_attention(
+        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal
+    )
+    return o.transpose(1, 2).contiguous()                # -> (B, Tq, Hq, D)
 
 class CausalGroupedQueryAttention(nn.Module):
     def __init__(self, embed_dim, n_heads, n_kv_heads, dropout=0.0):
@@ -67,6 +105,7 @@ class CausalGroupedQueryAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim)
         self.dropout = nn.Dropout(dropout)
         self.rope = RotaryEmbedding(self.head_dim)
+        self.attn_fn = flash_attn_func if HAS_FLASH else sdpa_attn_func
 
     def forward(self, x, seq_pos, use_cache=False, kv_cache=None):
         B, T, C = x.shape
@@ -98,7 +137,8 @@ class CausalGroupedQueryAttention(nn.Module):
         # so the single token can attend to the entire historical KV cache.
         is_causal = True if q.size(1) > 1 else False
 
-        attn_out = flash_attn_func(q, k, v, dropout_p=dropout_p, causal=is_causal)
+        # attn_out = flash_attn_func(q, k, v, dropout_p=dropout_p, causal=is_causal)
+        attn_out = self.attn_fn(q, k, v, dropout_p=dropout_p, causal=True)
         out = self.o_proj(attn_out.reshape(B, T, C))
         return out, new_kv_cache
 
