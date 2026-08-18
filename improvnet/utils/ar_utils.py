@@ -5,7 +5,7 @@ import json
 import torch
 from improvnet.tokenizer.midi import MidiDict
 from improvnet.tokenizer.absolute import AbsTokenizer
-from improvnet.model.hybrid_ar_config import GENRES
+from improvnet.model.ar_config import GENRES
 
 def read_jsonl_files(data_dirs, split="train"):
     files = []

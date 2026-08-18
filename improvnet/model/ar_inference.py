@@ -141,7 +141,7 @@ class ARContextInference:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="/gpfs/scratch/acw769/improvnet/artifacts/ar_context/best_model.pt")
+    parser.add_argument("--model", type=str, default="/gpfs/scratch/acw769/improvnet/artifacts/ar_context/latest_checkpoint.pt")
     parser.add_argument("--input", type=str, help="Path to input MIDI file for prompt context", default="/data/home/acw769/improvnet_2/improvnet/inference/debussy-clair-de-lune_original.mid")
     parser.add_argument("--output", type=str, default="/data/home/acw769/improvnet_2/improvnet/inference/generated.mid")
     parser.add_argument("--genre", type=str, default="classical")

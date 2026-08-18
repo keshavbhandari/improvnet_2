@@ -34,11 +34,14 @@ N_LAYERS = 20
 # AR training is highly efficient, so we can use larger batch sizes 
 # or sequences compared to the complex unrolled diffusion model.
 BATCH_SIZE = 7 
-ACCUM_STEPS = 1
+ACCUM_STEPS = 2
 LR = 1.0e-4 
 WARMUP_STEPS = 10000 
 N_STEPS = 800000 
 GRAD_CLIP = 1.0
+
+OPTIMIZER_BACKEND = "paged_adamw8bit"
+ALLOW_OPTIMIZER_MIGRATION_TO_8BIT = True
 
 LOG_EVERY = 10
 VAL_EVERY = 10000
@@ -51,10 +54,10 @@ JSONL_FILES = [
 if torch.cuda.is_available():
     vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
     if vram_gb < 60.0:
-        BATCH_SIZE = 8
-        ACCUM_STEPS = 2
-        RUN_NAME = RUN_NAME + "_small"
-        SAVE_DIR = os.path.join(SAVE_DIR, "small")
+        BATCH_SIZE = 2
+        ACCUM_STEPS = 4
+        # RUN_NAME = RUN_NAME + "_small"
+        # SAVE_DIR = os.path.join(SAVE_DIR, "small")
         print(f"AR Config: Detected {vram_gb:.1f}GB VRAM. Scaling to BATCH_SIZE={BATCH_SIZE}, ACCUM_STEPS={ACCUM_STEPS}.")
     else:
         print(f"AR Config: Detected {vram_gb:.1f}GB VRAM. Keeping defaults.")
