@@ -6,9 +6,11 @@ import pickle
 from tqdm import tqdm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
@@ -34,6 +36,10 @@ AMP_DTYPE = _amp_dtype()
 OPTIMIZER_BACKEND = globals().get("OPTIMIZER_BACKEND", "auto")
 ALLOW_OPTIMIZER_MIGRATION_TO_8BIT = globals().get("ALLOW_OPTIMIZER_MIGRATION_TO_8BIT", False)
 PREFER_PAGED_8BIT_OPTIMIZER = globals().get("PREFER_PAGED_8BIT_OPTIMIZER", True)
+LM_HEAD_CHUNK_SIZE = globals().get("LM_HEAD_CHUNK_SIZE", 512)
+RESUME_CHECKPOINT_BATCH_SIZE = globals().get("RESUME_CHECKPOINT_BATCH_SIZE", None)
+RESUME_CHECKPOINT_ACCUM_STEPS = globals().get("RESUME_CHECKPOINT_ACCUM_STEPS", None)
+RESUME_CHECKPOINT_WORLD_SIZE = globals().get("RESUME_CHECKPOINT_WORLD_SIZE", None)
 
 class ARContextDataset(Dataset):
     def __init__(self, jsonl_files: list[str], processor: ProcessData, augment: bool = True):
@@ -148,24 +154,54 @@ def build_dataloader(jsonl_files: list[str], split: str, batch_size: int, augmen
         collate_fn=collate_fn
     )
 
-def resume_epoch_loader(loader: DataLoader, start_batch_idx: int) -> DataLoader:
-    if start_batch_idx <= 0:
-        return loader
-    if loader.sampler is None:
-        return loader
+def _distributed_rank_world():
+    if dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
 
-    start_sample_idx = start_batch_idx * loader.batch_size
-    remaining_indices = list(loader.sampler)[start_sample_idx:]
+def _epoch_indices(loader: DataLoader, epoch: int) -> list[int]:
+    sampler = loader.sampler
+    dataset_len = len(loader.dataset)
+    shuffle = getattr(sampler, 'shuffle', False)
+    seed = getattr(sampler, 'seed', 0)
 
+    if shuffle:
+        generator = torch.Generator()
+        generator.manual_seed(seed + epoch)
+        return torch.randperm(dataset_len, generator=generator).tolist()
+    return list(range(dataset_len))
+
+def _loader_from_indices(loader: DataLoader, indices: list[int]) -> DataLoader:
     return DataLoader(
         loader.dataset,
         batch_size=loader.batch_size,
-        sampler=remaining_indices,
+        sampler=indices,
         num_workers=loader.num_workers,
         pin_memory=loader.pin_memory,
         drop_last=loader.drop_last,
         collate_fn=loader.collate_fn
     )
+
+def resume_epoch_loader(
+    loader: DataLoader,
+    start_sample_idx: int = 0,
+    epoch: int | None = None,
+    start_global_sample_idx: int | None = None
+) -> DataLoader:
+    if start_global_sample_idx is not None:
+        if start_global_sample_idx <= 0:
+            return loader
+        rank, world_size = _distributed_rank_world()
+        remaining_indices = _epoch_indices(loader, epoch or 0)[start_global_sample_idx:]
+        return _loader_from_indices(loader, remaining_indices[rank::world_size])
+
+    if start_sample_idx <= 0:
+        return loader
+    if loader.sampler is None:
+        return loader
+
+    remaining_indices = list(loader.sampler)[start_sample_idx:]
+    return _loader_from_indices(loader, remaining_indices)
 
 def setup_ddp():
     dist.init_process_group(backend="nccl")
@@ -433,6 +469,8 @@ def save_checkpoint(
     best_val_loss,
     epoch,
     next_batch_idx,
+    next_sample_idx,
+    next_global_sample_idx,
     micro_step,
     scaler=None,
     is_best=False,
@@ -443,7 +481,7 @@ def save_checkpoint(
     model_to_save = model.module if isinstance(model, DDP) else model
     optimizer_state_dict = _move_state_to_cpu(optimizer.state_dict())
     checkpoint = {
-        'checkpoint_version': 2,
+        'checkpoint_version': 3,
         'step': step, 
         'model_state_dict': model_to_save.state_dict(),
         'optimizer_state_dict': optimizer_state_dict,
@@ -453,6 +491,11 @@ def save_checkpoint(
         'best_val_loss': best_val_loss,
         'epoch': epoch,
         'next_batch_idx': next_batch_idx,
+        'next_sample_idx': next_sample_idx,
+        'next_global_sample_idx': next_global_sample_idx,
+        'batch_size': BATCH_SIZE,
+        'accum_steps': ACCUM_STEPS,
+        'world_size': dist.get_world_size() if dist.is_initialized() else 1,
         'micro_step': micro_step
     }
     if scaler is not None:
@@ -499,6 +542,11 @@ def load_checkpoint(model, optimizer, scheduler, device, scaler=None, checkpoint
         'has_resume_position': has_resume_position,
         'epoch': checkpoint.get('epoch'),
         'next_batch_idx': checkpoint.get('next_batch_idx'),
+        'next_sample_idx': checkpoint.get('next_sample_idx'),
+        'next_global_sample_idx': checkpoint.get('next_global_sample_idx'),
+        'checkpoint_batch_size': checkpoint.get('batch_size', RESUME_CHECKPOINT_BATCH_SIZE),
+        'checkpoint_accum_steps': checkpoint.get('accum_steps', RESUME_CHECKPOINT_ACCUM_STEPS),
+        'checkpoint_world_size': checkpoint.get('world_size', RESUME_CHECKPOINT_WORLD_SIZE),
         'micro_step': checkpoint.get('micro_step'),
         'optimizer_backend': _optimizer_backend_from_instance(optimizer),
         'checkpoint_optimizer_backend': _checkpoint_optimizer_backend(checkpoint),
@@ -591,10 +639,61 @@ def build_resume_warmup_scheduler(
 
     return LambdaLR(optimizer, [make_lr_lambda(factor) for factor in start_factors])
 
+def _unwrap_model(model):
+    return model.module if isinstance(model, DDP) else model
+
+def chunked_lm_head_cross_entropy(
+    model,
+    hidden: torch.Tensor,
+    target: torch.Tensor,
+    chunk_size: int = LM_HEAD_CHUNK_SIZE,
+    use_checkpoint: bool = False
+) -> torch.Tensor:
+    if hidden.shape[:2] != target.shape:
+        raise ValueError(
+            f"Hidden/target shape mismatch: hidden={tuple(hidden.shape)}, "
+            f"target={tuple(target.shape)}"
+        )
+
+    model_to_use = _unwrap_model(model)
+    chunk_size = int(chunk_size)
+    if chunk_size <= 0:
+        chunk_size = hidden.size(1)
+
+    valid_tokens = target.ne(PAD_ID).sum().clamp_min(1)
+    loss_sum = hidden.new_zeros((), dtype=torch.float32)
+
+    for start in range(0, hidden.size(1), chunk_size):
+        end = min(start + chunk_size, hidden.size(1))
+        hidden_chunk = hidden[:, start:end, :]
+        target_chunk = target[:, start:end].contiguous()
+
+        def chunk_loss(chunk_hidden, chunk_target):
+            logits = model_to_use.lm_head(chunk_hidden)
+            return F.cross_entropy(
+                logits.reshape(-1, VOCAB_SIZE),
+                chunk_target.reshape(-1),
+                ignore_index=PAD_ID,
+                reduction='sum'
+            )
+
+        if use_checkpoint and torch.is_grad_enabled():
+            loss_sum = loss_sum + activation_checkpoint(
+                chunk_loss,
+                hidden_chunk,
+                target_chunk,
+                use_reentrant=False
+            )
+        else:
+            loss_sum = loss_sum + chunk_loss(hidden_chunk, target_chunk)
+
+    return loss_sum / valid_tokens
+
 def train(n_steps: int = N_STEPS):
     local_rank = setup_ddp()
     device = torch.device(f"cuda:{local_rank}")
     is_main_process = (local_rank == 0)
+    _, world_size = _distributed_rank_world()
 
     writer = SummaryWriter(log_dir=os.path.join(SAVE_DIR, "runs", RUN_NAME)) if is_main_process else None
 
@@ -631,13 +730,56 @@ def train(n_steps: int = N_STEPS):
     del checkpoint
     
     has_resume_position = resume_state is not None and resume_state['has_resume_position']
-    micro_step = resume_state['micro_step'] if has_resume_position else update_step * ACCUM_STEPS
+    checkpoint_accum_steps = resume_state.get('checkpoint_accum_steps') if resume_state is not None else None
+    if has_resume_position and checkpoint_accum_steps in (None, ACCUM_STEPS):
+        micro_step = resume_state['micro_step']
+    else:
+        micro_step = update_step * ACCUM_STEPS
+
     start_epoch = resume_state['epoch'] if has_resume_position else micro_step // len(train_loader)
-    resume_batch_idx = resume_state['next_batch_idx'] if has_resume_position else 0
+    checkpoint_world_size = resume_state.get('checkpoint_world_size') if resume_state is not None else None
+    if has_resume_position and resume_state.get('next_global_sample_idx') is not None:
+        resume_global_sample_idx = resume_state['next_global_sample_idx']
+    elif has_resume_position and resume_state.get('next_sample_idx') is not None:
+        resume_global_sample_idx = resume_state['next_sample_idx'] * (checkpoint_world_size or world_size)
+    elif has_resume_position:
+        checkpoint_batch_size = resume_state.get('checkpoint_batch_size') or BATCH_SIZE
+        resume_global_sample_idx = (
+            resume_state['next_batch_idx']
+            * checkpoint_batch_size
+            * (checkpoint_world_size or world_size)
+        )
+    else:
+        resume_global_sample_idx = 0
+
+    if has_resume_position and resume_state.get('next_sample_idx') is not None:
+        resume_sample_idx = resume_state['next_sample_idx']
+    else:
+        resume_sample_idx = resume_global_sample_idx // world_size
+    resume_batch_idx = resume_global_sample_idx // max(1, BATCH_SIZE * world_size)
 
     if is_main_process and resume_state is not None:
         if has_resume_position:
-            print(f"Resuming from step {update_step}, epoch {start_epoch}, batch {resume_batch_idx}.")
+            print(
+                f"Resuming from step {update_step}, epoch {start_epoch}, "
+                f"global sample {resume_global_sample_idx}, "
+                f"rank sample {resume_sample_idx}, batch {resume_batch_idx}."
+            )
+            if resume_state.get('next_global_sample_idx') is None:
+                print(
+                    "Checkpoint has no next_global_sample_idx; inferred resume "
+                    "position from legacy metadata."
+                )
+            if checkpoint_world_size not in (None, world_size):
+                print(
+                    f"World size changed from {checkpoint_world_size} to {world_size}; "
+                    "re-sharding remaining epoch samples."
+                )
+            if checkpoint_accum_steps not in (None, ACCUM_STEPS):
+                print(
+                    f"ACCUM_STEPS changed from {checkpoint_accum_steps} to {ACCUM_STEPS}; "
+                    "starting a fresh accumulation window."
+                )
         else:
             print(f"Resuming legacy checkpoint from step {update_step}; starting at epoch {start_epoch}, batch 0.")
         if resume_state.get('optimizer_restored'):
@@ -646,6 +788,8 @@ def train(n_steps: int = N_STEPS):
             print(f"Optimizer state not restored: {resume_state.get('optimizer_skipped_reason', 'not available')}.")
         if resume_state.get('rng_restored'):
             print("Restored saved RNG state for training ranks.")
+    if is_main_process:
+        print(f"Using chunked LM-head CE with chunk size {LM_HEAD_CHUNK_SIZE}.")
     
     running_loss, log_steps = 0.0, 0
     model.train()
@@ -653,10 +797,16 @@ def train(n_steps: int = N_STEPS):
 
     while update_step < n_steps:
         if hasattr(train_loader.sampler, 'set_epoch'): train_loader.sampler.set_epoch(epoch)
-        epoch_loader = resume_epoch_loader(train_loader, resume_batch_idx)
+        epoch_loader = resume_epoch_loader(
+            train_loader,
+            epoch=epoch,
+            start_global_sample_idx=resume_global_sample_idx
+        )
         
-        for batch_idx, batch in enumerate(epoch_loader, start=resume_batch_idx):
+        for local_batch_idx, batch in enumerate(epoch_loader):
             if update_step >= n_steps: break
+            global_sample_idx = resume_global_sample_idx + (local_batch_idx * BATCH_SIZE * world_size)
+            batch_idx = global_sample_idx // max(1, BATCH_SIZE * world_size)
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
             is_accumulating = (micro_step + 1) % ACCUM_STEPS != 0
@@ -664,16 +814,19 @@ def train(n_steps: int = N_STEPS):
             
             with ddp_context:
                 with torch.amp.autocast(DEVICE, dtype=AMP_DTYPE):
-                    
-                    logits = model(
+                    hidden = model(
                         target=batch["input"],          
                         genre=batch["genre"],
-                        multi_hot=batch["multi_hot"]
+                        multi_hot=batch["multi_hot"],
+                        return_hidden=True
                     )
-                    
-                    # Standard Auto-Regressive Cross Entropy calculation
-                    criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID)
-                    loss = criterion(logits.view(-1, VOCAB_SIZE), batch["target"].view(-1)) / ACCUM_STEPS
+                    loss = chunked_lm_head_cross_entropy(
+                        model,
+                        hidden,
+                        batch["target"],
+                        chunk_size=LM_HEAD_CHUNK_SIZE,
+                        use_checkpoint=True
+                    ) / ACCUM_STEPS
 
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
@@ -716,11 +869,15 @@ def train(n_steps: int = N_STEPS):
                         writer.add_scalar('Validation/AR_CE_Loss', val_loss, update_step)
                         is_best = val_loss < best_val_loss
                         if is_best: best_val_loss = val_loss
-                        next_batch_idx = batch_idx + 1
+                        next_global_sample_idx = global_sample_idx + (BATCH_SIZE * world_size)
+                        next_sample_idx = next_global_sample_idx // world_size
+                        next_batch_idx = next_global_sample_idx // max(1, BATCH_SIZE * world_size)
                         next_epoch = epoch
-                        if next_batch_idx >= len(train_loader):
+                        if next_global_sample_idx >= len(train_loader.dataset):
                             next_epoch += 1
                             next_batch_idx = 0
+                            next_sample_idx = 0
+                            next_global_sample_idx = 0
                         save_checkpoint(
                             model,
                             optimizer,
@@ -729,12 +886,16 @@ def train(n_steps: int = N_STEPS):
                             best_val_loss,
                             next_epoch,
                             next_batch_idx,
+                            next_sample_idx,
+                            next_global_sample_idx,
                             micro_step,
                             scaler,
                             is_best,
                             optimizer_backend=optimizer_backend,
                             rng_state=checkpoint_rng_state
                         )
+        resume_global_sample_idx = 0
+        resume_sample_idx = 0
         resume_batch_idx = 0
         epoch += 1
 
@@ -753,14 +914,19 @@ def evaluate_validation(model, val_loader, local_rank, device, max_batches: int 
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         
         with torch.amp.autocast(DEVICE, dtype=AMP_DTYPE):
-            logits = model(
+            hidden = model(
                 target=batch["input"],
                 genre=batch["genre"],
-                multi_hot=batch["multi_hot"]
+                multi_hot=batch["multi_hot"],
+                return_hidden=True
             )
-            
-            criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID)
-            loss = criterion(logits.view(-1, VOCAB_SIZE), batch["target"].view(-1))
+            loss = chunked_lm_head_cross_entropy(
+                model,
+                hidden,
+                batch["target"],
+                chunk_size=LM_HEAD_CHUNK_SIZE,
+                use_checkpoint=False
+            )
             
         total_loss += loss.item()
         steps += 1

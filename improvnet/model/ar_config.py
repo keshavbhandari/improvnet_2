@@ -1,8 +1,10 @@
 import torch
 import os
 
-RUN_NAME = "ar_context_pretrain_v1"
-SAVE_DIR = "/gpfs/scratch/acw769/improvnet/artifacts/ar_context"
+RUN_NAME = "ar_context_pretrain_v1" # Old run
+SAVE_DIR = "/gpfs/scratch/acw769/improvnet/artifacts/ar_context" # Old run
+# RUN_NAME = "ar_context_pretrain_v1_optimized" # Optimized run
+# SAVE_DIR = "/gpfs/scratch/acw769/improvnet/artifacts/ar_context_optimized" # Optimized run
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 RESUME_TRAINING = True
@@ -33,17 +35,24 @@ N_LAYERS = 20
 # ==========================================
 # AR training is highly efficient, so we can use larger batch sizes 
 # or sequences compared to the complex unrolled diffusion model.
-BATCH_SIZE = 7 
-ACCUM_STEPS = 2
-LR = 1.0e-4 
+BATCH_SIZE = 20 # Old run
+# BATCH_SIZE = 22 # Optimized run
+ACCUM_STEPS = 1
+LR = 1.0e-4 # Old run
+# LR = 1.5e-4 # Optimized run
 WARMUP_STEPS = 10000 
 N_STEPS = 800000 
 GRAD_CLIP = 1.0
+LM_HEAD_CHUNK_SIZE = 2048
 
 OPTIMIZER_BACKEND = "paged_adamw8bit"
 ALLOW_OPTIMIZER_MIGRATION_TO_8BIT = True
+# Set these only when resuming a legacy checkpoint that predates saved batch/accum metadata.
+# RESUME_CHECKPOINT_BATCH_SIZE = 7
+# RESUME_CHECKPOINT_ACCUM_STEPS = 2
+# RESUME_CHECKPOINT_WORLD_SIZE = 4
 
-LOG_EVERY = 10
+LOG_EVERY = 1
 VAL_EVERY = 10000
 
 JSONL_FILES = [

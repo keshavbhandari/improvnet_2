@@ -195,7 +195,7 @@ class ARContextModel(nn.Module):
 
     def forward(
         self, target, genre=None, multi_hot=None, 
-        seq_offset=0, use_cache=False, past_key_values=None
+        seq_offset=0, use_cache=False, past_key_values=None, return_hidden=False
     ):
         B, T = target.shape
         device = target.device
@@ -245,6 +245,11 @@ class ARContextModel(nn.Module):
         # This perfectly aligns the output logits [B, T, V] with the input targets [B, T] for CrossEntropy.
         if is_first_step:
             h = h[:, 2:, :]
+
+        if return_hidden:
+            if use_cache:
+                return h, next_key_values
+            return h
 
         logits = self.lm_head(h)
 
