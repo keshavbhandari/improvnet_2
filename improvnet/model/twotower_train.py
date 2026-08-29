@@ -9,15 +9,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
-from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
+import improvnet.model.twotower_config as twotower_config
 from improvnet.model.twotower_config import *
-from improvnet.utils.ar_utils import ProcessData
+from improvnet.utils.ar_utils import (
+    ProcessData,
+    build_optimizer,
+    collect_rng_state_for_checkpoint,
+    distributed_rank_world,
+    load_checkpoint,
+    load_training_checkpoint,
+    resume_epoch_loader,
+    save_checkpoint,
+)
 from improvnet.model.ar_model import ARContextModel
 from improvnet.model.twotower_denoiser import TwoTowerDenoiser
 
@@ -267,30 +276,6 @@ def setup_ddp():
 def cleanup_ddp():
     dist.destroy_process_group()
 
-def save_checkpoint(model, optimizer, scheduler, step, best_val_loss, is_best=False):
-    os.makedirs(SAVE_DIR, exist_ok=True)
-    model_to_save = model.module if isinstance(model, DDP) else model
-    checkpoint = {
-        'step': step, 
-        'model_state_dict': model_to_save.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'best_val_loss': best_val_loss
-    }
-    torch.save(checkpoint, os.path.join(SAVE_DIR, "latest_checkpoint.pt"))
-    if is_best:
-        torch.save(checkpoint, os.path.join(SAVE_DIR, "best_model.pt"))
-
-def load_checkpoint(model, optimizer, device):
-    checkpoint_path = os.path.join(SAVE_DIR, "latest_checkpoint.pt")
-    if not os.path.exists(checkpoint_path):
-        return 0, float('inf')
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model_to_load = model.module if isinstance(model, DDP) else model
-    model_to_load.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    return checkpoint['step'], checkpoint['best_val_loss']
-
 def build_scheduler(optimizer, warmup_steps: int, total_steps: int, last_epoch: int = -1) -> LambdaLR:
     def lr_lambda(step: int) -> float:
         if step < warmup_steps: return step / max(1, warmup_steps)
@@ -303,6 +288,7 @@ def train(n_steps: int = N_STEPS):
     local_rank = setup_ddp()
     device = torch.device(f"cuda:{local_rank}")
     is_main_process = (local_rank == 0)
+    _, world_size = distributed_rank_world()
 
     writer = SummaryWriter(log_dir=os.path.join(SAVE_DIR, "runs", RUN_NAME)) if is_main_process else None
 
@@ -321,17 +307,96 @@ def train(n_steps: int = N_STEPS):
     model_denoiser = TwoTowerDenoiser().to(device)
 
     model_denoiser = DDP(model_denoiser, device_ids=[local_rank], find_unused_parameters=False)
-    optimizer = AdamW(model_denoiser.parameters(), lr=LR, weight_decay=1e-2, betas=(0.9, 0.95))
+    checkpoint = load_training_checkpoint(config=twotower_config) if RESUME_TRAINING else None
+    optimizer, optimizer_backend = build_optimizer(
+        model_denoiser.parameters(),
+        checkpoint=checkpoint,
+        is_main_process=is_main_process,
+        config=twotower_config
+    )
     scaler = torch.amp.GradScaler('cuda', enabled=(AMP_DTYPE == torch.float16))
 
     update_step, best_val_loss = 0, float('inf')
+    resume_state = None
+    scheduler = build_scheduler(optimizer, WARMUP_STEPS, n_steps)
     if RESUME_TRAINING:
-        update_step, best_val_loss = load_checkpoint(model_denoiser, optimizer, device)
+        update_step, best_val_loss, scheduler_restored, lr_changed, resume_start_lrs, resume_state = load_checkpoint(
+            model_denoiser,
+            optimizer,
+            scheduler,
+            device,
+            scaler,
+            checkpoint=checkpoint,
+            config=twotower_config
+        )
+        if lr_changed or not scheduler_restored:
+            scheduler = build_scheduler(
+                optimizer,
+                WARMUP_STEPS,
+                n_steps,
+                last_epoch=update_step - 1 if update_step > 0 else -1
+            )
+    del checkpoint
 
-    scheduler = build_scheduler(optimizer, WARMUP_STEPS, n_steps, last_epoch=update_step - 1 if update_step > 0 else -1)
-    
-    micro_step = update_step * ACCUM_STEPS 
-    start_epoch = micro_step // len(train_loader)
+    has_resume_position = resume_state is not None and resume_state['has_resume_position']
+    checkpoint_accum_steps = resume_state.get('checkpoint_accum_steps') if resume_state is not None else None
+    if has_resume_position and checkpoint_accum_steps in (None, ACCUM_STEPS):
+        micro_step = resume_state['micro_step']
+    else:
+        micro_step = update_step * ACCUM_STEPS
+
+    start_epoch = resume_state['epoch'] if has_resume_position else micro_step // len(train_loader)
+    checkpoint_world_size = resume_state.get('checkpoint_world_size') if resume_state is not None else None
+    if has_resume_position and resume_state.get('next_global_sample_idx') is not None:
+        resume_global_sample_idx = resume_state['next_global_sample_idx']
+    elif has_resume_position and resume_state.get('next_sample_idx') is not None:
+        resume_global_sample_idx = resume_state['next_sample_idx'] * (checkpoint_world_size or world_size)
+    elif has_resume_position:
+        checkpoint_batch_size = resume_state.get('checkpoint_batch_size') or BATCH_SIZE
+        resume_global_sample_idx = (
+            resume_state['next_batch_idx']
+            * checkpoint_batch_size
+            * (checkpoint_world_size or world_size)
+        )
+    else:
+        resume_global_sample_idx = 0
+
+    if has_resume_position and resume_state.get('next_sample_idx') is not None:
+        resume_sample_idx = resume_state['next_sample_idx']
+    else:
+        resume_sample_idx = resume_global_sample_idx // world_size
+    resume_batch_idx = resume_global_sample_idx // max(1, BATCH_SIZE * world_size)
+
+    if is_main_process and resume_state is not None:
+        if has_resume_position:
+            print(
+                f"Resuming from step {update_step}, epoch {start_epoch}, "
+                f"global sample {resume_global_sample_idx}, "
+                f"rank sample {resume_sample_idx}, batch {resume_batch_idx}."
+            )
+            if resume_state.get('next_global_sample_idx') is None:
+                print(
+                    "Checkpoint has no next_global_sample_idx; inferred resume "
+                    "position from legacy metadata."
+                )
+            if checkpoint_world_size not in (None, world_size):
+                print(
+                    f"World size changed from {checkpoint_world_size} to {world_size}; "
+                    "re-sharding remaining epoch samples."
+                )
+            if checkpoint_accum_steps not in (None, ACCUM_STEPS):
+                print(
+                    f"ACCUM_STEPS changed from {checkpoint_accum_steps} to {ACCUM_STEPS}; "
+                    "starting a fresh accumulation window."
+                )
+        else:
+            print(f"Resuming legacy checkpoint from step {update_step}; starting at epoch {start_epoch}, batch 0.")
+        if resume_state.get('optimizer_restored'):
+            print(f"Restored optimizer state ({resume_state['optimizer_backend']}).")
+        else:
+            print(f"Optimizer state not restored: {resume_state.get('optimizer_skipped_reason', 'not available')}.")
+        if resume_state.get('rng_restored'):
+            print("Restored saved RNG state for training ranks.")
     
     running_loss, log_steps = 0.0, 0
     model_denoiser.train()
@@ -339,9 +404,15 @@ def train(n_steps: int = N_STEPS):
 
     while update_step < n_steps:
         if hasattr(train_loader.sampler, 'set_epoch'): train_loader.sampler.set_epoch(epoch)
+        epoch_loader = resume_epoch_loader(
+            train_loader,
+            epoch=epoch,
+            start_global_sample_idx=resume_global_sample_idx
+        )
         
-        for batch in train_loader:
+        for local_batch_idx, batch in enumerate(epoch_loader):
             if update_step >= n_steps: break
+            global_sample_idx = resume_global_sample_idx + (local_batch_idx * BATCH_SIZE * world_size)
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
             is_accumulating = (micro_step + 1) % ACCUM_STEPS != 0
@@ -410,12 +481,39 @@ def train(n_steps: int = N_STEPS):
 
                 if update_step > 0 and update_step % VAL_EVERY == 0:
                     val_loss = evaluate_validation(model_ar, model_denoiser, val_loader, local_rank, device)
+                    checkpoint_rng_state = collect_rng_state_for_checkpoint(device)
                     if is_main_process:
                         print(f"\n--- Validation Step {update_step} | Val Loss: {val_loss:.4f} ---")
                         writer.add_scalar('Validation/TwoTower_Loss', val_loss, update_step)
                         is_best = val_loss < best_val_loss
                         if is_best: best_val_loss = val_loss
-                        save_checkpoint(model_denoiser, optimizer, scheduler, update_step, best_val_loss, is_best)
+                        next_global_sample_idx = global_sample_idx + (BATCH_SIZE * world_size)
+                        next_sample_idx = next_global_sample_idx // world_size
+                        next_batch_idx = next_global_sample_idx // max(1, BATCH_SIZE * world_size)
+                        next_epoch = epoch
+                        if next_global_sample_idx >= len(train_loader.dataset):
+                            next_epoch += 1
+                            next_batch_idx = 0
+                            next_sample_idx = 0
+                            next_global_sample_idx = 0
+                        save_checkpoint(
+                            model_denoiser,
+                            optimizer,
+                            scheduler,
+                            update_step,
+                            best_val_loss,
+                            next_epoch,
+                            next_batch_idx,
+                            next_sample_idx,
+                            next_global_sample_idx,
+                            micro_step,
+                            scaler,
+                            is_best,
+                            optimizer_backend=optimizer_backend,
+                            rng_state=checkpoint_rng_state,
+                            config=twotower_config
+                        )
+        resume_global_sample_idx = 0
         epoch += 1
 
     if is_main_process and writer: writer.close()

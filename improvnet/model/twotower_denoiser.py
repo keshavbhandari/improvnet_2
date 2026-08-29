@@ -74,7 +74,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, head_dim, base=10000.0):
+    def __init__(self, head_dim, base=500000.0):
         super().__init__()
         self.head_dim = head_dim
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))

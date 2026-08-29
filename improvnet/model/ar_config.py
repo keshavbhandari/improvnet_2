@@ -35,9 +35,9 @@ N_LAYERS = 20
 # ==========================================
 # AR training is highly efficient, so we can use larger batch sizes 
 # or sequences compared to the complex unrolled diffusion model.
-BATCH_SIZE = 20 # Old run
-# BATCH_SIZE = 22 # Optimized run
-ACCUM_STEPS = 1
+BATCH_SIZE = 19 # Old run #20
+# BATCH_SIZE = 20 # Optimized run
+ACCUM_STEPS = 1 # Optimized run, 2 for old run
 LR = 1.0e-4 # Old run
 # LR = 1.5e-4 # Optimized run
 WARMUP_STEPS = 10000 
@@ -45,8 +45,12 @@ N_STEPS = 800000
 GRAD_CLIP = 1.0
 LM_HEAD_CHUNK_SIZE = 2048
 
-OPTIMIZER_BACKEND = "paged_adamw8bit"
-ALLOW_OPTIMIZER_MIGRATION_TO_8BIT = True
+# OPTIMIZER_BACKEND = "paged_adamw8bit"
+# ALLOW_OPTIMIZER_MIGRATION_TO_8BIT = True
+
+OPTIMIZER_BACKEND = "adamw"
+ALLOW_OPTIMIZER_MIGRATION_TO_8BIT = False
+
 # Set these only when resuming a legacy checkpoint that predates saved batch/accum metadata.
 # RESUME_CHECKPOINT_BATCH_SIZE = 7
 # RESUME_CHECKPOINT_ACCUM_STEPS = 2
@@ -63,10 +67,8 @@ JSONL_FILES = [
 if torch.cuda.is_available():
     vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
     if vram_gb < 60.0:
-        BATCH_SIZE = 2
-        ACCUM_STEPS = 4
-        # RUN_NAME = RUN_NAME + "_small"
-        # SAVE_DIR = os.path.join(SAVE_DIR, "small")
+        BATCH_SIZE = 7
+        ACCUM_STEPS = 2
         print(f"AR Config: Detected {vram_gb:.1f}GB VRAM. Scaling to BATCH_SIZE={BATCH_SIZE}, ACCUM_STEPS={ACCUM_STEPS}.")
     else:
         print(f"AR Config: Detected {vram_gb:.1f}GB VRAM. Keeping defaults.")

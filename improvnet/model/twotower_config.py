@@ -19,10 +19,6 @@ BLOCK_SIZE = 256
 PROMPT_MAX = 1024
 NUM_DRAFTS = 4 
 
-# BLOCK_SIZE = 32 
-# PROMPT_MAX = 128
-# NUM_DRAFTS = 4 
-
 # Special Tokens
 PAD_ID = 2
 MASK_ID = 5
@@ -31,7 +27,7 @@ SEP_ID = 7
 
 # --- ARCHITECTURE MATH ---
 # Must EXACTLY match the AR Context Tower so the KV caches align perfectly
-EMBED_DIM = 1024
+EMBED_DIM = 1536
 N_HEADS = 16       
 N_KV_HEADS = 4     
 N_LAYERS = 20
@@ -42,12 +38,18 @@ N_LAYERS = 20
 BATCH_SIZE = 8 
 ACCUM_STEPS = 4
 LR = 1e-4 
-WARMUP_STEPS = 5000 
-N_STEPS = 200000 
+WARMUP_STEPS = 10000
+N_STEPS = 800000
 GRAD_CLIP = 1.0
 DIFFUSION_STEPS = 16 
+OPTIMIZER_BACKEND = "adamw"
+ALLOW_OPTIMIZER_MIGRATION_TO_8BIT = False
+# Set these only when resuming a legacy checkpoint that predates saved batch/accum/world metadata.
+# RESUME_CHECKPOINT_BATCH_SIZE = 8
+# RESUME_CHECKPOINT_ACCUM_STEPS = 4
+# RESUME_CHECKPOINT_WORLD_SIZE = 4
 
-AR_MODEL_PATH = "/gpfs/scratch/acw769/improvnet/artifacts/ar_context/best_model.pt"
+AR_MODEL_PATH = "/gpfs/scratch/acw769/improvnet/artifacts/ar_context/latest_checkpoint.pt"
 
 LOG_EVERY = 10
 VAL_EVERY = 20000
@@ -61,7 +63,5 @@ if torch.cuda.is_available():
     if vram_gb < 60.0:
         BATCH_SIZE = 8
         ACCUM_STEPS = 4
-        RUN_NAME = RUN_NAME + "_small"
-        SAVE_DIR = os.path.join(SAVE_DIR, "small")
 else:
     print("TwoTower Config: CUDA not initialized yet.")

@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
-from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 import torch.distributed as dist
@@ -17,13 +16,17 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from improvnet.model.ar_config import *
 from improvnet.model.ar_model import ARContextModel
-from improvnet.utils.ar_utils import ProcessData
+from improvnet.utils.ar_utils import (
+    ProcessData,
+    build_optimizer,
+    collect_rng_state_for_checkpoint,
+    distributed_rank_world,
+    load_checkpoint,
+    load_training_checkpoint,
+    resume_epoch_loader,
+    save_checkpoint,
+)
 import contextlib
-
-try:
-    import bitsandbytes as bnb
-except ImportError:
-    bnb = None
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -33,13 +36,7 @@ def _amp_dtype():
     return torch.bfloat16 if major >= 8 else torch.float16
 
 AMP_DTYPE = _amp_dtype()
-OPTIMIZER_BACKEND = globals().get("OPTIMIZER_BACKEND", "auto")
-ALLOW_OPTIMIZER_MIGRATION_TO_8BIT = globals().get("ALLOW_OPTIMIZER_MIGRATION_TO_8BIT", False)
-PREFER_PAGED_8BIT_OPTIMIZER = globals().get("PREFER_PAGED_8BIT_OPTIMIZER", True)
 LM_HEAD_CHUNK_SIZE = globals().get("LM_HEAD_CHUNK_SIZE", 512)
-RESUME_CHECKPOINT_BATCH_SIZE = globals().get("RESUME_CHECKPOINT_BATCH_SIZE", None)
-RESUME_CHECKPOINT_ACCUM_STEPS = globals().get("RESUME_CHECKPOINT_ACCUM_STEPS", None)
-RESUME_CHECKPOINT_WORLD_SIZE = globals().get("RESUME_CHECKPOINT_WORLD_SIZE", None)
 
 class ARContextDataset(Dataset):
     def __init__(self, jsonl_files: list[str], processor: ProcessData, augment: bool = True):
@@ -154,55 +151,6 @@ def build_dataloader(jsonl_files: list[str], split: str, batch_size: int, augmen
         collate_fn=collate_fn
     )
 
-def _distributed_rank_world():
-    if dist.is_initialized():
-        return dist.get_rank(), dist.get_world_size()
-    return 0, 1
-
-def _epoch_indices(loader: DataLoader, epoch: int) -> list[int]:
-    sampler = loader.sampler
-    dataset_len = len(loader.dataset)
-    shuffle = getattr(sampler, 'shuffle', False)
-    seed = getattr(sampler, 'seed', 0)
-
-    if shuffle:
-        generator = torch.Generator()
-        generator.manual_seed(seed + epoch)
-        return torch.randperm(dataset_len, generator=generator).tolist()
-    return list(range(dataset_len))
-
-def _loader_from_indices(loader: DataLoader, indices: list[int]) -> DataLoader:
-    return DataLoader(
-        loader.dataset,
-        batch_size=loader.batch_size,
-        sampler=indices,
-        num_workers=loader.num_workers,
-        pin_memory=loader.pin_memory,
-        drop_last=loader.drop_last,
-        collate_fn=loader.collate_fn
-    )
-
-def resume_epoch_loader(
-    loader: DataLoader,
-    start_sample_idx: int = 0,
-    epoch: int | None = None,
-    start_global_sample_idx: int | None = None
-) -> DataLoader:
-    if start_global_sample_idx is not None:
-        if start_global_sample_idx <= 0:
-            return loader
-        rank, world_size = _distributed_rank_world()
-        remaining_indices = _epoch_indices(loader, epoch or 0)[start_global_sample_idx:]
-        return _loader_from_indices(loader, remaining_indices[rank::world_size])
-
-    if start_sample_idx <= 0:
-        return loader
-    if loader.sampler is None:
-        return loader
-
-    remaining_indices = list(loader.sampler)[start_sample_idx:]
-    return _loader_from_indices(loader, remaining_indices)
-
 def setup_ddp():
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -211,395 +159,6 @@ def setup_ddp():
 
 def cleanup_ddp():
     dist.destroy_process_group()
-
-_BNB_STATE_KEYS = {
-    "state1", "state2", "qmap1", "qmap2", "absmax1", "absmax2",
-    "max1", "max2", "new_max1", "new_max2", "unorm_vec",
-    "__bnb_optimizer_quant_state__"
-}
-_TORCH_ADAMW_STATE_KEYS = {"exp_avg", "exp_avg_sq", "max_exp_avg_sq"}
-
-def _checkpoint_path():
-    return os.path.join(SAVE_DIR, "latest_checkpoint.pt")
-
-def _load_training_checkpoint():
-    checkpoint_path = _checkpoint_path()
-    # checkpoint_path = os.path.join(SAVE_DIR, "best_model.pt")
-    if not os.path.exists(checkpoint_path):
-        return None
-    try:
-        return torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    except TypeError:
-        return torch.load(checkpoint_path, map_location='cpu')
-
-def _move_state_to_cpu(value):
-    if isinstance(value, torch.Tensor):
-        return value.detach().cpu()
-    if isinstance(value, dict):
-        return {k: _move_state_to_cpu(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_move_state_to_cpu(v) for v in value]
-    if isinstance(value, tuple):
-        return tuple(_move_state_to_cpu(v) for v in value)
-    return value
-
-def _normalize_optimizer_backend(backend):
-    if backend is None:
-        return "auto"
-    backend = str(backend).lower().replace("-", "_")
-    aliases = {
-        "torch": "adamw",
-        "torch_adamw": "adamw",
-        "adamw32": "adamw",
-        "adamw_32bit": "adamw",
-        "bnb": "paged_adamw8bit",
-        "bitsandbytes": "paged_adamw8bit",
-        "8bit": "paged_adamw8bit",
-        "adamw_8bit": "adamw8bit",
-        "adamw8": "adamw8bit",
-        "paged_adamw_8bit": "paged_adamw8bit",
-        "paged_8bit": "paged_adamw8bit",
-    }
-    return aliases.get(backend, backend)
-
-def _optimizer_state_format(optimizer_state_dict):
-    if not optimizer_state_dict:
-        return None
-
-    state = optimizer_state_dict.get("state", {})
-    saw_state = False
-    for param_state in state.values():
-        if not isinstance(param_state, dict) or len(param_state) == 0:
-            continue
-        saw_state = True
-        keys = set(param_state.keys())
-        wrapped_quant_state = param_state.get("__bnb_optimizer_quant_state__")
-        if isinstance(wrapped_quant_state, dict):
-            keys.update(wrapped_quant_state.keys())
-
-        if keys & _BNB_STATE_KEYS:
-            return "bitsandbytes"
-        if keys & _TORCH_ADAMW_STATE_KEYS:
-            return "torch_adamw"
-
-    return "empty" if not saw_state else "unknown"
-
-def _default_8bit_backend():
-    if bnb is None:
-        return None
-    if PREFER_PAGED_8BIT_OPTIMIZER and hasattr(bnb.optim, "PagedAdamW8bit"):
-        return "paged_adamw8bit"
-    if hasattr(bnb.optim, "AdamW8bit"):
-        return "adamw8bit"
-    return None
-
-def _optimizer_backend_from_instance(optimizer):
-    module_name = optimizer.__class__.__module__.lower()
-    class_name = optimizer.__class__.__name__.lower()
-    if module_name.startswith("bitsandbytes"):
-        if "paged" in class_name:
-            return "paged_adamw8bit"
-        if "8bit" in class_name:
-            return "adamw8bit"
-    return "adamw"
-
-def _checkpoint_optimizer_backend(checkpoint):
-    if checkpoint is None:
-        return None
-
-    backend = checkpoint.get("optimizer_backend")
-    if backend is not None:
-        return _normalize_optimizer_backend(backend)
-
-    optimizer_class = str(checkpoint.get("optimizer_class", "")).lower()
-    if "pagedadamw8bit" in optimizer_class:
-        return "paged_adamw8bit"
-    if "adamw8bit" in optimizer_class:
-        return "adamw8bit"
-    if "adamw" in optimizer_class:
-        return "adamw"
-
-    state_format = _optimizer_state_format(checkpoint.get("optimizer_state_dict"))
-    if state_format == "bitsandbytes":
-        return _default_8bit_backend() or "adamw8bit"
-    if state_format == "torch_adamw":
-        return "adamw"
-    return None
-
-def _is_bitsandbytes_backend(backend):
-    return backend in ("adamw8bit", "paged_adamw8bit")
-
-def _is_bitsandbytes_optimizer(optimizer):
-    return optimizer.__class__.__module__.lower().startswith("bitsandbytes")
-
-def _choose_optimizer_backend(checkpoint):
-    requested_backend = _normalize_optimizer_backend(OPTIMIZER_BACKEND)
-    valid_backends = {"auto", "adamw", "adamw8bit", "paged_adamw8bit"}
-    if requested_backend not in valid_backends:
-        raise ValueError(
-            f"Unsupported OPTIMIZER_BACKEND={OPTIMIZER_BACKEND!r}. "
-            f"Use one of {sorted(valid_backends)}."
-        )
-
-    if requested_backend != "auto":
-        return requested_backend
-
-    checkpoint_backend = _checkpoint_optimizer_backend(checkpoint)
-    if checkpoint_backend is not None:
-        return checkpoint_backend
-
-    return _default_8bit_backend() or "adamw"
-
-def build_optimizer(parameters, checkpoint=None, is_main_process=True):
-    params = list(parameters)
-    backend = _choose_optimizer_backend(checkpoint)
-    requested_backend = _normalize_optimizer_backend(OPTIMIZER_BACKEND)
-    auto_requested = requested_backend == "auto"
-    checkpoint_format = _optimizer_state_format(
-        checkpoint.get("optimizer_state_dict") if checkpoint is not None else None
-    )
-
-    if _is_bitsandbytes_backend(backend) and bnb is None:
-        if auto_requested and checkpoint_format != "bitsandbytes":
-            backend = "adamw"
-        else:
-            raise RuntimeError(
-                "This checkpoint needs a bitsandbytes optimizer, but bitsandbytes "
-                "could not be imported in this environment."
-            )
-
-    optimizer_kwargs = dict(lr=LR, weight_decay=1e-2, betas=(0.9, 0.95))
-    if backend == "adamw":
-        optimizer = AdamW(params, **optimizer_kwargs)
-    elif backend == "paged_adamw8bit":
-        if not hasattr(bnb.optim, "PagedAdamW8bit"):
-            backend = "adamw8bit"
-            optimizer = bnb.optim.AdamW8bit(params, **optimizer_kwargs)
-        else:
-            optimizer = bnb.optim.PagedAdamW8bit(params, **optimizer_kwargs)
-    elif backend == "adamw8bit":
-        optimizer = bnb.optim.AdamW8bit(params, **optimizer_kwargs)
-    else:
-        raise ValueError(f"Unsupported optimizer backend: {backend}")
-
-    if is_main_process:
-        print(f"Using optimizer backend: {backend} ({optimizer.__class__.__name__}).")
-    return optimizer, backend
-
-def _optimizer_state_is_compatible(optimizer, optimizer_state_dict):
-    state_format = _optimizer_state_format(optimizer_state_dict)
-    if state_format in (None, "empty"):
-        return True
-    if state_format == "unknown":
-        return True
-    if _is_bitsandbytes_optimizer(optimizer):
-        return state_format == "bitsandbytes"
-    return state_format == "torch_adamw"
-
-def _load_optimizer_state_dict(optimizer, optimizer_state_dict):
-    if _is_bitsandbytes_optimizer(optimizer):
-        try:
-            optimizer.load_state_dict(optimizer_state_dict, move_to_device=True)
-            return
-        except TypeError:
-            pass
-    optimizer.load_state_dict(optimizer_state_dict)
-
-def _current_rank_rng_state(device):
-    return {
-        "rank": dist.get_rank() if dist.is_initialized() else 0,
-        "python_random_state": random.getstate(),
-        "torch_rng_state": torch.get_rng_state(),
-        "cuda_rng_state": (
-            torch.cuda.get_rng_state(device)
-            if device.type == 'cuda' and torch.cuda.is_available()
-            else None
-        ),
-    }
-
-def collect_rng_state_for_checkpoint(device):
-    rank_state = _current_rank_rng_state(device)
-    if dist.is_initialized():
-        rank_states = [None for _ in range(dist.get_world_size())]
-        dist.all_gather_object(rank_states, rank_state)
-    else:
-        rank_states = [rank_state]
-    return {"rank_states": rank_states}
-
-def _restore_rng_state(rng_state, device):
-    if not rng_state:
-        return False
-
-    rank_state = rng_state
-    if isinstance(rng_state, dict) and "rank_states" in rng_state:
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        rank_states = rng_state.get("rank_states") or []
-        if rank < len(rank_states):
-            rank_state = rank_states[rank]
-        elif rank_states:
-            rank_state = rank_states[0]
-        else:
-            return False
-
-    if not isinstance(rank_state, dict):
-        return False
-
-    python_random_state = rank_state.get("python_random_state")
-    torch_rng_state = rank_state.get("torch_rng_state")
-    cuda_rng_state = rank_state.get("cuda_rng_state")
-
-    if python_random_state is not None:
-        random.setstate(python_random_state)
-    if torch_rng_state is not None:
-        torch.set_rng_state(torch_rng_state.cpu())
-    if (
-        cuda_rng_state is not None
-        and device.type == 'cuda'
-        and torch.cuda.is_available()
-    ):
-        torch.cuda.set_rng_state(cuda_rng_state.cpu(), device=device)
-
-    return python_random_state is not None or torch_rng_state is not None or cuda_rng_state is not None
-
-def save_checkpoint(
-    model,
-    optimizer,
-    scheduler,
-    step,
-    best_val_loss,
-    epoch,
-    next_batch_idx,
-    next_sample_idx,
-    next_global_sample_idx,
-    micro_step,
-    scaler=None,
-    is_best=False,
-    optimizer_backend=None,
-    rng_state=None,
-):
-    os.makedirs(SAVE_DIR, exist_ok=True)
-    model_to_save = model.module if isinstance(model, DDP) else model
-    optimizer_state_dict = _move_state_to_cpu(optimizer.state_dict())
-    checkpoint = {
-        'checkpoint_version': 3,
-        'step': step, 
-        'model_state_dict': model_to_save.state_dict(),
-        'optimizer_state_dict': optimizer_state_dict,
-        'optimizer_backend': optimizer_backend or _optimizer_backend_from_instance(optimizer),
-        'optimizer_class': f"{optimizer.__class__.__module__}.{optimizer.__class__.__name__}",
-        'scheduler_state_dict': scheduler.state_dict(),
-        'best_val_loss': best_val_loss,
-        'epoch': epoch,
-        'next_batch_idx': next_batch_idx,
-        'next_sample_idx': next_sample_idx,
-        'next_global_sample_idx': next_global_sample_idx,
-        'batch_size': BATCH_SIZE,
-        'accum_steps': ACCUM_STEPS,
-        'world_size': dist.get_world_size() if dist.is_initialized() else 1,
-        'micro_step': micro_step
-    }
-    if scaler is not None:
-        checkpoint['scaler_state_dict'] = scaler.state_dict()
-    if rng_state is not None:
-        checkpoint['rng_state'] = rng_state
-    torch.save(checkpoint, _checkpoint_path())
-    if is_best:
-        torch.save(checkpoint, os.path.join(SAVE_DIR, "best_model.pt"))
-    del checkpoint, optimizer_state_dict
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-def _checkpoint_base_lrs(checkpoint, optimizer=None):
-    scheduler_state = checkpoint.get('scheduler_state_dict', {})
-    if 'base_lrs' in scheduler_state:
-        return scheduler_state['base_lrs']
-    optimizer_state_dict = checkpoint.get('optimizer_state_dict')
-    if not optimizer_state_dict:
-        if optimizer is not None:
-            return [
-                group.get('initial_lr', group['lr'])
-                for group in optimizer.param_groups
-            ]
-        return [LR]
-    return [
-        group.get('initial_lr', group['lr'])
-        for group in optimizer_state_dict['param_groups']
-    ]
-
-def _lrs_match_config(checkpoint_lrs, config_lr: float) -> bool:
-    return all(math.isclose(lr, config_lr, rel_tol=1e-12, abs_tol=1e-16) for lr in checkpoint_lrs)
-
-def load_checkpoint(model, optimizer, scheduler, device, scaler=None, checkpoint=None):
-    if checkpoint is None:
-        checkpoint = _load_training_checkpoint()
-    if checkpoint is None:
-        return 0, float('inf'), False, False, None, None
-
-    has_resume_position = all(
-        key in checkpoint for key in ('epoch', 'next_batch_idx', 'micro_step')
-    )
-    resume_state = {
-        'has_resume_position': has_resume_position,
-        'epoch': checkpoint.get('epoch'),
-        'next_batch_idx': checkpoint.get('next_batch_idx'),
-        'next_sample_idx': checkpoint.get('next_sample_idx'),
-        'next_global_sample_idx': checkpoint.get('next_global_sample_idx'),
-        'checkpoint_batch_size': checkpoint.get('batch_size', RESUME_CHECKPOINT_BATCH_SIZE),
-        'checkpoint_accum_steps': checkpoint.get('accum_steps', RESUME_CHECKPOINT_ACCUM_STEPS),
-        'checkpoint_world_size': checkpoint.get('world_size', RESUME_CHECKPOINT_WORLD_SIZE),
-        'micro_step': checkpoint.get('micro_step'),
-        'optimizer_backend': _optimizer_backend_from_instance(optimizer),
-        'checkpoint_optimizer_backend': _checkpoint_optimizer_backend(checkpoint),
-        'optimizer_restored': False,
-        'rng_restored': False
-    }
-    model_to_load = model.module if isinstance(model, DDP) else model
-    model_to_load.load_state_dict(checkpoint['model_state_dict'])
-
-    optimizer_state_dict = checkpoint.get('optimizer_state_dict')
-    if optimizer_state_dict is not None:
-        if _optimizer_state_is_compatible(optimizer, optimizer_state_dict):
-            _load_optimizer_state_dict(optimizer, optimizer_state_dict)
-            resume_state['optimizer_restored'] = True
-        elif ALLOW_OPTIMIZER_MIGRATION_TO_8BIT:
-            resume_state['optimizer_skipped_reason'] = (
-                "optimizer backend changed; ALLOW_OPTIMIZER_MIGRATION_TO_8BIT=True"
-            )
-        else:
-            checkpoint_format = _optimizer_state_format(optimizer_state_dict)
-            current_backend = _optimizer_backend_from_instance(optimizer)
-            raise RuntimeError(
-                "Optimizer checkpoint is not compatible with the current optimizer. "
-                f"Checkpoint format={checkpoint_format!r}, current backend={current_backend!r}. "
-                "Leave OPTIMIZER_BACKEND='auto' to resume exactly, or set "
-                "ALLOW_OPTIMIZER_MIGRATION_TO_8BIT=True if you intentionally want "
-                "to skip the old optimizer moments and continue with the new optimizer."
-            )
-    else:
-        resume_state['optimizer_skipped_reason'] = "checkpoint has no optimizer_state_dict"
-
-    checkpoint_lrs = _checkpoint_base_lrs(checkpoint, optimizer)
-    lr_changed = not _lrs_match_config(checkpoint_lrs, LR)
-    scheduler_restored = 'scheduler_state_dict' in checkpoint
-    resume_start_lrs = [group['lr'] for group in optimizer.param_groups]
-
-    if scheduler_restored and not lr_changed:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        for group, lr in zip(optimizer.param_groups, scheduler.get_last_lr()):
-            group['lr'] = lr
-
-    if scaler is not None and 'scaler_state_dict' in checkpoint:
-        scaler.load_state_dict(checkpoint['scaler_state_dict'])
-
-    resume_state['rng_restored'] = _restore_rng_state(checkpoint.get('rng_state'), device)
-
-    step = checkpoint.get('step', 0)
-    best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-    del checkpoint
-    if device.type == 'cuda':
-        torch.cuda.empty_cache()
-
-    return step, best_val_loss, scheduler_restored, lr_changed, resume_start_lrs, resume_state
 
 def build_scheduler(optimizer, warmup_steps: int, total_steps: int, last_epoch: int = -1) -> LambdaLR:
     def lr_lambda(step: int) -> float:
@@ -693,7 +252,7 @@ def train(n_steps: int = N_STEPS):
     local_rank = setup_ddp()
     device = torch.device(f"cuda:{local_rank}")
     is_main_process = (local_rank == 0)
-    _, world_size = _distributed_rank_world()
+    _, world_size = distributed_rank_world()
 
     writer = SummaryWriter(log_dir=os.path.join(SAVE_DIR, "runs", RUN_NAME)) if is_main_process else None
 
@@ -706,7 +265,7 @@ def train(n_steps: int = N_STEPS):
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     print(f"Model Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
-    checkpoint = _load_training_checkpoint() if RESUME_TRAINING else None
+    checkpoint = load_training_checkpoint() if RESUME_TRAINING else None
     optimizer, optimizer_backend = build_optimizer(
         model.parameters(),
         checkpoint=checkpoint,
