@@ -471,7 +471,11 @@ def build_optimizer(parameters, checkpoint=None, is_main_process=True, config=No
                 "could not be imported in this environment."
             )
 
-    optimizer_kwargs = dict(lr=_cfg("LR", config=config), weight_decay=1e-2, betas=(0.9, 0.95))
+    optimizer_kwargs = dict(
+        lr=_cfg("LR", config=config),
+        weight_decay=_cfg("WEIGHT_DECAY", 1e-2, config=config),
+        betas=_cfg("BETAS", (0.9, 0.95), config=config),
+    )
     if backend == "adamw":
         optimizer = AdamW(params, **optimizer_kwargs)
     elif backend == "paged_adamw8bit":

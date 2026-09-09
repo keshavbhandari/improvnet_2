@@ -3,7 +3,7 @@ import os
 from improvnet.tokenizer.absolute import AbsTokenizer
 
 RUN_NAME = "ar_context_split_instrument_v1"
-SAVE_DIR = "/gpfs/scratch/acw769/improvnet/artifacts/ar_context_split_instrument"
+SAVE_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/ar_context_split_instrument"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 RESUME_TRAINING = False
@@ -38,9 +38,11 @@ N_LAYERS = 20
 # ==========================================
 # AR training is highly efficient, so we can use larger batch sizes 
 # or sequences compared to the complex unrolled diffusion model.
-BATCH_SIZE = 20
-ACCUM_STEPS = 2 # Optimized run, 2 for old run
+BATCH_SIZE = 24
+ACCUM_STEPS = 1 # Optimized run, 2 for old run
 LR = 2e-4 # Optimized run
+WEIGHT_DECAY = 0.1
+BETAS = (0.9, 0.95)
 WARMUP_STEPS = 10000 
 N_STEPS = 800000 
 GRAD_CLIP = 1.0
@@ -60,7 +62,7 @@ LOG_EVERY = 1
 VAL_EVERY = 10000
 
 JSONL_FILES = [
-    "/data/scratch/acw769/improvnet/artifacts/data/misc_data_tokenized.jsonl",
+    "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/misc_data_tokenized.jsonl",
     # "/data/scratch/acw769/improvnet/artifacts/data/gigamidi_data_tokenized.jsonl"
 ]
 
