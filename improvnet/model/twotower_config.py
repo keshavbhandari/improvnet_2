@@ -1,17 +1,22 @@
 import torch
 import os
+from improvnet.tokenizer.absolute import AbsTokenizer
 
-RUN_NAME = "twotower_caddi_hybrid_v1"
-SAVE_DIR = "/gpfs/scratch/acw769/improvnet/artifacts/twotower_hybrid"
+RUN_NAME = "twotower_split_instrument_v1"
+SAVE_DIR = "/gpfs/scratch/acw769/improvnet/artifacts/twotower_split_instrument"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 RESUME_TRAINING = False
 
 # --- VOCABULARY ---
-VOCAB_SIZE = 67761 
+VOCAB_SIZE = AbsTokenizer().vocab_size
 GENRES = ["classical", "jazz", "blues", "unknown"]
 NUM_GENRES = len(GENRES)
 NUM_INSTRUMENTS = 41 # Matches AR Context config
+
+# --- DATA SPLITS ---
+DATA_SPLIT_SEED = 42
+DATA_SPLIT_RATIOS = {"train": 0.97, "validation": 0.02, "test": 0.01}
 
 # --- SEQUENCE MATH ---
 # By shifting prefix to 1024, we leave ~1024 tokens for 4 sequential drafts
@@ -49,7 +54,7 @@ ALLOW_OPTIMIZER_MIGRATION_TO_8BIT = False
 # RESUME_CHECKPOINT_ACCUM_STEPS = 4
 # RESUME_CHECKPOINT_WORLD_SIZE = 4
 
-AR_MODEL_PATH = "/gpfs/scratch/acw769/improvnet/artifacts/ar_context/latest_checkpoint.pt"
+AR_MODEL_PATH = "/gpfs/scratch/acw769/improvnet/artifacts/ar_context_split_instrument/latest_checkpoint.pt"
 
 LOG_EVERY = 10
 VAL_EVERY = 20000

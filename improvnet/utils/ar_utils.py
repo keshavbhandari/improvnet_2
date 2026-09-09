@@ -3,6 +3,7 @@ import copy
 import os
 import json
 import math
+import pickle
 import torch
 from torch.optim import AdamW
 import torch.distributed as dist
@@ -18,6 +19,8 @@ try:
 except ImportError:
     bnb = None
 
+_SPLIT_INDEX_CACHE: dict[tuple[str, int, tuple[tuple[str, float], ...]], dict[str, list[int]]] = {}
+
 def read_jsonl_files(data_dirs, split="train"):
     files = []
     for file in data_dirs:
@@ -30,6 +33,60 @@ def read_jsonl_files(data_dirs, split="train"):
         else:
             print(f"Warning: {file} does not exist. Skipping.")
     return files
+
+def _cfg(name, default=None, config=None):
+    return getattr(config or ar_config, name, default)
+
+def load_split_byte_index(jsonl_path: str, split: str, config=None) -> list[int]:
+    """Loads the full byte index and partitions offsets deterministically."""
+    index_path = jsonl_path.replace('.jsonl', '_index.pkl')
+    if not os.path.exists(index_path):
+        raise FileNotFoundError(f"Missing index! Run build_index.py on {jsonl_path}")
+
+    split_ratios = _cfg(
+        "DATA_SPLIT_RATIOS",
+        {"train": 0.97, "validation": 0.02, "test": 0.01},
+        config=config,
+    )
+    split_seed = int(_cfg("DATA_SPLIT_SEED", 42, config=config))
+    if split not in split_ratios:
+        raise ValueError(f"Unknown split {split!r}; expected one of {sorted(split_ratios)}")
+
+    cache_key = (
+        jsonl_path,
+        split_seed,
+        tuple((split_name, float(ratio)) for split_name, ratio in split_ratios.items()),
+    )
+    if cache_key in _SPLIT_INDEX_CACHE:
+        return _SPLIT_INDEX_CACHE[cache_key][split]
+
+    with open(index_path, 'rb') as f:
+        offsets = pickle.load(f)
+
+    shuffled_offsets = list(offsets)
+    random.Random(split_seed).shuffle(shuffled_offsets)
+
+    n_offsets = len(shuffled_offsets)
+    train_end = int(n_offsets * split_ratios.get("train", 0.0))
+    validation_end = train_end + int(n_offsets * split_ratios.get("validation", 0.0))
+
+    split_indexes = {
+        "train": sorted(shuffled_offsets[:train_end]),
+        "validation": sorted(shuffled_offsets[train_end:validation_end]),
+        "test": sorted(shuffled_offsets[validation_end:]),
+    }
+
+    cursor = 0
+    for split_name, ratio in split_ratios.items():
+        if split_name in split_indexes:
+            cursor += int(n_offsets * ratio)
+            continue
+        next_cursor = cursor + int(n_offsets * ratio)
+        split_indexes[split_name] = sorted(shuffled_offsets[cursor:next_cursor])
+        cursor = next_cursor
+
+    _SPLIT_INDEX_CACHE[cache_key] = split_indexes
+    return split_indexes[split]
 
 class ProcessData:
     def __init__(self):
@@ -67,8 +124,93 @@ class ProcessData:
     
     def tokens_to_midi(self, tokens: list) -> MidiDict:
         return self.tokenizer.detokenize(tokens).to_midi()
+
+    def _is_instrument_name(self, value) -> bool:
+        return isinstance(value, str) and value in self.INSTRUMENT_CLASSES
+
+    def _append_split_note(
+        self,
+        tokens: list,
+        instrument: str,
+        pitch: int,
+        velocity: int | None,
+        onset: int | None = None,
+        duration: int | None = None,
+    ) -> None:
+        if velocity is None:
+            velocity = self.tokenizer.config["drum_velocity"]
+        tokens.append(("instrument", instrument))
+        tokens.append(("note", pitch, velocity))
+        if onset is not None:
+            tokens.append(("onset", onset))
+        if duration is not None:
+            tokens.append(("dur", duration))
+
+    def normalize_token_sequence(self, tokens: list) -> list:
+        normalized = []
+        for event in tokens:
+            if not isinstance(event, tuple):
+                normalized.append(event)
+                continue
+
+            tok_type = event[0] if len(event) > 0 else None
+            if tok_type == "instrument":
+                normalized.append(event)
+            elif tok_type == "note":
+                normalized.append(event)
+            elif tok_type == "drum" and len(event) >= 2 and isinstance(event[1], int):
+                self._append_split_note(
+                    normalized,
+                    "drum",
+                    event[1],
+                    self.tokenizer.config["drum_velocity"],
+                )
+            elif self._is_instrument_name(tok_type) and len(event) >= 3:
+                self._append_split_note(normalized, tok_type, event[1], event[2])
+            else:
+                normalized.append(event)
+        return normalized
+
+    def serialized_tokens_to_tokens(self, tokens_raw: list) -> list:
+        tokens = []
+        for event in tokens_raw:
+            if (
+                isinstance(event, list)
+                and len(event) > 0
+                and all(x == event[0] for x in event)
+                and isinstance(event[0], str)
+            ):
+                tokens.append(event[0])
+            elif (
+                isinstance(event, list)
+                and len(event) == 5
+                and isinstance(event[0], list)
+                and len(event[0]) == 2
+            ):
+                inst_val = event[0][1]
+                pitch_val = event[1][1]
+                vel_val = event[2][1]
+                onset_val = event[3][1]
+                dur_val = event[4][1]
+
+                if inst_val in ('<P>', '<BLANK>', '<MASK>', '<S>', '<E>', '<T>'):
+                    if inst_val not in ('<P>', '<BLANK>'):
+                        tokens.append(inst_val)
+                else:
+                    self._append_split_note(
+                        tokens,
+                        inst_val,
+                        pitch_val,
+                        vel_val,
+                        onset=onset_val,
+                        duration=dur_val,
+                    )
+            else:
+                tokens.append(tuple(event) if isinstance(event, list) else event)
+        return self.normalize_token_sequence(tokens)
     
     def tokens_to_tensor(self, tokens: list) -> torch.Tensor:
+        tokens = self.normalize_token_sequence(tokens)
         ids = []
         for tok in tokens:
             if tok in self.tokenizer.tok_to_id:
@@ -92,23 +234,28 @@ class ProcessData:
 
     def pitch_augmentation(self, tokens: list) -> list:
         semitone_shift = random.randint(-7, 7)
-        augmented_tokens = copy.deepcopy(tokens)
+        augmented_tokens = copy.deepcopy(self.normalize_token_sequence(tokens))
+        current_instrument = None
         for i, event in enumerate(augmented_tokens):
-            if isinstance(event, tuple) and len(event) in (2, 3) and isinstance(event[1], int):
-                if event[0] in ('onset', 'dur', 'prefix'): continue
-                if "Drum" in str(event[0]) or "Percuss" in str(event[0]) or event[0] == 'drum': continue
+            if isinstance(event, tuple) and event[0] == "instrument":
+                current_instrument = event[1]
+                continue
+            if isinstance(event, tuple) and event[0] == "note" and isinstance(event[1], int):
+                if current_instrument == 'drum' or "Drum" in str(current_instrument) or "Percuss" in str(current_instrument):
+                    continue
                     
                 new_pitch = max(0, min(127, event[1] + semitone_shift))
-                if len(event) == 3:
-                    augmented_tokens[i] = (event[0], new_pitch, event[2])
-                else:
-                    augmented_tokens[i] = (event[0], new_pitch)
+                augmented_tokens[i] = ("note", new_pitch, event[2])
         return augmented_tokens
 
     def get_instrument_multihot(self, tokens: list) -> torch.Tensor:
         active_instruments = set()
         for event in tokens:
-            if isinstance(event, tuple) and len(event) in (2, 3):
+            if isinstance(event, tuple) and event[0] == "instrument":
+                inst_name = event[1]
+                if inst_name in self.INSTRUMENT_CLASSES:
+                    active_instruments.add(inst_name)
+            elif isinstance(event, tuple) and len(event) in (2, 3):
                 inst_name = event[0]
                 if inst_name in self.INSTRUMENT_CLASSES:
                     active_instruments.add(inst_name)
@@ -118,9 +265,6 @@ class ProcessData:
             if cls_name in active_instruments:
                 multi_hot[i] = 1.0
         return multi_hot
-
-def _cfg(name, default=None, config=None):
-    return getattr(config or ar_config, name, default)
 
 def distributed_rank_world():
     if dist.is_initialized():

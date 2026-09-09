@@ -41,18 +41,11 @@ class AbsTokenizer(Tokenizer):
     represented relative to the segment start.
 
     Tokenization Schema:
-        For non-percussion instruments:
-            - Each note is represented by three consecutive tokens:
-                1. [instrument, pitch, velocity]: Instrument class, MIDI pitch,
-                    and velocity
-                2. [onset]: Absolute time in milliseconds from segment start
-                3. [duration]: Note duration in milliseconds
-
-        For percussion instruments:
-            - Each note is represented by two consecutive tokens:
-                1. [drum, note_number]: Percussion instrument and MIDI note
-                    number
-                2. [onset]: Absolute time in milliseconds from segment start
+        Each note is represented by four consecutive tokens:
+            1. [instrument]: Instrument class, including drum
+            2. [note]: MIDI pitch and velocity
+            3. [onset]: Absolute time in milliseconds from segment start
+            4. [duration]: Note duration in milliseconds
 
     Notes:
         - Notes are ordered according to onset time
@@ -128,15 +121,13 @@ class AbsTokenizer(Tokenizer):
             ("dur", i) for i in self.dur_time_quantizations
         ]
 
-        if self.include_drums:
-            # self.drum_tokens: list[Token] = [("drum", i) for i in range(35, 82)]
-            self.drum_tokens: list[Token] = [("drum", i) for i in range(0, 128)]
-        else:
-            self.drum_tokens: list[Token] = []
+        self.instrument_tokens: list[Token] = [
+            ("instrument", instrument) for instrument in self.instruments_wd
+        ]
 
         self.note_tokens: list[Token] = list(
             itertools.product(
-                self.instruments_nd,
+                ["note"],
                 [i for i in range(128)],
                 self.velocity_quantizations,
             )
@@ -146,8 +137,8 @@ class AbsTokenizer(Tokenizer):
         self.add_tokens_to_vocab(
             self.special_tokens
             + self.prefix_tokens
+            + self.instrument_tokens
             + self.note_tokens
-            + self.drum_tokens
             + self.dur_tokens
             + self.onset_tokens
         )
@@ -204,14 +195,14 @@ class AbsTokenizer(Tokenizer):
         # If unformatted_seq is longer than 150 tokens insert diminish tok
         idx = -100 + random.randint(-10, 10)
         if len(unformatted_seq) > 150 and add_dim_tok is True:
-            if (
-                unformatted_seq[idx][0] == "onset"
-            ):  # Don't want: note, <D>, onset, due
+            tok = unformatted_seq[idx]
+            tok_type = tok[0] if isinstance(tok, tuple) else tok
+            if tok_type == "note":
                 unformatted_seq.insert(idx - 1, self.dim_tok)
-            elif (
-                unformatted_seq[idx][0] == "dur"
-            ):  # Don't want: note, onset, <D>, dur
+            elif tok_type == "onset":
                 unformatted_seq.insert(idx - 2, self.dim_tok)
+            elif tok_type == "dur":
+                unformatted_seq.insert(idx - 3, self.dim_tok)
             else:
                 unformatted_seq.insert(idx, self.dim_tok)
 
@@ -282,6 +273,12 @@ class AbsTokenizer(Tokenizer):
                 time_offset_ms += self.abs_time_step_ms
             elif type(tok) is tuple and tok[0] == "onset":
                 if time_offset_ms + tok[1] > trunc_time_ms:
+                    if (
+                        idx >= 2
+                        and isinstance(tokenized_seq[idx - 2], tuple)
+                        and tokenized_seq[idx - 2][0] == "instrument"
+                    ):
+                        return tokenized_seq[: idx - 2]
                     return tokenized_seq[: idx - 1]
 
         return tokenized_seq
@@ -404,19 +401,7 @@ class AbsTokenizer(Tokenizer):
                 for _ in range(time_toks_to_append):
                     tokenized_seq.append(self.time_tok)
 
-            # Special case instrument is a drum. This occurs exclusively when
-            # MIDI channel is 9 when 0 indexing
-            if _channel == 9:
-                if self.include_drums is False:
-                    continue
-
-                _note_onset = self._quantize_onset(
-                    curr_time_since_onset % self.abs_time_step_ms
-                )
-                tokenized_seq.append(("drum", _pitch))
-                tokenized_seq.append(("onset", _note_onset))
-
-            elif _type == "pedal":
+            if _type == "pedal":
                 _pedal_onset = self._quantize_onset(
                     curr_time_since_onset % self.abs_time_step_ms
                 )
@@ -429,10 +414,16 @@ class AbsTokenizer(Tokenizer):
                 else:
                     raise ValueError("Invalid pedal message")
 
-            else:  # Non drum case (i.e. an instrument note)
-                _instrument = channel_to_instrument[_channel]
+            else:  # Note event
                 assert _velocity is not None
                 assert _end_tick is not None
+
+                if _channel == 9:
+                    if self.include_drums is False:
+                        continue
+                    _instrument = "drum"
+                else:
+                    _instrument = channel_to_instrument[_channel]
 
                 if extend_note_durations_with_pedal:
                     # Update _end_tick if affected by pedal
@@ -458,7 +449,8 @@ class AbsTokenizer(Tokenizer):
                 )
                 _note_duration = self._quantize_dur(_note_duration)
 
-                tokenized_seq.append((_instrument, _pitch, _velocity))
+                tokenized_seq.append(("instrument", _instrument))
+                tokenized_seq.append(("note", _pitch, _velocity))
                 tokenized_seq.append(("onset", _note_onset))
                 tokenized_seq.append(("dur", _note_duration))
 
@@ -520,19 +512,24 @@ class AbsTokenizer(Tokenizer):
         for tok in tokenized_seq:
             if type(tok) is tuple and len(tok) >= 2:
                 _tok_type = tok[0]
-                if _tok_type == "drum":
+                if _tok_type == "instrument":
+                    _instrument = tok[1]
+                else:
+                    _instrument = _tok_type
+
+                if _instrument == "drum":
                     if "drum" not in instrument_to_channel:
                         instrument_to_channel["drum"] = 9
                         instrument_msgs.append(
                             {"type": "instrument", "data": 0, "tick": 0, "channel": 9}
                         )
-                elif _tok_type in self.instruments_nd:
-                    if _tok_type not in instrument_to_channel:
+                elif _instrument in self.instruments_nd:
+                    if _instrument not in instrument_to_channel:
                         if channel_idx == 9:  # Skip channel 9 (reserved for drums)
                             channel_idx += 1
-                        instrument_to_channel[_tok_type] = channel_idx
+                        instrument_to_channel[_instrument] = channel_idx
                         instrument_msgs.append(
-                            {"type": "instrument", "data": instrument_programs[_tok_type], "tick": 0, "channel": channel_idx}
+                            {"type": "instrument", "data": instrument_programs[_instrument], "tick": 0, "channel": channel_idx}
                         )
                         channel_idx += 1
 
@@ -580,12 +577,57 @@ class AbsTokenizer(Tokenizer):
             if type(tok_1) is tuple:
                 _tok_type_1 = tok_1[0]
                 
-                # Drum Case (Takes 2 blocks)
-                if _tok_type_1 == "drum":
+                # Split note case (takes 4 blocks)
+                if _tok_type_1 == "instrument":
+                    if idx + 3 >= len(tokenized_seq):
+                        break
+                    tok_2 = tokenized_seq[idx + 1]
+                    tok_3 = tokenized_seq[idx + 2]
+                    tok_4 = tokenized_seq[idx + 3]
+                    if (
+                        not isinstance(tok_2, tuple)
+                        or tok_2[0] != "note"
+                        or not isinstance(tok_3, tuple)
+                        or tok_3[0] != "onset"
+                        or not isinstance(tok_4, tuple)
+                        or tok_4[0] != "dur"
+                    ):
+                        idx += 1
+                        continue
+
+                    assert isinstance(tok_1[1], str), f"Expected str for instrument, got {tok_1[1]}"
+                    assert isinstance(tok_2[1], int), f"Expected int for pitch, got {tok_2[1]}"
+                    assert isinstance(tok_2[2], int), f"Expected int for velocity, got {tok_2[2]}"
+                    assert isinstance(tok_3[1], int), f"Expected int for onset, got {tok_3[1]}"
+                    assert isinstance(tok_4[1], int), f"Expected int for duration, got {tok_4[1]}"
+
+                    _instrument = tok_1[1]
+                    _pitch = tok_2[1]
+                    _velocity = tok_2[2]
+                    _start_tick = curr_tick + tok_3[1]
+                    _end_tick = _start_tick + tok_4[1]
+
+                    if _instrument in instrument_to_channel:
+                        _channel = instrument_to_channel[_instrument]
+                        note_msgs.append({
+                            "type": "note",
+                            "data": {"pitch": _pitch, "start": _start_tick, "end": _end_tick, "velocity": _velocity},
+                            "tick": _start_tick,
+                            "channel": _channel,
+                        })
+                    else:
+                        logger.warning(
+                            f"Tried to decode note message for unexpected instrument: {_instrument}"
+                        )
+                    idx += 4
+                    continue
+
+                # Legacy drum case (takes 2 or 3 blocks)
+                elif _tok_type_1 == "drum":
                     if idx + 1 >= len(tokenized_seq):
                         break
                     tok_2 = tokenized_seq[idx + 1]
-                    if tok_2[0] != "onset":
+                    if not isinstance(tok_2, tuple) or tok_2[0] != "onset":
                         idx += 1
                         continue
                         
@@ -596,7 +638,19 @@ class AbsTokenizer(Tokenizer):
                     _channel = instrument_to_channel["drum"]
                     _velocity: int = self.config["drum_velocity"]
                     _start_tick: int = curr_tick + tok_2[1]
-                    _end_tick: int = _start_tick + self.time_step_ms
+                    if (
+                        idx + 2 < len(tokenized_seq)
+                        and isinstance(tokenized_seq[idx + 2], tuple)
+                        and tokenized_seq[idx + 2][0] == "dur"
+                    ):
+                        assert isinstance(tokenized_seq[idx + 2][1], int), (
+                            f"Expected int for duration, got {tokenized_seq[idx + 2][1]}"
+                        )
+                        _end_tick: int = _start_tick + tokenized_seq[idx + 2][1]
+                        idx += 3
+                    else:
+                        _end_tick = _start_tick + self.time_step_ms
+                        idx += 2
 
                     note_msgs.append({
                         "type": "note",
@@ -604,17 +658,21 @@ class AbsTokenizer(Tokenizer):
                         "tick": _start_tick,
                         "channel": _channel,
                     })
-                    idx += 2
                     continue
                     
-                # Note Case (Takes 3 blocks)
+                # Legacy note case (takes 3 blocks)
                 elif _tok_type_1 in self.instruments_nd:
                     if idx + 2 >= len(tokenized_seq):
                         break
                     tok_2 = tokenized_seq[idx + 1]
                     tok_3 = tokenized_seq[idx + 2]
                     
-                    if tok_2[0] != "onset" or tok_3[0] != "dur":
+                    if (
+                        not isinstance(tok_2, tuple)
+                        or not isinstance(tok_3, tuple)
+                        or tok_2[0] != "onset"
+                        or tok_3[0] != "dur"
+                    ):
                         idx += 1
                         continue
 
@@ -691,7 +749,7 @@ class AbsTokenizer(Tokenizer):
             _max_pitch_aug: int,
             pitch_aug: int | None = None,
         ) -> list[Token]:
-            def pitch_aug_tok(tok: Token, _pitch_aug: int) -> Token:
+            def pitch_aug_tok(tok: Token, _pitch_aug: int, instrument: str | None) -> Token:
                 if isinstance(tok, str):  # Stand in for SpecialToken
                     _tok_type = "special"
                 else:
@@ -701,13 +759,32 @@ class AbsTokenizer(Tokenizer):
                     _tok_type == "special"
                     or _tok_type == "prefix"
                     or _tok_type == "dur"
-                    or _tok_type == "drum"
                     or _tok_type == "onset"
+                    or _tok_type == "instrument"
+                    or _tok_type == "drum"
                 ):
                     # Return without changing
                     return tok
+                elif _tok_type == "note":
+                    assert isinstance(tok, tuple) and len(tok) == 3, (
+                        "Invalid note token"
+                    )
+                    (_, _pitch, _velocity) = tok
+
+                    assert isinstance(_pitch, int), (
+                        f"Expected int for pitch, got {_pitch}"
+                    )
+                    assert isinstance(_velocity, int), (
+                        f"Expected int for velocity, got {_velocity}"
+                    )
+
+                    if instrument == "drum":
+                        return tok
+                    if 0 <= _pitch + _pitch_aug <= 127:
+                        return ("note", _pitch + _pitch_aug, _velocity)
+                    return unk_tok
                 else:
-                    # Return augmented tok
+                    # Legacy note token
                     assert isinstance(tok, tuple) and len(tok) == 3, (
                         "Invalid note token"
                     )
@@ -728,7 +805,13 @@ class AbsTokenizer(Tokenizer):
             if pitch_aug is None:
                 pitch_aug = random.randint(-_max_pitch_aug, _max_pitch_aug)
 
-            return [pitch_aug_tok(x, pitch_aug) for x in src]
+            res = []
+            current_instrument = None
+            for tok in src:
+                if isinstance(tok, tuple) and tok[0] == "instrument":
+                    current_instrument = cast(str, tok[1])
+                res.append(pitch_aug_tok(tok, pitch_aug, current_instrument))
+            return res
 
         return self.export_aug_fn_concat(
             functools.partial(
@@ -772,12 +855,27 @@ class AbsTokenizer(Tokenizer):
                     _tok_type == "special"
                     or _tok_type == "prefix"
                     or _tok_type == "dur"
-                    or _tok_type == "drum"
                     or _tok_type == "onset"
+                    or _tok_type == "instrument"
+                    or _tok_type == "drum"
                 ):
                     # Return without changing
                     return tok
+                elif _tok_type == "note":
+                    assert isinstance(tok, tuple) and len(tok) == 3
+                    (_, _pitch, _velocity) = tok
+
+                    assert isinstance(_pitch, int)
+                    assert isinstance(_velocity, int)
+
+                    if _velocity + _velocity_aug >= max_velocity:
+                        return ("note", _pitch, max_velocity)
+                    elif _velocity + _velocity_aug <= min_velocity_step:
+                        return ("note", _pitch, min_velocity_step)
+
+                    return ("note", _pitch, _velocity + _velocity_aug)
                 else:
+                    # Legacy note token
                     assert isinstance(tok, tuple) and len(tok) == 3
                     (_instrument, _pitch, _velocity) = tok
 
@@ -863,7 +961,8 @@ class AbsTokenizer(Tokenizer):
 
             # Buffer to hold all events, grouped by time
             # buffer[time_tok_count][onset_ms] = [ event_1, event_2, ... ]
-            # where event is a list of tokens, e.g. [note, onset, dur]
+            # where event is a list of tokens, e.g.
+            # [instrument, note, onset, dur]
             buffer: defaultdict[int, defaultdict[int, list[list[Token]]]] = (
                 defaultdict(lambda: defaultdict(list))
             )
@@ -936,9 +1035,26 @@ class AbsTokenizer(Tokenizer):
                 tok_type = tok[0] if isinstance(tok, tuple) else tok
                 current_onset = -1
 
-                if (
+                if tok_type == "instrument":  # Split note event: 4 tokens
+                    event_subsequence = src[idx : idx + 4]
+                    idx += 4
+                    if (
+                        len(event_subsequence) < 4
+                        or not isinstance(event_subsequence[1], tuple)
+                        or not isinstance(event_subsequence[2], tuple)
+                        or not isinstance(event_subsequence[3], tuple)
+                        or event_subsequence[1][0] != "note"
+                        or event_subsequence[2][0] != "onset"
+                        or event_subsequence[3][0] != "dur"
+                    ):
+                        logger.warning(
+                            f"Malformed sequence: {event_subsequence}"
+                        )
+                        continue
+                    current_onset = event_subsequence[2][1]
+                elif (
                     tok_type in instruments_wd and tok_type != "drum"
-                ):  # Note Event: 3 tokens
+                ):  # Legacy note event: 3 tokens
                     event_subsequence = src[idx : idx + 3]
                     idx += 3
                     if (
@@ -951,9 +1067,17 @@ class AbsTokenizer(Tokenizer):
                         )
                         continue
                     current_onset = event_subsequence[1][1]
-                elif tok_type == "drum":  # Drum Event: 2 tokens
-                    event_subsequence = src[idx : idx + 2]
-                    idx += 2
+                elif tok_type == "drum":  # Legacy drum event: 2 or 3 tokens
+                    if (
+                        idx + 2 < len(src)
+                        and isinstance(src[idx + 2], tuple)
+                        and src[idx + 2][0] == "dur"
+                    ):
+                        event_subsequence = src[idx : idx + 3]
+                        idx += 3
+                    else:
+                        event_subsequence = src[idx : idx + 2]
+                        idx += 2
                     if (
                         len(event_subsequence) < 2
                         or event_subsequence[1][0] != "onset"
@@ -1013,10 +1137,9 @@ class AbsTokenizer(Tokenizer):
 
                     # Process and append all events for this timestamp
                     for event in events_at_onset:
-                        first_tok = event[0]
-                        # Note event with duration
-                        if len(event) == 3:
-                            _src_dur_tok = cast(tuple[str, int], event[2])
+                        # Split or legacy note event with duration
+                        if len(event) in (3, 4):
+                            _src_dur_tok = cast(tuple[str, int], event[-1])
                             tgt_dur = _quantize_time(
                                 _src_dur_tok[1] * tempo_aug
                             )
@@ -1024,14 +1147,13 @@ class AbsTokenizer(Tokenizer):
                                 min(tgt_dur, max_dur),
                                 time_step,
                             )
-                            res_events.extend(
-                                [
-                                    first_tok,
-                                    ("onset", curr_tgt_onset),
-                                    ("dur", tgt_dur),
-                                ]
-                            )
+                            res_events.extend(event[:-2])
+                            res_events.extend([
+                                ("onset", curr_tgt_onset),
+                                ("dur", tgt_dur),
+                            ])
                         elif len(event) == 2:
+                            first_tok = event[0]
                             res_events.extend(
                                 [first_tok, ("onset", curr_tgt_onset)]
                             )

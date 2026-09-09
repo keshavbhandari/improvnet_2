@@ -5,7 +5,7 @@ import json
 import torch
 from improvnet.tokenizer.midi import MidiDict
 from improvnet.tokenizer.absolute import AbsTokenizer
-from improvnet.model.caddi_config import GENRES
+from improvnet.model.ar_config import GENRES
 
 
 def read_jsonl_files(data_dirs, split="train"):
@@ -36,7 +36,7 @@ class ProcessData:
             "French Horn", "Brass Section", "Soprano/Alto Sax", "Tenor Sax", 
             "Baritone Sax", "Oboe", "English Horn", "Bassoon", "Clarinet", "Piccolo", 
             "Flute", "Pipe", "Synth Lead", "Synth Pad", "Synth Effect", "Ethnic", 
-            "Percussive", "Sound Effects"
+            "Percussive", "Sound Effects", "drum"
         ]
 
     def get_genre_id(self, genre_str: str) -> int:
@@ -60,9 +60,92 @@ class ProcessData:
     
     def tokens_to_midi(self, tokens: list) -> MidiDict:
         return self.tokenizer.detokenize(tokens).to_midi()
+
+    def _is_instrument_name(self, value) -> bool:
+        return isinstance(value, str) and value in self.INSTRUMENT_CLASSES
+
+    def _append_split_note(
+        self,
+        tokens: list,
+        instrument: str,
+        pitch: int,
+        velocity: int | None,
+        onset: int | None = None,
+        duration: int | None = None,
+    ) -> None:
+        if velocity is None:
+            velocity = self.tokenizer.config["drum_velocity"]
+        tokens.append(("instrument", instrument))
+        tokens.append(("note", pitch, velocity))
+        if onset is not None:
+            tokens.append(("onset", onset))
+        if duration is not None:
+            tokens.append(("dur", duration))
+
+    def normalize_token_sequence(self, tokens: list) -> list:
+        normalized = []
+        for event in tokens:
+            if not isinstance(event, tuple):
+                normalized.append(event)
+                continue
+
+            tok_type = event[0] if len(event) > 0 else None
+            if tok_type in ("instrument", "note"):
+                normalized.append(event)
+            elif tok_type == "drum" and len(event) >= 2 and isinstance(event[1], int):
+                self._append_split_note(
+                    normalized,
+                    "drum",
+                    event[1],
+                    self.tokenizer.config["drum_velocity"],
+                )
+            elif self._is_instrument_name(tok_type) and len(event) >= 3:
+                self._append_split_note(normalized, tok_type, event[1], event[2])
+            else:
+                normalized.append(event)
+        return normalized
+
+    def serialized_tokens_to_tokens(self, tokens_raw: list) -> list:
+        tokens = []
+        for event in tokens_raw:
+            if (
+                isinstance(event, list)
+                and len(event) > 0
+                and all(x == event[0] for x in event)
+                and isinstance(event[0], str)
+            ):
+                tokens.append(event[0])
+            elif (
+                isinstance(event, list)
+                and len(event) == 5
+                and isinstance(event[0], list)
+                and len(event[0]) == 2
+            ):
+                inst_val = event[0][1]
+                pitch_val = event[1][1]
+                vel_val = event[2][1]
+                onset_val = event[3][1]
+                dur_val = event[4][1]
+
+                if inst_val in ('<P>', '<BLANK>', '<MASK>', '<S>', '<E>', '<T>'):
+                    if inst_val not in ('<P>', '<BLANK>'):
+                        tokens.append(inst_val)
+                else:
+                    self._append_split_note(
+                        tokens,
+                        inst_val,
+                        pitch_val,
+                        vel_val,
+                        onset=onset_val,
+                        duration=dur_val,
+                    )
+            else:
+                tokens.append(tuple(event) if isinstance(event, list) else event)
+        return self.normalize_token_sequence(tokens)
     
     def tokens_to_tensor(self, tokens: list) -> torch.Tensor:
         """Converts a flattened list of mixed strings/tuples directly into a 1D tensor of IDs."""
+        tokens = self.normalize_token_sequence(tokens)
         ids = []
         for tok in tokens:
             if tok in self.tokenizer.tok_to_id:
@@ -92,30 +175,30 @@ class ProcessData:
         return final_tensor
 
     def pitch_augmentation(self, tokens: list) -> list:
-        """Shifts pitches. Safely handles 2-element or 3-element tuples, skipping drums, onsets, and durations!"""
+        """Shifts note pitches while skipping drums."""
         semitone_shift = random.randint(-7, 7)
-        augmented_tokens = copy.deepcopy(tokens)
+        augmented_tokens = copy.deepcopy(self.normalize_token_sequence(tokens))
+        current_instrument = None
         for i, event in enumerate(augmented_tokens):
-            if isinstance(event, tuple) and len(event) in (2, 3) and isinstance(event[1], int):
-                # Prevent pitch-shifting onset, duration, or prefix tokens!
-                if event[0] in ('onset', 'dur', 'prefix'):
-                    continue
-                    
-                # DO NOT pitch-shift drums, as MIDI drum pitches map to specific drum hardware!
-                if "Drum" in str(event[0]) or "Percuss" in str(event[0]):
+            if isinstance(event, tuple) and event[0] == "instrument":
+                current_instrument = event[1]
+                continue
+            if isinstance(event, tuple) and event[0] == "note" and isinstance(event[1], int):
+                if current_instrument == "drum" or "Drum" in str(current_instrument) or "Percuss" in str(current_instrument):
                     continue
                     
                 new_pitch = max(0, min(127, event[1] + semitone_shift))
-                if len(event) == 3:
-                    augmented_tokens[i] = (event[0], new_pitch, event[2])
-                else:
-                    augmented_tokens[i] = (event[0], new_pitch)
+                augmented_tokens[i] = ("note", new_pitch, event[2])
         return augmented_tokens
 
     def get_instrument_multihot(self, tokens: list) -> torch.Tensor:
         active_instruments = set()
         for event in tokens:
-            if isinstance(event, tuple) and len(event) in (2, 3):
+            if isinstance(event, tuple) and event[0] == "instrument":
+                inst_name = event[1]
+                if inst_name in self.INSTRUMENT_CLASSES:
+                    active_instruments.add(inst_name)
+            elif isinstance(event, tuple) and len(event) in (2, 3):
                 inst_name = event[0]
                 if inst_name in self.INSTRUMENT_CLASSES:
                     active_instruments.add(inst_name)
@@ -132,7 +215,7 @@ class ProcessData:
         augmented_tokens = copy.deepcopy(tokens)
         note_indices = [
             i for i, event in enumerate(augmented_tokens)
-            if isinstance(event, tuple) and len(event) in (2, 3)
+            if isinstance(event, tuple) and event[0] == "note"
         ]
         mask_notes = random.sample(note_indices, int(len(note_indices) * ratio))
 

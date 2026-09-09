@@ -2,18 +2,17 @@ import math
 import random
 import os
 import json
-import pickle
 from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.checkpoint import checkpoint as activation_checkpoint
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
+import improvnet.model.ar_config as ar_config
 from improvnet.model.ar_config import *
 from improvnet.model.ar_model import ARContextModel
 from improvnet.utils.ar_utils import (
@@ -21,6 +20,7 @@ from improvnet.utils.ar_utils import (
     build_optimizer,
     collect_rng_state_for_checkpoint,
     distributed_rank_world,
+    load_split_byte_index,
     load_checkpoint,
     load_training_checkpoint,
     resume_epoch_loader,
@@ -36,24 +36,29 @@ def _amp_dtype():
     return torch.bfloat16 if major >= 8 else torch.float16
 
 AMP_DTYPE = _amp_dtype()
-LM_HEAD_CHUNK_SIZE = globals().get("LM_HEAD_CHUNK_SIZE", 512)
 
 class ARContextDataset(Dataset):
-    def __init__(self, jsonl_files: list[str], processor: ProcessData, augment: bool = True):
+    def __init__(
+        self,
+        jsonl_files: list[str],
+        split: str,
+        processor: ProcessData,
+        augment: bool = True
+    ):
         self.jsonl_files = jsonl_files
+        self.split = split
         self.processor = processor
         self.augment = augment
         self.file_handles = {}
         self.global_indices = []
         
         for file_idx, jsonl_path in enumerate(self.jsonl_files):
-            index_path = jsonl_path.replace('.jsonl', '_index.pkl')
-            if not os.path.exists(index_path):
-                raise FileNotFoundError(f"Missing index! Run build_index.py on {jsonl_path}")
-            with open(index_path, 'rb') as f:
-                offsets = pickle.load(f)
+            offsets = load_split_byte_index(jsonl_path, split, config=ar_config)
             for offset in offsets:
                 self.global_indices.append((file_idx, offset))
+
+        if not self.global_indices:
+            raise ValueError(f"No {split!r} examples found in {self.jsonl_files}")
 
     def __len__(self):
         return len(self.global_indices)
@@ -64,33 +69,7 @@ class ARContextDataset(Dataset):
         return self.file_handles[jsonl_path]
 
     def _lists_to_tuples(self, tokens_raw):
-        tokens = []
-        for event in tokens_raw:
-            if isinstance(event, list) and len(event) > 0 and all(x == event[0] for x in event) and isinstance(event[0], str):
-                tokens.append(event[0])
-            elif isinstance(event, list) and len(event) == 5 and isinstance(event[0], list) and len(event[0]) == 2:
-                inst_val = event[0][1]
-                pitch_val = event[1][1]
-                vel_val = event[2][1]
-                onset_val = event[3][1]
-                dur_val = event[4][1]
-                
-                if inst_val in ('<P>', '<BLANK>', '<MASK>', '<S>', '<E>', '<T>'):
-                    if inst_val not in ('<P>', '<BLANK>'):
-                        tokens.append(inst_val)
-                else:
-                    if inst_val == 'drum':
-                        tokens.append((inst_val, pitch_val))
-                    else:
-                        tokens.append((inst_val, pitch_val, vel_val))
-                    tokens.append(('onset', onset_val))
-                    tokens.append(('dur', dur_val))
-            else:
-                if isinstance(event, list):
-                    tokens.append(tuple(event))
-                else:
-                    tokens.append(event)
-        return tokens
+        return self.processor.serialized_tokens_to_tokens(tokens_raw)
 
     def __getitem__(self, idx):
         file_idx, offset = self.global_indices[idx]
@@ -134,8 +113,9 @@ class ARContextDataset(Dataset):
 
 def build_dataloader(jsonl_files: list[str], split: str, batch_size: int, augment: bool = False, num_workers: int = 4, distributed: bool = False) -> DataLoader:
     processor = ProcessData()
-    dataset = ARContextDataset(jsonl_files=jsonl_files, processor=processor, augment=augment)
-    sampler = DistributedSampler(dataset, shuffle=True) if distributed else None
+    dataset = ARContextDataset(jsonl_files=jsonl_files, split=split, processor=processor, augment=augment)
+    shuffle = split == "train"
+    sampler = DistributedSampler(dataset, shuffle=shuffle) if distributed else None
     
     def collate_fn(batch):
         return {
@@ -146,7 +126,7 @@ def build_dataloader(jsonl_files: list[str], split: str, batch_size: int, augmen
         }
         
     return DataLoader(
-        dataset, batch_size=batch_size, shuffle=(not distributed),
+        dataset, batch_size=batch_size, shuffle=(shuffle and not distributed),
         sampler=sampler, num_workers=num_workers, pin_memory=True, drop_last=True,
         collate_fn=collate_fn
     )
@@ -197,56 +177,6 @@ def build_resume_warmup_scheduler(
         return lr_lambda
 
     return LambdaLR(optimizer, [make_lr_lambda(factor) for factor in start_factors])
-
-def _unwrap_model(model):
-    return model.module if isinstance(model, DDP) else model
-
-def chunked_lm_head_cross_entropy(
-    model,
-    hidden: torch.Tensor,
-    target: torch.Tensor,
-    chunk_size: int = LM_HEAD_CHUNK_SIZE,
-    use_checkpoint: bool = False
-) -> torch.Tensor:
-    if hidden.shape[:2] != target.shape:
-        raise ValueError(
-            f"Hidden/target shape mismatch: hidden={tuple(hidden.shape)}, "
-            f"target={tuple(target.shape)}"
-        )
-
-    model_to_use = _unwrap_model(model)
-    chunk_size = int(chunk_size)
-    if chunk_size <= 0:
-        chunk_size = hidden.size(1)
-
-    valid_tokens = target.ne(PAD_ID).sum().clamp_min(1)
-    loss_sum = hidden.new_zeros((), dtype=torch.float32)
-
-    for start in range(0, hidden.size(1), chunk_size):
-        end = min(start + chunk_size, hidden.size(1))
-        hidden_chunk = hidden[:, start:end, :]
-        target_chunk = target[:, start:end].contiguous()
-
-        def chunk_loss(chunk_hidden, chunk_target):
-            logits = model_to_use.lm_head(chunk_hidden)
-            return F.cross_entropy(
-                logits.reshape(-1, VOCAB_SIZE),
-                chunk_target.reshape(-1),
-                ignore_index=PAD_ID,
-                reduction='sum'
-            )
-
-        if use_checkpoint and torch.is_grad_enabled():
-            loss_sum = loss_sum + activation_checkpoint(
-                chunk_loss,
-                hidden_chunk,
-                target_chunk,
-                use_reentrant=False
-            )
-        else:
-            loss_sum = loss_sum + chunk_loss(hidden_chunk, target_chunk)
-
-    return loss_sum / valid_tokens
 
 def train(n_steps: int = N_STEPS):
     local_rank = setup_ddp()
@@ -347,9 +277,6 @@ def train(n_steps: int = N_STEPS):
             print(f"Optimizer state not restored: {resume_state.get('optimizer_skipped_reason', 'not available')}.")
         if resume_state.get('rng_restored'):
             print("Restored saved RNG state for training ranks.")
-    if is_main_process:
-        print(f"Using chunked LM-head CE with chunk size {LM_HEAD_CHUNK_SIZE}.")
-    
     running_loss, log_steps = 0.0, 0
     model.train()
     epoch = start_epoch
@@ -373,18 +300,15 @@ def train(n_steps: int = N_STEPS):
             
             with ddp_context:
                 with torch.amp.autocast(DEVICE, dtype=AMP_DTYPE):
-                    hidden = model(
+                    logits = model(
                         target=batch["input"],          
                         genre=batch["genre"],
-                        multi_hot=batch["multi_hot"],
-                        return_hidden=True
+                        multi_hot=batch["multi_hot"]
                     )
-                    loss = chunked_lm_head_cross_entropy(
-                        model,
-                        hidden,
-                        batch["target"],
-                        chunk_size=LM_HEAD_CHUNK_SIZE,
-                        use_checkpoint=True
+                    loss = F.cross_entropy(
+                        logits.reshape(-1, VOCAB_SIZE),
+                        batch["target"].reshape(-1),
+                        ignore_index=PAD_ID
                     ) / ACCUM_STEPS
 
                 if scaler.is_enabled():
@@ -463,7 +387,7 @@ def train(n_steps: int = N_STEPS):
     return model
 
 @torch.no_grad()
-def evaluate_validation(model, val_loader, local_rank, device, max_batches: int = 50):
+def evaluate_validation(model, val_loader, local_rank, device, max_batches: int = 100):
     model.eval()
     total_loss, steps = 0.0, 0
     iterator = tqdm(val_loader, desc="Validation", total=min(len(val_loader), max_batches), leave=False) if local_rank == 0 else val_loader
@@ -473,18 +397,15 @@ def evaluate_validation(model, val_loader, local_rank, device, max_batches: int 
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         
         with torch.amp.autocast(DEVICE, dtype=AMP_DTYPE):
-            hidden = model(
+            logits = model(
                 target=batch["input"],
                 genre=batch["genre"],
-                multi_hot=batch["multi_hot"],
-                return_hidden=True
+                multi_hot=batch["multi_hot"]
             )
-            loss = chunked_lm_head_cross_entropy(
-                model,
-                hidden,
-                batch["target"],
-                chunk_size=LM_HEAD_CHUNK_SIZE,
-                use_checkpoint=False
+            loss = F.cross_entropy(
+                logits.reshape(-1, VOCAB_SIZE),
+                batch["target"].reshape(-1),
+                ignore_index=PAD_ID
             )
             
         total_loss += loss.item()

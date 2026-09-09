@@ -2,7 +2,6 @@ import math
 import random
 import os
 import json
-import pickle
 import contextlib
 from tqdm import tqdm
 import torch
@@ -22,6 +21,7 @@ from improvnet.utils.ar_utils import (
     build_optimizer,
     collect_rng_state_for_checkpoint,
     distributed_rank_world,
+    load_split_byte_index,
     load_checkpoint,
     load_training_checkpoint,
     resume_epoch_loader,
@@ -40,21 +40,27 @@ def _amp_dtype():
 AMP_DTYPE = _amp_dtype()
 
 class TwoTowerDataset(Dataset):
-    def __init__(self, jsonl_files: list[str], processor: ProcessData, augment: bool = True):
+    def __init__(
+        self,
+        jsonl_files: list[str],
+        split: str,
+        processor: ProcessData,
+        augment: bool = True
+    ):
         self.jsonl_files = jsonl_files
+        self.split = split
         self.processor = processor
         self.augment = augment
         self.file_handles = {}
         self.global_indices = []
         
         for file_idx, jsonl_path in enumerate(self.jsonl_files):
-            index_path = jsonl_path.replace('.jsonl', '_index.pkl')
-            if not os.path.exists(index_path):
-                raise FileNotFoundError(f"Missing index! Run build_index.py on {jsonl_path}")
-            with open(index_path, 'rb') as f:
-                offsets = pickle.load(f)
+            offsets = load_split_byte_index(jsonl_path, split, config=twotower_config)
             for offset in offsets:
                 self.global_indices.append((file_idx, offset))
+
+        if not self.global_indices:
+            raise ValueError(f"No {split!r} examples found in {self.jsonl_files}")
 
     def __len__(self):
         return len(self.global_indices)
@@ -65,33 +71,7 @@ class TwoTowerDataset(Dataset):
         return self.file_handles[jsonl_path]
 
     def _lists_to_tuples(self, tokens_raw):
-        tokens = []
-        for event in tokens_raw:
-            if isinstance(event, list) and len(event) > 0 and all(x == event[0] for x in event) and isinstance(event[0], str):
-                tokens.append(event[0])
-            elif isinstance(event, list) and len(event) == 5 and isinstance(event[0], list) and len(event[0]) == 2:
-                inst_val = event[0][1]
-                pitch_val = event[1][1]
-                vel_val = event[2][1]
-                onset_val = event[3][1]
-                dur_val = event[4][1]
-                
-                if inst_val in ('<P>', '<BLANK>', '<MASK>', '<S>', '<E>', '<T>'):
-                    if inst_val not in ('<P>', '<BLANK>'):
-                        tokens.append(inst_val)
-                else:
-                    if inst_val == 'drum':
-                        tokens.append((inst_val, pitch_val))
-                    else:
-                        tokens.append((inst_val, pitch_val, vel_val))
-                    tokens.append(('onset', onset_val))
-                    tokens.append(('dur', dur_val))
-            else:
-                if isinstance(event, list):
-                    tokens.append(tuple(event))
-                else:
-                    tokens.append(event)
-        return tokens
+        return self.processor.serialized_tokens_to_tokens(tokens_raw)
 
     def __getitem__(self, idx):
         file_idx, offset = self.global_indices[idx]
@@ -153,7 +133,9 @@ class TwoTowerDataset(Dataset):
 
             active_insts_names = set()
             for tok in target_tokens:
-                if isinstance(tok, tuple) and len(tok) in (2, 3) and tok[0] in self.processor.INSTRUMENT_CLASSES:
+                if isinstance(tok, tuple) and tok[0] == "instrument" and tok[1] in self.processor.INSTRUMENT_CLASSES:
+                    active_insts_names.add(tok[1])
+                elif isinstance(tok, tuple) and len(tok) in (2, 3) and tok[0] in self.processor.INSTRUMENT_CLASSES:
                     active_insts_names.add(tok[0])
             is_multi_track = len(active_insts_names) > 1
 
@@ -204,7 +186,9 @@ class TwoTowerDataset(Dataset):
                         for v_idx in valid_indices:
                             tok_id = target_tensor[v_idx].item()
                             tok_str = self.processor.tokenizer.id_to_tok.get(tok_id)
-                            if isinstance(tok_str, tuple) and len(tok_str) in (2,3) and tok_str[0] in self.processor.INSTRUMENT_CLASSES:
+                            if isinstance(tok_str, tuple) and tok_str[0] == "instrument" and tok_str[1] in self.processor.INSTRUMENT_CLASSES:
+                                active_insts.add(tok_str[1])
+                            elif isinstance(tok_str, tuple) and len(tok_str) in (2,3) and tok_str[0] in self.processor.INSTRUMENT_CLASSES:
                                 active_insts.add(tok_str[0])
                         
                         if len(active_insts) > 1:
@@ -218,9 +202,12 @@ class TwoTowerDataset(Dataset):
                                     
                                 tok_id = target_tensor[v_idx].item()
                                 tok_str = self.processor.tokenizer.id_to_tok.get(tok_id)
-                                if isinstance(tok_str, tuple) and len(tok_str) in (2,3) and tok_str[0] == strip_inst:
+                                if isinstance(tok_str, tuple) and tok_str[0] == "instrument" and tok_str[1] == strip_inst:
                                     draft_input[v_idx] = MASK_ID
-                                    skip_count = 2 # Also mask the subsequent onset and duration!
+                                    skip_count = 3 # Also mask note, onset, and duration.
+                                elif isinstance(tok_str, tuple) and len(tok_str) in (2,3) and tok_str[0] == strip_inst:
+                                    draft_input[v_idx] = MASK_ID
+                                    skip_count = 2 # Legacy note token: also mask onset and duration.
 
                     # Weights: Low emphasis on clean notes, high emphasis on hallucinating masked notes
                     draft_wt[valid_indices] = 0.05 
@@ -258,11 +245,12 @@ class TwoTowerDataset(Dataset):
 
 def build_dataloader(jsonl_files: list[str], split: str, batch_size: int, augment: bool = False, num_workers: int = 4, distributed: bool = False) -> DataLoader:
     processor = ProcessData()
-    dataset = TwoTowerDataset(jsonl_files=jsonl_files, processor=processor, augment=augment)
-    sampler = DistributedSampler(dataset, shuffle=True) if distributed else None
+    dataset = TwoTowerDataset(jsonl_files=jsonl_files, split=split, processor=processor, augment=augment)
+    shuffle = split == "train"
+    sampler = DistributedSampler(dataset, shuffle=shuffle) if distributed else None
     
     return DataLoader(
-        dataset, batch_size=batch_size, shuffle=(not distributed),
+        dataset, batch_size=batch_size, shuffle=(shuffle and not distributed),
         sampler=sampler, num_workers=num_workers, pin_memory=True, drop_last=True,
         collate_fn=dataset.collate_fn
     )

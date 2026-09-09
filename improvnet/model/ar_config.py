@@ -1,18 +1,21 @@
 import torch
 import os
+from improvnet.tokenizer.absolute import AbsTokenizer
 
-RUN_NAME = "ar_context_pretrain_v1" # Old run
-SAVE_DIR = "/gpfs/scratch/acw769/improvnet/artifacts/ar_context" # Old run
-# RUN_NAME = "ar_context_pretrain_v1_optimized" # Optimized run
-# SAVE_DIR = "/gpfs/scratch/acw769/improvnet/artifacts/ar_context_optimized" # Optimized run
+RUN_NAME = "ar_context_split_instrument_v1"
+SAVE_DIR = "/gpfs/scratch/acw769/improvnet/artifacts/ar_context_split_instrument"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-RESUME_TRAINING = True
+RESUME_TRAINING = False
 
 # --- VOCABULARY ---
-VOCAB_SIZE = 67761 
+VOCAB_SIZE = AbsTokenizer().vocab_size
 GENRES = ["classical", "jazz", "blues", "unknown"]
 NUM_GENRES = len(GENRES)
+
+# --- DATA SPLITS ---
+DATA_SPLIT_SEED = 42
+DATA_SPLIT_RATIOS = {"train": 0.97, "validation": 0.02, "test": 0.01}
 
 # --- SEQUENCE MATH ---
 # We train the AR context model on full 2048-token sequences.
@@ -25,7 +28,7 @@ BLANK_ID = 6
 SEP_ID = 7
 
 # --- ARCHITECTURE MATH ---
-EMBED_DIM = 1536
+EMBED_DIM = 2048
 N_HEADS = 16       # 1024 / 16 = 64 head_dim
 N_KV_HEADS = 4     # Grouped Query Attention (4 queries per KV)
 N_LAYERS = 20
@@ -35,15 +38,12 @@ N_LAYERS = 20
 # ==========================================
 # AR training is highly efficient, so we can use larger batch sizes 
 # or sequences compared to the complex unrolled diffusion model.
-BATCH_SIZE = 19 # Old run #20
-# BATCH_SIZE = 20 # Optimized run
-ACCUM_STEPS = 1 # Optimized run, 2 for old run
-LR = 1.0e-4 # Old run
-# LR = 1.5e-4 # Optimized run
+BATCH_SIZE = 20
+ACCUM_STEPS = 2 # Optimized run, 2 for old run
+LR = 2e-4 # Optimized run
 WARMUP_STEPS = 10000 
 N_STEPS = 800000 
 GRAD_CLIP = 1.0
-LM_HEAD_CHUNK_SIZE = 2048
 
 # OPTIMIZER_BACKEND = "paged_adamw8bit"
 # ALLOW_OPTIMIZER_MIGRATION_TO_8BIT = True
@@ -61,7 +61,7 @@ VAL_EVERY = 10000
 
 JSONL_FILES = [
     "/data/scratch/acw769/improvnet/artifacts/data/misc_data_tokenized.jsonl",
-    "/data/scratch/acw769/improvnet/artifacts/data/gigamidi_data_tokenized.jsonl"
+    # "/data/scratch/acw769/improvnet/artifacts/data/gigamidi_data_tokenized.jsonl"
 ]
 
 if torch.cuda.is_available():
