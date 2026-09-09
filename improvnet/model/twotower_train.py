@@ -145,7 +145,7 @@ class TwoTowerDataset(Dataset):
                 # Slightly increased the maximum possible insertions for multi-track pieces
                 num_insertions = random.randint(0, int(len(target_tokens) * 0.10) + 1)
                 for _ in range(num_insertions):
-                    chunk_size = 3 if random.random() < 0.8 else 1
+                    chunk_size = 4 if random.random() < 0.8 else 1
                     idx = random.randint(0, len(target_tokens))
                     for _ in range(chunk_size):
                         target_tokens.insert(idx, '<BLANK>')
