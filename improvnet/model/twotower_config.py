@@ -3,10 +3,11 @@ import os
 from improvnet.tokenizer.absolute import AbsTokenizer
 
 RUN_NAME = "twotower_split_instrument_v1"
-SAVE_DIR = "/gpfs/scratch/acw769/improvnet/artifacts/twotower_split_instrument"
+SAVE_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/twotower_split_instrument"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-RESUME_TRAINING = False
+# Start from latest_checkpoint.pt when present; otherwise start a fresh run.
+RESUME_TRAINING = True
 
 # --- VOCABULARY ---
 VOCAB_SIZE = AbsTokenizer().vocab_size
@@ -56,13 +57,15 @@ ALLOW_OPTIMIZER_MIGRATION_TO_8BIT = False
 # RESUME_CHECKPOINT_ACCUM_STEPS = 4
 # RESUME_CHECKPOINT_WORLD_SIZE = 4
 
-AR_MODEL_PATH = "/gpfs/scratch/acw769/improvnet/artifacts/ar_context_split_instrument/latest_checkpoint.pt"
+AR_MODEL_PATH = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/ar_context_split_instrument/latest_checkpoint.pt"
 
 LOG_EVERY = 10
 VAL_EVERY = 20000
+# Save independently of validation so long Slurm jobs can always resume.
+CHECKPOINT_EVERY = 2000
 
 JSONL_FILES = [
-    "/data/scratch/acw769/improvnet/artifacts/data/misc_data_tokenized.jsonl"
+    "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/misc_data_tokenized.jsonl"
 ]
 
 if torch.cuda.is_available():

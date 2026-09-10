@@ -140,6 +140,28 @@ def setup_ddp():
 def cleanup_ddp():
     dist.destroy_process_group()
 
+def checkpoint_requested(device: torch.device) -> bool:
+    """Return a rank-consistent pre-timeout checkpoint request."""
+    request_file = os.environ.get("CHECKPOINT_REQUEST_FILE")
+    requested = bool(request_file and os.path.exists(request_file))
+    if dist.is_initialized():
+        requested_tensor = torch.tensor(int(requested), device=device)
+        dist.all_reduce(requested_tensor, op=dist.ReduceOp.MAX)
+        requested = bool(requested_tensor.item())
+    return requested
+
+def next_training_position(global_sample_idx, epoch, dataset_size, batch_size, world_size):
+    next_global_sample_idx = global_sample_idx + (batch_size * world_size)
+    next_sample_idx = next_global_sample_idx // world_size
+    next_batch_idx = next_global_sample_idx // max(1, batch_size * world_size)
+    next_epoch = epoch
+    if next_global_sample_idx >= dataset_size:
+        next_epoch += 1
+        next_batch_idx = 0
+        next_sample_idx = 0
+        next_global_sample_idx = 0
+    return next_epoch, next_batch_idx, next_sample_idx, next_global_sample_idx
+
 def build_scheduler(optimizer, warmup_steps: int, total_steps: int, last_epoch: int = -1) -> LambdaLR:
     def lr_lambda(step: int) -> float:
         if step < warmup_steps: return step / max(1, warmup_steps)
@@ -181,8 +203,8 @@ def build_resume_warmup_scheduler(
 def train(n_steps: int = N_STEPS):
     local_rank = setup_ddp()
     device = torch.device(f"cuda:{local_rank}")
-    is_main_process = (local_rank == 0)
-    _, world_size = distributed_rank_world()
+    rank, world_size = distributed_rank_world()
+    is_main_process = (rank == 0)
 
     writer = SummaryWriter(log_dir=os.path.join(SAVE_DIR, "runs", RUN_NAME)) if is_main_process else None
 
@@ -193,7 +215,8 @@ def train(n_steps: int = N_STEPS):
     model = ARContextModel().to(device)
 
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
-    print(f"Model Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+    if is_main_process:
+        print(f"Model Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
     checkpoint = load_training_checkpoint() if RESUME_TRAINING else None
     optimizer, optimizer_backend = build_optimizer(
@@ -280,6 +303,7 @@ def train(n_steps: int = N_STEPS):
     running_loss, log_steps = 0.0, 0
     model.train()
     epoch = start_epoch
+    stop_requested = False
 
     while update_step < n_steps:
         if hasattr(train_loader.sampler, 'set_epoch'): train_loader.sampler.set_epoch(epoch)
@@ -343,8 +367,9 @@ def train(n_steps: int = N_STEPS):
                     writer.add_scalar('Hyperparameters/LR', optimizer.param_groups[0]['lr'], update_step)
                     running_loss, log_steps = 0.0, 0
 
-                if update_step > 0 and update_step % VAL_EVERY == 0:
-                    val_loss = evaluate_validation(model, val_loader, local_rank, device)
+                validation_due = update_step > 0 and update_step % VAL_EVERY == 0
+                if validation_due:
+                    val_loss = evaluate_validation(model, val_loader, device)
                     checkpoint_rng_state = collect_rng_state_for_checkpoint(device)
                     if is_main_process:
                         val_ppl = math.exp(min(val_loss, 20.0))
@@ -352,15 +377,9 @@ def train(n_steps: int = N_STEPS):
                         writer.add_scalar('Validation/AR_CE_Loss', val_loss, update_step)
                         is_best = val_loss < best_val_loss
                         if is_best: best_val_loss = val_loss
-                        next_global_sample_idx = global_sample_idx + (BATCH_SIZE * world_size)
-                        next_sample_idx = next_global_sample_idx // world_size
-                        next_batch_idx = next_global_sample_idx // max(1, BATCH_SIZE * world_size)
-                        next_epoch = epoch
-                        if next_global_sample_idx >= len(train_loader.dataset):
-                            next_epoch += 1
-                            next_batch_idx = 0
-                            next_sample_idx = 0
-                            next_global_sample_idx = 0
+                        next_epoch, next_batch_idx, next_sample_idx, next_global_sample_idx = next_training_position(
+                            global_sample_idx, epoch, len(train_loader.dataset), BATCH_SIZE, world_size
+                        )
                         save_checkpoint(
                             model,
                             optimizer,
@@ -377,20 +396,62 @@ def train(n_steps: int = N_STEPS):
                             optimizer_backend=optimizer_backend,
                             rng_state=checkpoint_rng_state
                         )
+                    if dist.is_initialized():
+                        dist.barrier()
+
+                timeout_checkpoint = checkpoint_requested(device)
+                periodic_checkpoint = (
+                    update_step > 0
+                    and update_step % CHECKPOINT_EVERY == 0
+                    and not validation_due
+                )
+                if periodic_checkpoint or (timeout_checkpoint and not validation_due):
+                    checkpoint_rng_state = collect_rng_state_for_checkpoint(device)
+                    if is_main_process:
+                        next_epoch, next_batch_idx, next_sample_idx, next_global_sample_idx = next_training_position(
+                            global_sample_idx, epoch, len(train_loader.dataset), BATCH_SIZE, world_size
+                        )
+                        save_checkpoint(
+                            model,
+                            optimizer,
+                            scheduler,
+                            update_step,
+                            best_val_loss,
+                            next_epoch,
+                            next_batch_idx,
+                            next_sample_idx,
+                            next_global_sample_idx,
+                            micro_step,
+                            scaler,
+                            optimizer_backend=optimizer_backend,
+                            rng_state=checkpoint_rng_state
+                        )
+                        print(f"Saved resumable checkpoint at step {update_step}.")
+                    if dist.is_initialized():
+                        dist.barrier()
+
+                if timeout_checkpoint:
+                    if is_main_process:
+                        print(f"Checkpointed at step {update_step} for the next Slurm job; exiting cleanly.")
+                    stop_requested = True
+                    break
         resume_global_sample_idx = 0
         resume_sample_idx = 0
         resume_batch_idx = 0
         epoch += 1
+        if stop_requested:
+            break
 
     if is_main_process and writer: writer.close()
     cleanup_ddp()
     return model
 
 @torch.no_grad()
-def evaluate_validation(model, val_loader, local_rank, device, max_batches: int = 100):
+def evaluate_validation(model, val_loader, device, max_batches: int = 100):
     model.eval()
     total_loss, steps = 0.0, 0
-    iterator = tqdm(val_loader, desc="Validation", total=min(len(val_loader), max_batches), leave=False) if local_rank == 0 else val_loader
+    rank, _ = distributed_rank_world()
+    iterator = tqdm(val_loader, desc="Validation", total=min(len(val_loader), max_batches), leave=False) if rank == 0 else val_loader
 
     for batch in iterator:
         if steps >= max_batches: break

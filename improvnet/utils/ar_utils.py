@@ -610,9 +610,15 @@ def save_checkpoint(
         checkpoint['scaler_state_dict'] = scaler.state_dict()
     if rng_state is not None:
         checkpoint['rng_state'] = rng_state
-    torch.save(checkpoint, checkpoint_path(config=config))
+    latest_path = checkpoint_path(config=config)
+    latest_tmp_path = f"{latest_path}.tmp.{os.getpid()}"
+    torch.save(checkpoint, latest_tmp_path)
+    os.replace(latest_tmp_path, latest_path)
     if is_best:
-        torch.save(checkpoint, os.path.join(_cfg("SAVE_DIR", config=config), "best_model.pt"))
+        best_path = os.path.join(_cfg("SAVE_DIR", config=config), "best_model.pt")
+        best_tmp_path = f"{best_path}.tmp.{os.getpid()}"
+        torch.save(checkpoint, best_tmp_path)
+        os.replace(best_tmp_path, best_path)
     del checkpoint, optimizer_state_dict
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

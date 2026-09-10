@@ -6,7 +6,8 @@ RUN_NAME = "ar_context_split_instrument_v1"
 SAVE_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/ar_context_split_instrument"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-RESUME_TRAINING = False
+# Start from latest_checkpoint.pt when present; otherwise start a fresh run.
+RESUME_TRAINING = True
 
 # --- VOCABULARY ---
 VOCAB_SIZE = AbsTokenizer().vocab_size
@@ -43,7 +44,7 @@ ACCUM_STEPS = 1 # Optimized run, 2 for old run
 LR = 2e-4 # Optimized run
 WEIGHT_DECAY = 0.1
 BETAS = (0.9, 0.95)
-WARMUP_STEPS = 10000 
+WARMUP_STEPS = 8000
 N_STEPS = 800000 
 GRAD_CLIP = 1.0
 
@@ -60,10 +61,12 @@ ALLOW_OPTIMIZER_MIGRATION_TO_8BIT = False
 
 LOG_EVERY = 1
 VAL_EVERY = 10000
+# Save independently of validation so long Slurm jobs can always resume.
+CHECKPOINT_EVERY = 2000
 
 JSONL_FILES = [
     "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/misc_data_tokenized.jsonl",
-    # "/data/scratch/acw769/improvnet/artifacts/data/gigamidi_data_tokenized.jsonl"
+    "/data/scratch/acw769/improvnet/artifacts/data/gigamidi_data_tokenized.jsonl"
 ]
 
 if torch.cuda.is_available():
