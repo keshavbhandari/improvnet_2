@@ -65,7 +65,8 @@ VAL_EVERY = 20000
 CHECKPOINT_EVERY = 2000
 
 JSONL_FILES = [
-    "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/misc_data_tokenized.jsonl"
+    "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/misc_data_tokenized.jsonl",
+    # "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/gigamidi_data_tokenized.jsonl"
 ]
 
 if torch.cuda.is_available():

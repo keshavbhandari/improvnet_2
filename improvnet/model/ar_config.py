@@ -54,11 +54,6 @@ GRAD_CLIP = 1.0
 OPTIMIZER_BACKEND = "adamw"
 ALLOW_OPTIMIZER_MIGRATION_TO_8BIT = False
 
-# Set these only when resuming a legacy checkpoint that predates saved batch/accum metadata.
-# RESUME_CHECKPOINT_BATCH_SIZE = 7
-# RESUME_CHECKPOINT_ACCUM_STEPS = 2
-# RESUME_CHECKPOINT_WORLD_SIZE = 4
-
 LOG_EVERY = 1
 VAL_EVERY = 10000
 # Save independently of validation so long Slurm jobs can always resume.
@@ -66,7 +61,7 @@ CHECKPOINT_EVERY = 2000
 
 JSONL_FILES = [
     "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/misc_data_tokenized.jsonl",
-    "/data/scratch/acw769/improvnet/artifacts/data/gigamidi_data_tokenized.jsonl"
+    # "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/gigamidi_data_tokenized.jsonl"
 ]
 
 if torch.cuda.is_available():

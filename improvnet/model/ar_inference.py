@@ -141,9 +141,9 @@ class ARContextInference:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="/gpfs/scratch/acw769/improvnet/artifacts/ar_context/latest_checkpoint.pt")
-    parser.add_argument("--input", type=str, help="Path to input MIDI file for prompt context", default="/data/home/acw769/improvnet_2/improvnet/inference/debussy-clair-de-lune_original.mid")
-    parser.add_argument("--output", type=str, default="/data/home/acw769/improvnet_2/improvnet/inference/generated.mid")
+    parser.add_argument("--model", type=str, default="/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/ar_context_split_instrument/latest_checkpoint.pt")
+    parser.add_argument("--input", type=str, help="Path to input MIDI file for prompt context", default="/e/home/jusers/bhandari1/jupiter/improvnet_2/improvnet/inference/debussy-clair-de-lune_original.mid")
+    parser.add_argument("--output", type=str, default="/e/home/jusers/bhandari1/jupiter/improvnet_2/improvnet/inference/generated.mid")
     parser.add_argument("--genre", type=str, default="classical")
     parser.add_argument("--prompt_len", type=int, default=256, help="Number of tokens to extract from input as the prompt")
     parser.add_argument("--max_tokens", type=int, default=1024, help="Maximum length of the generated sequence")
