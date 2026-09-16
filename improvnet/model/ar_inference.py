@@ -146,7 +146,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, default="/e/home/jusers/bhandari1/jupiter/improvnet_2/improvnet/inference/generated.mid")
     parser.add_argument("--genre", type=str, default="classical")
     parser.add_argument("--prompt_len", type=int, default=256, help="Number of tokens to extract from input as the prompt")
-    parser.add_argument("--max_tokens", type=int, default=1024, help="Maximum length of the generated sequence")
+    parser.add_argument("--max_tokens", type=int, default=2048, help="Maximum length of the generated sequence")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=50)
     args = parser.parse_args()

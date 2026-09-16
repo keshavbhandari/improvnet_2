@@ -4,6 +4,8 @@ import os
 import json
 import math
 import pickle
+import hashlib
+import fcntl
 import torch
 from torch.optim import AdamW
 import torch.distributed as dist
@@ -19,7 +21,10 @@ try:
 except ImportError:
     bnb = None
 
-_SPLIT_INDEX_CACHE: dict[tuple[str, int, tuple[tuple[str, float], ...]], dict[str, list[int]]] = {}
+_SPLIT_INDEX_CACHE: dict[
+    tuple[str, int, tuple[tuple[str, float], ...], tuple[str, ...]],
+    dict[str, list[int]],
+] = {}
 
 def read_jsonl_files(data_dirs, split="train"):
     files = []
@@ -37,6 +42,93 @@ def read_jsonl_files(data_dirs, split="train"):
 def _cfg(name, default=None, config=None):
     return getattr(config or ar_config, name, default)
 
+def _midi_filepath_exclusions(jsonl_path: str, config=None) -> tuple[str, ...]:
+    exclusions_by_file = _cfg("MIDI_FILEPATH_EXCLUDE_SUBSTRINGS", {}, config=config)
+    return tuple(str(value) for value in exclusions_by_file.get(jsonl_path, ()))
+
+def _filtered_index_cache_path(index_path: str, exclusions: tuple[str, ...]) -> str:
+    digest = hashlib.sha256("\0".join(exclusions).encode("utf-8")).hexdigest()[:12]
+    base, extension = os.path.splitext(index_path)
+    return f"{base}.filtered-{digest}{extension}"
+
+def _load_filtered_offsets(
+    jsonl_path: str,
+    index_path: str,
+    exclusions: tuple[str, ...],
+) -> list[int]:
+    """Build or load a persistent byte index excluding selected MIDI paths."""
+    if not exclusions:
+        with open(index_path, "rb") as index_file:
+            return pickle.load(index_file)
+
+    filtered_index_path = _filtered_index_cache_path(index_path, exclusions)
+    lock_path = f"{filtered_index_path}.lock"
+    source_stat = os.stat(index_path)
+    source_signature = (source_stat.st_size, source_stat.st_mtime_ns)
+
+    def load_cached_offsets():
+        if not os.path.exists(filtered_index_path):
+            return None
+        try:
+            with open(filtered_index_path, "rb") as filtered_file:
+                cached = pickle.load(filtered_file)
+        except (OSError, EOFError, pickle.UnpicklingError):
+            return None
+        if not isinstance(cached, dict):
+            return None
+        if cached.get("source_signature") != source_signature:
+            return None
+        if tuple(cached.get("exclusions", ())) != exclusions:
+            return None
+        return cached.get("offsets")
+
+    os.makedirs(os.path.dirname(filtered_index_path) or ".", exist_ok=True)
+    with open(lock_path, "a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        cached_offsets = load_cached_offsets()
+        if cached_offsets is not None:
+            return cached_offsets
+
+        with open(index_path, "rb") as index_file:
+            offsets = pickle.load(index_file)
+
+        exclusion_bytes = tuple(value.encode("utf-8") for value in exclusions)
+        filtered_offsets = []
+        filepath_key = b'"midi_filepath"'
+        with open(jsonl_path, "rb", buffering=0) as jsonl_file:
+            for offset in offsets:
+                record_prefix = os.pread(jsonl_file.fileno(), 4096, offset)
+                key_start = record_prefix.find(filepath_key)
+                if key_start < 0:
+                    raise ValueError(
+                        f"Could not find midi_filepath near byte offset {offset} in {jsonl_path}"
+                    )
+                value_start = record_prefix.find(b'"', key_start + len(filepath_key))
+                value_end = record_prefix.find(b'"', value_start + 1)
+                if value_start < 0 or value_end < 0:
+                    raise ValueError(
+                        f"Could not parse midi_filepath near byte offset {offset} in {jsonl_path}"
+                    )
+                midi_filepath = record_prefix[value_start + 1:value_end]
+                if not any(exclusion in midi_filepath for exclusion in exclusion_bytes):
+                    filtered_offsets.append(offset)
+
+        payload = {
+            "source_signature": source_signature,
+            "exclusions": exclusions,
+            "offsets": filtered_offsets,
+        }
+        temporary_path = f"{filtered_index_path}.tmp.{os.getpid()}"
+        try:
+            with open(temporary_path, "wb") as filtered_file:
+                pickle.dump(payload, filtered_file, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(temporary_path, filtered_index_path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+
+        return filtered_offsets
+
 def load_split_byte_index(jsonl_path: str, split: str, config=None) -> list[int]:
     """Loads the full byte index and partitions offsets deterministically."""
     index_path = jsonl_path.replace('.jsonl', '_index.pkl')
@@ -49,6 +141,7 @@ def load_split_byte_index(jsonl_path: str, split: str, config=None) -> list[int]
         config=config,
     )
     split_seed = int(_cfg("DATA_SPLIT_SEED", 42, config=config))
+    exclusions = _midi_filepath_exclusions(jsonl_path, config=config)
     if split not in split_ratios:
         raise ValueError(f"Unknown split {split!r}; expected one of {sorted(split_ratios)}")
 
@@ -56,12 +149,12 @@ def load_split_byte_index(jsonl_path: str, split: str, config=None) -> list[int]
         jsonl_path,
         split_seed,
         tuple((split_name, float(ratio)) for split_name, ratio in split_ratios.items()),
+        exclusions,
     )
     if cache_key in _SPLIT_INDEX_CACHE:
         return _SPLIT_INDEX_CACHE[cache_key][split]
 
-    with open(index_path, 'rb') as f:
-        offsets = pickle.load(f)
+    offsets = _load_filtered_offsets(jsonl_path, index_path, exclusions)
 
     shuffled_offsets = list(offsets)
     random.Random(split_seed).shuffle(shuffled_offsets)

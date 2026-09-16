@@ -88,3 +88,4 @@ improvnet/artifacts/*
 
 # Data folder
 improvnet/data/*
+improvnet/inference/generated.mid

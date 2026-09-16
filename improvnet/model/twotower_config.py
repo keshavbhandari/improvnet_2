@@ -64,10 +64,18 @@ VAL_EVERY = 20000
 # Save independently of validation so long Slurm jobs can always resume.
 CHECKPOINT_EVERY = 2000
 
+MISC_JSONL = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/misc_data_tokenized.jsonl"
+GIGAMIDI_JSONL = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/gigamidi_data_tokenized.jsonl"
+
 JSONL_FILES = [
-    "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/misc_data_tokenized.jsonl",
-    # "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/gigamidi_data_tokenized.jsonl"
+    MISC_JSONL,
+    GIGAMIDI_JSONL,
 ]
+
+# Keep no-drums and all-instruments-with-drums; exclude only drums-only files.
+MIDI_FILEPATH_EXCLUDE_SUBSTRINGS = {
+    GIGAMIDI_JSONL: ("/drums-only/",),
+}
 
 if torch.cuda.is_available():
     vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
