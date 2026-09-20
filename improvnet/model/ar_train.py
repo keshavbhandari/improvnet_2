@@ -150,6 +150,13 @@ def checkpoint_requested(device: torch.device) -> bool:
         requested = bool(requested_tensor.item())
     return requested
 
+def all_ranks_finite(value: torch.Tensor, device: torch.device) -> bool:
+    """Return True only when every distributed rank reports a finite value."""
+    finite = torch.isfinite(value.detach()).all().to(device=device, dtype=torch.int32)
+    if dist.is_initialized():
+        dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+    return bool(finite.item())
+
 def next_training_position(global_sample_idx, epoch, dataset_size, batch_size, world_size):
     next_global_sample_idx = global_sample_idx + (batch_size * world_size)
     next_sample_idx = next_global_sample_idx // world_size
@@ -234,9 +241,20 @@ def train(n_steps: int = N_STEPS):
             model, optimizer, scheduler, device, scaler, checkpoint=checkpoint
         )
         if lr_changed and resume_start_lrs is not None:
+            resume_start_lrs = [RESUME_START_LR for _ in optimizer.param_groups]
             scheduler = build_resume_warmup_scheduler(
-                optimizer, resume_start_lrs, LR, WARMUP_STEPS, n_steps, update_step
+                optimizer,
+                resume_start_lrs,
+                LR,
+                RESUME_WARMUP_STEPS,
+                n_steps,
+                update_step,
             )
+            if is_main_process:
+                print(
+                    f"Learning rate changed; warming up from {RESUME_START_LR:.2e} "
+                    f"to {LR:.2e} over {RESUME_WARMUP_STEPS} steps."
+                )
         elif not scheduler_restored:
             scheduler = build_scheduler(optimizer, WARMUP_STEPS, n_steps, last_epoch=update_step - 1 if update_step > 0 else -1)
     del checkpoint
@@ -301,6 +319,8 @@ def train(n_steps: int = N_STEPS):
         if resume_state.get('rng_restored'):
             print("Restored saved RNG state for training ranks.")
     running_loss, log_steps = 0.0, 0
+    window_loss, window_steps = 0.0, 0
+    skipped_nonfinite_losses, skipped_nonfinite_gradients = 0, 0
     model.train()
     epoch = start_epoch
     stop_requested = False
@@ -335,28 +355,61 @@ def train(n_steps: int = N_STEPS):
                         ignore_index=PAD_ID
                     ) / ACCUM_STEPS
 
+                if not all_ranks_finite(loss, device):
+                    optimizer.zero_grad(set_to_none=True)
+                    window_loss, window_steps = 0.0, 0
+                    micro_step += 1
+                    micro_step += (-micro_step) % ACCUM_STEPS
+                    skipped_nonfinite_losses += 1
+                    if is_main_process:
+                        print(
+                            f"  Skipping non-finite loss at update step {update_step + 1} "
+                            f"(skipped loss windows: {skipped_nonfinite_losses})."
+                        )
+                    continue
+
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
                 else:
                     loss.backward()
 
-            running_loss += (loss.item() * ACCUM_STEPS)
-            log_steps += 1
+            window_loss += (loss.item() * ACCUM_STEPS)
+            window_steps += 1
             micro_step += 1
 
             if not is_accumulating:
                 if scaler.is_enabled():
                     scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                grad_norm = nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    GRAD_CLIP,
+                    error_if_nonfinite=False,
+                )
+                if not all_ranks_finite(grad_norm, device):
+                    optimizer.zero_grad(set_to_none=True)
+                    window_loss, window_steps = 0.0, 0
+                    if scaler.is_enabled():
+                        scaler.update()
+                    skipped_nonfinite_gradients += 1
+                    if is_main_process:
+                        print(
+                            f"  Skipping non-finite gradient norm at update step {update_step + 1} "
+                            f"(skipped gradient windows: {skipped_nonfinite_gradients})."
+                        )
+                    continue
+
+                if scaler.is_enabled():
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
                     optimizer.step()
-                    
+
                 scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 update_step += 1
+                running_loss += window_loss
+                log_steps += window_steps
+                window_loss, window_steps = 0.0, 0
 
                 if is_main_process and (update_step % LOG_EVERY == 0) and log_steps > 0:
                     avg_loss = running_loss / log_steps

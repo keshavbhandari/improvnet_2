@@ -41,11 +41,13 @@ N_LAYERS = 20
 # or sequences compared to the complex unrolled diffusion model.
 BATCH_SIZE = 24
 ACCUM_STEPS = 1 # Optimized run, 2 for old run
-LR = 2e-4 # Optimized run
+LR = 1.5e-4
 WEIGHT_DECAY = 0.1
 BETAS = (0.9, 0.95)
 WARMUP_STEPS = 8000
-N_STEPS = 800000 
+RESUME_START_LR = 1e-5
+RESUME_WARMUP_STEPS = 2000
+N_STEPS = 200000
 GRAD_CLIP = 1.0
 
 # OPTIMIZER_BACKEND = "paged_adamw8bit"

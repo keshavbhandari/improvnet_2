@@ -33,7 +33,7 @@ SEP_ID = 7
 
 # --- ARCHITECTURE MATH ---
 # Must EXACTLY match the AR Context Tower so the KV caches align perfectly
-EMBED_DIM = 1536
+EMBED_DIM = 2048
 N_HEADS = 16       
 N_KV_HEADS = 4     
 N_LAYERS = 20
@@ -43,11 +43,13 @@ N_LAYERS = 20
 # ==========================================
 BATCH_SIZE = 8 
 ACCUM_STEPS = 4
-LR = 1e-4 
+LR = 1.5e-4
 WEIGHT_DECAY = 0.1
 BETAS = (0.9, 0.95)
-WARMUP_STEPS = 10000
-N_STEPS = 800000
+WARMUP_STEPS = 8000
+RESUME_START_LR = 1e-5
+RESUME_WARMUP_STEPS = 2000
+N_STEPS = 200000
 GRAD_CLIP = 1.0
 DIFFUSION_STEPS = 16 
 OPTIMIZER_BACKEND = "adamw"
