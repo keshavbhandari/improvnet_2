@@ -25,6 +25,33 @@ BLOCK_SIZE = 256
 PROMPT_MAX = 1024
 NUM_DRAFTS = 4 
 
+# Structured denoising augmentations. Elastic examples reserve a variable
+# fraction of the target for four-token <BLANK> event slots. The realized
+# fraction is passed to Tower B as an explicit generation-time control.
+ELASTICITY_MIN_RATIO = 0.10
+ELASTICITY_MAX_RATIO = 0.20
+ELASTICITY_MULTITRACK_PROB = 0.8
+ELASTICITY_SOLO_PROB = 0.3
+
+# On multi-instrument examples, remove one complete, conditioned instrument
+# stem from every draft and train the denoiser to reconstruct it.
+STEM_REMOVAL_PROB = 0.8
+
+# Visible-token corruption teaches later drafts to revise plausible mistakes,
+# not only fill masks. Most replacements preserve token type; a small fraction
+# deliberately uses the wider vocabulary to expose the model to bad structure.
+NON_MASK_CORRUPTION_PROBS = (0.15, 0.10, 0.05, 0.025)
+FULL_VOCAB_CORRUPTION_PROB = 0.075
+
+# Explicitly train recovery of the diminish/end markers. Ordinary diffusion
+# can also mask them; these probabilities are additional chances when visible.
+BOUNDARY_TOKEN_MASK_PROBS = (0.75, 0.50, 0.25, 0.10)
+
+# Simple weighted reconstruction objective.
+CLEAN_TOKEN_LOSS_WEIGHT = 0.05
+CORRUPTED_TOKEN_LOSS_WEIGHT = 1.0
+MASKED_TOKEN_LOSS_WEIGHT = 2.0
+
 # Special Tokens
 PAD_ID = 2
 MASK_ID = 5

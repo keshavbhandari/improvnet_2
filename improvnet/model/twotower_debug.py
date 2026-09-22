@@ -15,7 +15,12 @@ if __name__ == "__main__":
     processor = ProcessData()
     
     # Using the exact dataset class from twotower_train.py
-    dataset = TwoTowerDataset(JSONL_FILES, processor, augment=False)
+    dataset = TwoTowerDataset(
+        jsonl_files=JSONL_FILES,
+        split="train",
+        processor=processor,
+        augment=False,
+    )
     
     loader = DataLoader(
         dataset, batch_size=1, shuffle=True, 
@@ -33,6 +38,14 @@ if __name__ == "__main__":
         traj_target = batch["targets"][0]
         traj_ts = batch["timesteps"][0]
         traj_wt = batch["weights"][0]
+        traj_corrupted = batch["random_corruption_mask"][0]
+        elasticity = batch["elasticity"][0].item()
+        removed_instrument_id = batch["removed_instrument"][0].item()
+        removed_instrument = (
+            processor.INSTRUMENT_CLASSES[removed_instrument_id]
+            if removed_instrument_id >= 0
+            else "none"
+        )
         
         # Reconstruct the raw prefix strings directly from the tensor to verify the pipeline
         raw_prefix = [processor.tokenizer.id_to_tok.get(tid.item(), f"ID:{tid.item()}") 
@@ -49,8 +62,9 @@ if __name__ == "__main__":
                 print(f"  {tok}")
         
         print(f"\n--- NON-MARKOVIAN TRAJECTORY (Denoiser Input) ---")
+        print(f"Elasticity control: {elasticity:.3f} | Removed stem: {removed_instrument}")
         print("-" * 100)
-        print(f"{'Idx':<5} | {'Time':<5} | {'Weight':<6} | {'Input Token':<35} | {'Target (Ground Truth)':<35}")
+        print(f"{'Idx':<5} | {'Time':<5} | {'Weight':<6} | {'Rand':<4} | {'Input Token':<35} | {'Target (Ground Truth)':<35}")
         print("-" * 100)
         
         current_draft = 1
@@ -60,6 +74,7 @@ if __name__ == "__main__":
             tgt_id = traj_target[i].item()
             ts_val = traj_ts[i].item()
             wt_val = traj_wt[i].item()
+            was_corrupted = traj_corrupted[i].item()
             
             inp_tok = processor.tokenizer.id_to_tok.get(inp_id, f"ID:{inp_id}")
             tgt_tok = processor.tokenizer.id_to_tok.get(tgt_id, f"ID:{tgt_id}")
@@ -75,14 +90,14 @@ if __name__ == "__main__":
             # Skip bulk padding to keep console output readable
             if inp_id == PAD_ID and tgt_id == PAD_ID:
                 if i > 0 and traj_input[i-1].item() != PAD_ID:
-                    print(f"{i:<5} | {ts_val:.3f} | {wt_val:.3f} | {'<PAD> ...':<35} | {'<PAD> ...':<35}")
+                    print(f"{i:<5} | {ts_val:.3f} | {wt_val:.3f} | {'False':<4} | {'<PAD> ...':<35} | {'<PAD> ...':<35}")
                 continue
                 
             # Formatting strings for clean columns
             inp_str = str(inp_tok)
             tgt_str = str(tgt_tok)
             
-            print(f"{i:<5} | {ts_val:.3f} | {wt_val:.3f} | {inp_str:<35} | {tgt_str:<35}")
+            print(f"{i:<5} | {ts_val:.3f} | {wt_val:.3f} | {str(was_corrupted):<4} | {inp_str:<35} | {tgt_str:<35}")
             
         print("\nDebugger complete. Exiting.\n")
         break # Only process one batch

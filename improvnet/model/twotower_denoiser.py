@@ -3,8 +3,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from flash_attn import flash_attn_func
 from improvnet.model.twotower_config import *
+
+HAS_FLASH = False
+
+try:
+    from flash_attn import flash_attn_func
+
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+
+        # FlashAttention v2 requires Ampere (SM80+) or newer.
+        HAS_FLASH = major >= 8
+except ImportError:
+    HAS_FLASH = False
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -68,6 +80,21 @@ class TimestepEmbedder(nn.Module):
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return self.mlp(emb)
 
+class ElasticityEmbedder(nn.Module):
+    """Embed the requested fraction of output positions reserved for blanks."""
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, elasticity):
+        # Normalize the configured generation range to approximately [0, 1].
+        scale = max(float(ELASTICITY_MAX_RATIO), 1e-8)
+        return self.mlp((elasticity.float() / scale).unsqueeze(-1))
+
 def rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
@@ -87,6 +114,30 @@ class RotaryEmbedding(nn.Module):
         sin = emb.sin().unsqueeze(2).to(dtype=qk.dtype)
         return (qk * cos) + (rotate_half(qk) * sin)
 
+def sdpa_attn_func(q, k, v, dropout_p=0.0, causal=False):
+    """flash_attn_func-compatible SDPA fallback.
+
+    Inputs use FlashAttention layout: q is (B, Tq, Hq, D), while k and v
+    are (B, Tk, Hkv, D). Grouped-query KV heads are expanded for PyTorch
+    versions that do not expose SDPA's enable_gqa argument.
+    """
+    hq = q.shape[2]
+    hkv = k.shape[2]
+
+    q, k, v = (tensor.transpose(1, 2) for tensor in (q, k, v))
+
+    if hq != hkv:
+        if hq % hkv != 0:
+            raise ValueError(f"Query heads ({hq}) must be divisible by KV heads ({hkv})")
+        repeats = hq // hkv
+        k = k.repeat_interleave(repeats, dim=1)
+        v = v.repeat_interleave(repeats, dim=1)
+
+    output = F.scaled_dot_product_attention(
+        q, k, v, dropout_p=dropout_p, is_causal=causal
+    )
+    return output.transpose(1, 2).contiguous()
+
 class HybridGroupedQueryAttention(nn.Module):
     def __init__(self, embed_dim, n_heads, n_kv_heads, dropout=0.0):
         super().__init__()
@@ -103,6 +154,7 @@ class HybridGroupedQueryAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim)
         self.dropout = nn.Dropout(dropout)
         self.rope = RotaryEmbedding(self.head_dim)
+        self.attn_fn = flash_attn_func if HAS_FLASH else sdpa_attn_func
 
     def forward(self, x, seq_pos, context_kv=None, draft_size=0):
         B, T, C = x.shape
@@ -146,7 +198,7 @@ class HybridGroupedQueryAttention(nn.Module):
                 v_d = v[:, :prefix_len + next_idx]
                 
                 # causal=False triggers bidirectional visibility WITHIN the visible window
-                out_d = flash_attn_func(q_d, k_d, v_d, dropout_p=dropout_p, causal=False)
+                out_d = self.attn_fn(q_d, k_d, v_d, dropout_p=dropout_p, causal=False)
                 q_drafts.append(out_d)
                 
                 curr_idx = next_idx
@@ -154,7 +206,7 @@ class HybridGroupedQueryAttention(nn.Module):
             attn_out = torch.cat(q_drafts, dim=1)
         else:
             # Fallback for inference (1 token)
-            attn_out = flash_attn_func(q, k, v, dropout_p=dropout_p, causal=False)
+            attn_out = self.attn_fn(q, k, v, dropout_p=dropout_p, causal=False)
 
         out = self.o_proj(attn_out.reshape(B, T, C))
         return out
@@ -182,6 +234,7 @@ class TwoTowerDenoiser(nn.Module):
         
         self.token_emb = nn.Embedding(VOCAB_SIZE, EMBED_DIM)
         self.time_emb = TimestepEmbedder(EMBED_DIM)
+        self.elasticity_emb = ElasticityEmbedder(EMBED_DIM)
         
         self.layers = nn.ModuleList([
             DenoiserTransformerBlock(
@@ -205,20 +258,36 @@ class TwoTowerDenoiser(nn.Module):
             else:
                 nn.init.normal_(p, mean=0.0, std=0.02)
 
-    def forward(self, noisy_target, timestep, seq_offset=0, context_kv_cache=None, draft_size=0):
+    def forward(
+        self,
+        noisy_target,
+        timestep,
+        seq_offset=0,
+        context_kv_cache=None,
+        draft_size=0,
+        elasticity=None,
+    ):
         """
         noisy_target: [Batch, Sequence_Length] (e.g., Draft 1 <SEP> Draft 2 <SEP> Draft 3)
         timestep: [Batch, Sequence_Length] (Distinct t-values for each token)
         seq_offset: Proved by AR Context (e.g., PROMPT_MAX + 2)
         draft_size: Determines the staircase slicing logic (e.g., BLOCK_SIZE + 1)
+        elasticity: [Batch] requested <BLANK> fraction; 0 disables elasticity
         """
         B, T = noisy_target.shape
         device = noisy_target.device
 
         x = self.token_emb(noisy_target) 
         
-        # t_emb is now Sequence-Wise [B, T, D] instead of [B, 1, D]
-        t_emb = self.time_emb(timestep) 
+        # Both diffusion time and the requested sequence elasticity modulate
+        # every denoiser block. Omitting the control means rigid generation.
+        if elasticity is None:
+            elasticity = torch.zeros(B, device=device, dtype=torch.float32)
+        elif elasticity.ndim != 1 or elasticity.shape[0] != B:
+            raise ValueError(f"elasticity must have shape ({B},), got {tuple(elasticity.shape)}")
+        elasticity = elasticity.to(device=device, dtype=torch.float32)
+        t_emb = self.time_emb(timestep)
+        t_emb = t_emb + self.elasticity_emb(elasticity).unsqueeze(1).to(t_emb.dtype)
         
         # Continuous RoPE coordinates for the entire concatenated trajectory
         seq_pos = torch.arange(seq_offset, seq_offset + T, device=device).unsqueeze(0).expand(B, -1)

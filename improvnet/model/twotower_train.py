@@ -29,6 +29,7 @@ from improvnet.utils.ar_utils import (
 )
 from improvnet.model.ar_model import ARContextModel
 from improvnet.model.twotower_denoiser import TwoTowerDenoiser
+from improvnet.utils.twotower_corruption import TwoTowerCorruptionStrategy
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -50,6 +51,7 @@ class TwoTowerDataset(Dataset):
         self.jsonl_files = jsonl_files
         self.split = split
         self.processor = processor
+        self.corruption = TwoTowerCorruptionStrategy(processor)
         self.augment = augment
         self.file_handles = {}
         self.global_indices = []
@@ -121,37 +123,69 @@ class TwoTowerDataset(Dataset):
         padded_traj_targets = []
         padded_traj_ts = []
         padded_traj_wts = []
+        padded_corruption_masks = []
         genres = []
         multi_hots = []
+        elasticities = []
+        removed_instruments = []
 
         for item in batch:
             prefix_tokens = item["prefix"]
-            target_tokens = item["target"]
+            target_tokens = list(item["target"])
             
             genres.append(torch.tensor(item["genre"], dtype=torch.long))
             multi_hots.append(item["multi_hot"])
 
-            active_insts_names = set()
-            for tok in target_tokens:
-                if isinstance(tok, tuple) and tok[0] == "instrument" and tok[1] in self.processor.INSTRUMENT_CLASSES:
-                    active_insts_names.add(tok[1])
-                elif isinstance(tok, tuple) and len(tok) in (2, 3) and tok[0] in self.processor.INSTRUMENT_CLASSES:
-                    active_insts_names.add(tok[0])
+            instrument_associations = self.corruption.instrument_associations(target_tokens)
+            active_insts_names = {inst for inst in instrument_associations if inst is not None}
             is_multi_track = len(active_insts_names) > 1
 
-            # 1. Elasticity on target labels (80% chance for multi-track, 30% for solo piano)
-            elasticity_prob = 0.8 if is_multi_track else 0.3
-            if random.random() < elasticity_prob:
-                # Slightly increased the maximum possible insertions for multi-track pieces
-                num_insertions = random.randint(0, int(len(target_tokens) * 0.10) + 1)
-                for _ in range(num_insertions):
-                    chunk_size = 4 if random.random() < 0.8 else 1
-                    idx = random.randint(0, len(target_tokens))
-                    for _ in range(chunk_size):
-                        target_tokens.insert(idx, '<BLANK>')
+            # Elasticity is an explicit condition. Rigid examples use 0.0;
+            # enabled examples reserve a variable 10-20% for blank events.
+            elasticity_prob = (
+                ELASTICITY_MULTITRACK_PROB if is_multi_track else ELASTICITY_SOLO_PROB
+            )
+            target_tokens, instrument_associations, elasticity = self.corruption.insert_elastic_blanks(
+                target_tokens,
+                instrument_associations,
+                enabled=random.random() < elasticity_prob,
+            )
+
+            # Pick one stem once, from instruments requested by the unchanged
+            # multi-hot condition, and remove that same stem from every draft.
+            conditioned_instruments = {
+                name
+                for idx, name in enumerate(self.processor.INSTRUMENT_CLASSES)
+                if item["multi_hot"][idx].item() > 0.5
+            }
+            stem_candidates = sorted(
+                ({inst for inst in instrument_associations if inst is not None})
+                & conditioned_instruments
+            )
+            removed_instrument = None
+            if len(stem_candidates) > 1 and random.random() < STEM_REMOVAL_PROB:
+                removed_instrument = random.choice(stem_candidates)
+
+            stem_mask = torch.zeros(BLOCK_SIZE, dtype=torch.bool)
+            if removed_instrument is not None:
+                for idx, instrument in enumerate(instrument_associations[:BLOCK_SIZE]):
+                    if instrument == removed_instrument:
+                        stem_mask[idx] = True
+
+            removed_instrument_id = (
+                self.processor.INSTRUMENT_CLASSES.index(removed_instrument)
+                if removed_instrument is not None
+                else -1
+            )
+            elasticities.append(torch.tensor(elasticity, dtype=torch.float32))
+            removed_instruments.append(torch.tensor(removed_instrument_id, dtype=torch.long))
 
             prefix_tensor = self.processor.format_variable_sequence(prefix_tokens, PROMPT_MAX, pad_id=PAD_ID)
             target_tensor = self.processor.format_variable_sequence(target_tokens, BLOCK_SIZE, pad_id=PAD_ID)
+            # Elasticity creates complete spare event slots. Presenting those
+            # slots as <MASK>x4 teaches the same generation-time interface as
+            # a removed stem: each group must resolve to an event or blanks.
+            insertion_slot_mask = target_tensor == BLANK_ID
 
             valid_indices = (target_tensor != PAD_ID).nonzero(as_tuple=True)[0]
             L_valid = len(valid_indices)
@@ -160,6 +194,7 @@ class TwoTowerDataset(Dataset):
             traj_target = []
             traj_ts = []
             traj_wt = []
+            traj_corruption_masks = []
 
             # Create random descending timesteps for a dynamic non-Markovian trajectory
             steps = sorted([random.randint(0, DIFFUSION_STEPS) for _ in range(NUM_DRAFTS)], reverse=True)
@@ -172,46 +207,37 @@ class TwoTowerDataset(Dataset):
                 if L_valid > 0:
                     r = torch.rand(L_valid)
                     do_mask = r > (1.0 - t_val)
-                    do_clean = ~do_mask
 
                     idx_mask = valid_indices[do_mask]
-                    idx_clean = valid_indices[do_clean]
-                    
                     draft_input[idx_mask] = MASK_ID
-                    
-                    # 2. Targeted Instrument Stripping (80% chance for multi-track, 0% for solo)
-                    strip_prob = 0.8 if is_multi_track else 0.0
-                    if random.random() < strip_prob:
-                        active_insts = set()
-                        for v_idx in valid_indices:
-                            tok_id = target_tensor[v_idx].item()
-                            tok_str = self.processor.tokenizer.id_to_tok.get(tok_id)
-                            if isinstance(tok_str, tuple) and tok_str[0] == "instrument" and tok_str[1] in self.processor.INSTRUMENT_CLASSES:
-                                active_insts.add(tok_str[1])
-                            elif isinstance(tok_str, tuple) and len(tok_str) in (2,3) and tok_str[0] in self.processor.INSTRUMENT_CLASSES:
-                                active_insts.add(tok_str[0])
-                        
-                        if len(active_insts) > 1:
-                            strip_inst = random.choice(list(active_insts))
-                            skip_count = 0
-                            for v_idx in valid_indices:
-                                if skip_count > 0:
-                                    draft_input[v_idx] = MASK_ID
-                                    skip_count -= 1
-                                    continue
-                                    
-                                tok_id = target_tensor[v_idx].item()
-                                tok_str = self.processor.tokenizer.id_to_tok.get(tok_id)
-                                if isinstance(tok_str, tuple) and tok_str[0] == "instrument" and tok_str[1] == strip_inst:
-                                    draft_input[v_idx] = MASK_ID
-                                    skip_count = 3 # Also mask note, onset, and duration.
-                                elif isinstance(tok_str, tuple) and len(tok_str) in (2,3) and tok_str[0] == strip_inst:
-                                    draft_input[v_idx] = MASK_ID
-                                    skip_count = 2 # Legacy note token: also mask onset and duration.
 
-                    # Weights: Low emphasis on clean notes, high emphasis on hallucinating masked notes
-                    draft_wt[valid_indices] = 0.05 
-                    draft_wt[draft_input == MASK_ID] = 2.0 
+                    # This is true stem removal: all fields belonging to the
+                    # selected instrument are absent in every draft.
+                    draft_input[stem_mask] = MASK_ID
+
+                    # Candidate insertion capacity is always exposed as full
+                    # four-token mask groups, never as isolated blank fields.
+                    draft_input[insertion_slot_mask] = MASK_ID
+
+                    # Explicitly practice recovering diminish/end markers so
+                    # continuation generation learns when the piece should end.
+                    self.corruption.mask_boundary_tokens(
+                        draft_input, target_tensor, valid_indices, i
+                    )
+
+                    # Corrupt only tokens still visible after diffusion and
+                    # stem masking. Earlier drafts receive more such errors.
+                    corruption_mask = self.corruption.corrupt_visible_tokens(
+                        draft_input, target_tensor, valid_indices, i
+                    )
+
+                    # Keep copying cheap, make correction meaningful, and put
+                    # the strongest emphasis on masks/stem/insertion recovery.
+                    draft_wt[valid_indices] = CLEAN_TOKEN_LOSS_WEIGHT
+                    draft_wt[corruption_mask] = CORRUPTED_TOKEN_LOSS_WEIGHT
+                    draft_wt[draft_input == MASK_ID] = MASKED_TOKEN_LOSS_WEIGHT
+                else:
+                    corruption_mask = torch.zeros_like(target_tensor, dtype=torch.bool)
 
                 traj_input.append(draft_input)
                 traj_target.append(target_tensor)
@@ -219,6 +245,7 @@ class TwoTowerDataset(Dataset):
                 t_tensor = torch.full((BLOCK_SIZE,), t_val, dtype=torch.float32)
                 traj_ts.append(t_tensor)
                 traj_wt.append(draft_wt)
+                traj_corruption_masks.append(corruption_mask)
                 
                 # Append <SEP> delimiter
                 if i < NUM_DRAFTS - 1:
@@ -226,12 +253,14 @@ class TwoTowerDataset(Dataset):
                     traj_target.append(torch.tensor([PAD_ID], dtype=torch.long)) # <SEP> target is ignored
                     traj_ts.append(torch.tensor([t_val], dtype=torch.float32))
                     traj_wt.append(torch.tensor([0.0], dtype=torch.float32))
+                    traj_corruption_masks.append(torch.tensor([False], dtype=torch.bool))
 
             padded_prefixes.append(prefix_tensor)
             padded_traj_inputs.append(torch.cat(traj_input))
             padded_traj_targets.append(torch.cat(traj_target))
             padded_traj_ts.append(torch.cat(traj_ts))
             padded_traj_wts.append(torch.cat(traj_wt))
+            padded_corruption_masks.append(torch.cat(traj_corruption_masks))
 
         return {
             "prefix": torch.stack(padded_prefixes),
@@ -239,8 +268,11 @@ class TwoTowerDataset(Dataset):
             "targets": torch.stack(padded_traj_targets),
             "timesteps": torch.stack(padded_traj_ts),
             "weights": torch.stack(padded_traj_wts),
+            "random_corruption_mask": torch.stack(padded_corruption_masks),
             "genre": torch.stack(genres),
-            "multi_hot": torch.stack(multi_hots)
+            "multi_hot": torch.stack(multi_hots),
+            "elasticity": torch.stack(elasticities),
+            "removed_instrument": torch.stack(removed_instruments),
         }
 
 def build_dataloader(jsonl_files: list[str], split: str, batch_size: int, augment: bool = False, num_workers: int = 4, distributed: bool = False) -> DataLoader:
@@ -503,7 +535,8 @@ def train(n_steps: int = N_STEPS):
                         timestep=batch["timesteps"],
                         seq_offset=PROMPT_MAX + 2,
                         context_kv_cache=past_kv,
-                        draft_size=BLOCK_SIZE + 1
+                        draft_size=BLOCK_SIZE + 1,
+                        elasticity=batch["elasticity"],
                     )
                     
                     flat_logits = logits.view(-1, VOCAB_SIZE)
@@ -681,7 +714,8 @@ def evaluate_validation(model_ar, model_denoiser, val_loader, device, max_batche
                 timestep=batch["timesteps"],
                 seq_offset=PROMPT_MAX + 2,
                 context_kv_cache=past_kv,
-                draft_size=BLOCK_SIZE + 1
+                draft_size=BLOCK_SIZE + 1,
+                elasticity=batch["elasticity"],
             )
             
             flat_logits = logits.view(-1, VOCAB_SIZE)
