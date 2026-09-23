@@ -37,14 +37,19 @@ ELASTICITY_SOLO_PROB = 0.3
 # stem from every draft and train the denoiser to reconstruct it.
 STEM_REMOVAL_PROB = 0.8
 
+# Train Tower B to operate without any Tower A context for this fraction of
+# batches. Genre and desired instruments are still supplied directly to B.
+PROMPTLESS_BATCH_PROB = 0.05
+
 # Visible-token corruption teaches later drafts to revise plausible mistakes,
 # not only fill masks. Most replacements preserve token type; a small fraction
 # deliberately uses the wider vocabulary to expose the model to bad structure.
 NON_MASK_CORRUPTION_PROBS = (0.15, 0.10, 0.05, 0.025)
 FULL_VOCAB_CORRUPTION_PROB = 0.075
 
-# Explicitly train recovery of the diminish/end markers. Ordinary diffusion
-# can also mask them; these probabilities are additional chances when visible.
+# If both <D>/<E> are in the target, one is kept visible while the other is
+# masked. If only one is present, ordinary diffusion plus these additional
+# probabilities provide explicit reconstruction practice.
 BOUNDARY_TOKEN_MASK_PROBS = (0.75, 0.50, 0.25, 0.10)
 
 # Simple weighted reconstruction objective.

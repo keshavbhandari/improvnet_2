@@ -47,7 +47,13 @@ BETAS = (0.9, 0.95)
 WARMUP_STEPS = 8000
 RESUME_START_LR = 1e-5
 RESUME_WARMUP_STEPS = 2000
-N_STEPS = 200000
+# Final WSD-style cooldown. These are absolute optimizer-update steps so the
+# schedule continues correctly across Slurm checkpoint/resume boundaries.
+TERMINAL_DECAY_START_STEP = 124000
+TERMINAL_DECAY_END_STEP = 140000
+TERMINAL_DECAY_START_LR = 1.3e-4
+TERMINAL_DECAY_MIN_LR = 1e-5
+N_STEPS = TERMINAL_DECAY_END_STEP
 GRAD_CLIP = 1.0
 
 # OPTIMIZER_BACKEND = "paged_adamw8bit"

@@ -176,7 +176,14 @@ class TwoTowerCorruptionStrategy:
             replacement = random.choice(pool)
         return replacement
 
-    def corrupt_visible_tokens(self, draft_input, target_tensor, valid_indices, draft_idx):
+    def corrupt_visible_tokens(
+        self,
+        draft_input,
+        target_tensor,
+        valid_indices,
+        draft_idx,
+        protected_visible_mask=None,
+    ):
         """Replace a scheduled fraction of currently visible, non-mask tokens."""
         corruption_mask = torch.zeros_like(draft_input, dtype=torch.bool)
         if draft_idx >= len(NON_MASK_CORRUPTION_PROBS):
@@ -186,7 +193,10 @@ class TwoTowerCorruptionStrategy:
         if corruption_prob <= 0.0:
             return corruption_mask
 
-        visible_indices = valid_indices[draft_input[valid_indices] != MASK_ID]
+        is_visible = draft_input[valid_indices] != MASK_ID
+        if protected_visible_mask is not None:
+            is_visible &= ~protected_visible_mask[valid_indices]
+        visible_indices = valid_indices[is_visible]
         if len(visible_indices) == 0:
             return corruption_mask
 
@@ -208,29 +218,37 @@ class TwoTowerCorruptionStrategy:
 
     def mask_boundary_tokens(self, draft_input, target_tensor, valid_indices, draft_idx):
         """Give <D>/<E> explicit reconstruction practice in every draft stage."""
+        protected_visible_mask = torch.zeros_like(draft_input, dtype=torch.bool)
         if draft_idx >= len(BOUNDARY_TOKEN_MASK_PROBS):
-            return
+            return protected_visible_mask
         mask_prob = float(BOUNDARY_TOKEN_MASK_PROBS[draft_idx])
-        if mask_prob <= 0.0:
-            return
 
-        boundary_ids = torch.tensor(
-            [
-                self.processor.tokenizer.tok_to_id[token]
-                for token in ("<D>", "<E>")
-                if token in self.processor.tokenizer.tok_to_id
-            ],
-            dtype=target_tensor.dtype,
-        )
-        if len(boundary_ids) == 0:
-            return
+        dim_id = self.processor.tokenizer.tok_to_id.get("<D>")
+        end_id = self.processor.tokenizer.tok_to_id.get("<E>")
+        if dim_id is None and end_id is None:
+            return protected_visible_mask
 
         target_values = target_tensor[valid_indices]
-        is_boundary = (target_values.unsqueeze(1) == boundary_ids.unsqueeze(0)).any(dim=1)
-        boundary_positions = valid_indices[is_boundary]
-        if len(boundary_positions) == 0:
-            return
+        dim_positions = valid_indices[target_values == dim_id] if dim_id is not None else valid_indices[:0]
+        end_positions = valid_indices[target_values == end_id] if end_id is not None else valid_indices[:0]
+
+        # When the pair is available, train both conditional directions:
+        # visible <D> -> recover <E>, or visible <E> -> recover <D>.
+        if len(dim_positions) > 0 and len(end_positions) > 0:
+            if random.random() < 0.5:
+                visible_positions, masked_positions = dim_positions, end_positions
+            else:
+                visible_positions, masked_positions = end_positions, dim_positions
+            draft_input[visible_positions] = target_tensor[visible_positions]
+            draft_input[masked_positions] = MASK_ID
+            protected_visible_mask[visible_positions] = True
+            return protected_visible_mask
+
+        boundary_positions = dim_positions if len(dim_positions) > 0 else end_positions
+        if len(boundary_positions) == 0 or mask_prob <= 0.0:
+            return protected_visible_mask
 
         still_visible = draft_input[boundary_positions] != MASK_ID
         selected = torch.rand(len(boundary_positions)) < mask_prob
         draft_input[boundary_positions[still_visible & selected]] = MASK_ID
+        return protected_visible_mask

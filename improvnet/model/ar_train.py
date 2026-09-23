@@ -207,6 +207,36 @@ def build_resume_warmup_scheduler(
 
     return LambdaLR(optimizer, [make_lr_lambda(factor) for factor in start_factors])
 
+def build_terminal_decay_scheduler(
+    optimizer,
+    start_step: int,
+    end_step: int,
+    start_lr: float,
+    min_lr: float,
+    current_step: int,
+) -> LambdaLR:
+    """Build an absolute-step cosine cooldown that survives job resumes."""
+    if end_step <= start_step:
+        raise ValueError("TERMINAL_DECAY_END_STEP must be greater than TERMINAL_DECAY_START_STEP")
+    if not 0.0 <= min_lr <= start_lr:
+        raise ValueError("TERMINAL_DECAY_MIN_LR must be between zero and TERMINAL_DECAY_START_LR")
+
+    min_factor = min_lr / start_lr if start_lr > 0 else 1.0
+    for group in optimizer.param_groups:
+        group['lr'] = start_lr
+        group['initial_lr'] = start_lr
+
+    def lr_lambda(step: int) -> float:
+        if step <= start_step:
+            return 1.0
+        progress = (step - start_step) / (end_step - start_step)
+        progress = min(1.0, max(0.0, progress))
+        cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_factor + (1.0 - min_factor) * cosine_factor
+
+    last_epoch = current_step - 1 if current_step > 0 else -1
+    return LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)
+
 def train(n_steps: int = N_STEPS):
     local_rank = setup_ddp()
     device = torch.device(f"cuda:{local_rank}")
@@ -240,7 +270,23 @@ def train(n_steps: int = N_STEPS):
         update_step, best_val_loss, scheduler_restored, lr_changed, resume_start_lrs, resume_state = load_checkpoint(
             model, optimizer, scheduler, device, scaler, checkpoint=checkpoint
         )
-        if lr_changed and resume_start_lrs is not None:
+        if resume_state is not None:
+            scheduler = build_terminal_decay_scheduler(
+                optimizer,
+                TERMINAL_DECAY_START_STEP,
+                TERMINAL_DECAY_END_STEP,
+                TERMINAL_DECAY_START_LR,
+                TERMINAL_DECAY_MIN_LR,
+                update_step,
+            )
+            if is_main_process:
+                print(
+                    f"Terminal cooldown: {TERMINAL_DECAY_START_LR:.2e} at step "
+                    f"{TERMINAL_DECAY_START_STEP} to {TERMINAL_DECAY_MIN_LR:.2e} "
+                    f"at step {TERMINAL_DECAY_END_STEP}; current LR "
+                    f"{optimizer.param_groups[0]['lr']:.2e}."
+                )
+        elif lr_changed and resume_start_lrs is not None:
             resume_start_lrs = [RESUME_START_LR for _ in optimizer.param_groups]
             scheduler = build_resume_warmup_scheduler(
                 optimizer,

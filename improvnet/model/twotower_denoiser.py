@@ -235,6 +235,8 @@ class TwoTowerDenoiser(nn.Module):
         self.token_emb = nn.Embedding(VOCAB_SIZE, EMBED_DIM)
         self.time_emb = TimestepEmbedder(EMBED_DIM)
         self.elasticity_emb = ElasticityEmbedder(EMBED_DIM)
+        self.genre_emb = nn.Embedding(NUM_GENRES, EMBED_DIM)
+        self.multihot_proj = nn.Linear(NUM_INSTRUMENTS, EMBED_DIM, bias=False)
         
         self.layers = nn.ModuleList([
             DenoiserTransformerBlock(
@@ -266,6 +268,8 @@ class TwoTowerDenoiser(nn.Module):
         context_kv_cache=None,
         draft_size=0,
         elasticity=None,
+        genre=None,
+        multi_hot=None,
     ):
         """
         noisy_target: [Batch, Sequence_Length] (e.g., Draft 1 <SEP> Draft 2 <SEP> Draft 3)
@@ -273,6 +277,8 @@ class TwoTowerDenoiser(nn.Module):
         seq_offset: Proved by AR Context (e.g., PROMPT_MAX + 2)
         draft_size: Determines the staircase slicing logic (e.g., BLOCK_SIZE + 1)
         elasticity: [Batch] requested <BLANK> fraction; 0 disables elasticity
+        genre: [Batch] target genre, supplied directly to Tower B
+        multi_hot: [Batch, NUM_INSTRUMENTS] desired output instrumentation
         """
         B, T = noisy_target.shape
         device = noisy_target.device
@@ -286,8 +292,26 @@ class TwoTowerDenoiser(nn.Module):
         elif elasticity.ndim != 1 or elasticity.shape[0] != B:
             raise ValueError(f"elasticity must have shape ({B},), got {tuple(elasticity.shape)}")
         elasticity = elasticity.to(device=device, dtype=torch.float32)
+
+        if genre is None:
+            genre = torch.zeros(B, device=device, dtype=torch.long)
+        elif genre.ndim != 1 or genre.shape[0] != B:
+            raise ValueError(f"genre must have shape ({B},), got {tuple(genre.shape)}")
+        genre = genre.to(device=device, dtype=torch.long)
+
+        if multi_hot is None:
+            multi_hot = torch.zeros(B, NUM_INSTRUMENTS, device=device, dtype=torch.float32)
+        elif multi_hot.shape != (B, NUM_INSTRUMENTS):
+            raise ValueError(
+                f"multi_hot must have shape ({B}, {NUM_INSTRUMENTS}), "
+                f"got {tuple(multi_hot.shape)}"
+            )
+        multi_hot = multi_hot.to(device=device, dtype=torch.float32)
+
         t_emb = self.time_emb(timestep)
         t_emb = t_emb + self.elasticity_emb(elasticity).unsqueeze(1).to(t_emb.dtype)
+        t_emb = t_emb + self.genre_emb(genre).unsqueeze(1).to(t_emb.dtype)
+        t_emb = t_emb + self.multihot_proj(multi_hot).unsqueeze(1).to(t_emb.dtype)
         
         # Continuous RoPE coordinates for the entire concatenated trajectory
         seq_pos = torch.arange(seq_offset, seq_offset + T, device=device).unsqueeze(0).expand(B, -1)

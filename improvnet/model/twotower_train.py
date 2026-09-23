@@ -221,14 +221,18 @@ class TwoTowerDataset(Dataset):
 
                     # Explicitly practice recovering diminish/end markers so
                     # continuation generation learns when the piece should end.
-                    self.corruption.mask_boundary_tokens(
+                    protected_visible_mask = self.corruption.mask_boundary_tokens(
                         draft_input, target_tensor, valid_indices, i
                     )
 
                     # Corrupt only tokens still visible after diffusion and
                     # stem masking. Earlier drafts receive more such errors.
                     corruption_mask = self.corruption.corrupt_visible_tokens(
-                        draft_input, target_tensor, valid_indices, i
+                        draft_input,
+                        target_tensor,
+                        valid_indices,
+                        i,
+                        protected_visible_mask=protected_visible_mask,
                     )
 
                     # Keep copying cheap, make correction meaningful, and put
@@ -517,26 +521,37 @@ def train(n_steps: int = N_STEPS):
             
             with ddp_context:
                 with torch.amp.autocast(DEVICE, dtype=AMP_DTYPE):
-                    # 1. Forward Pass through Tower A (Frozen) to generate static KV Context
-                    with torch.no_grad():
-                        _, past_kv = model_ar(
-                            target=batch["prefix"],          
-                            genre=batch["genre"],
-                            multi_hot=batch["multi_hot"],
-                            use_cache=True,
-                            past_key_values=None,
-                            seq_offset=0
-                        )
+                    # Five percent of batches deliberately have no musical
+                    # history or Tower A cache. Tower B still receives genre
+                    # and instrumentation directly and uses its normal drafts.
+                    is_promptless = random.random() < PROMPTLESS_BATCH_PROB
+                    if is_promptless:
+                        past_kv = None
+                        denoiser_seq_offset = 0
+                    else:
+                        # Tower A remains frozen and unchanged.
+                        with torch.no_grad():
+                            _, past_kv = model_ar(
+                                target=batch["prefix"],
+                                genre=batch["genre"],
+                                multi_hot=batch["multi_hot"],
+                                use_cache=True,
+                                past_key_values=None,
+                                seq_offset=0
+                            )
+                        denoiser_seq_offset = PROMPT_MAX + 2
 
-                    # 2. Forward Pass through Tower B (Trainable) to Denoise the Trajectory
-                    # Denoiser picks up exactly after the prefix RoPE indices (PROMPT_MAX + 2)
+                    # Tower B always gets controls directly, whether or not
+                    # Tower A provides a musical-history cache.
                     logits = model_denoiser(
                         noisy_target=batch["draft_traj"],
                         timestep=batch["timesteps"],
-                        seq_offset=PROMPT_MAX + 2,
+                        seq_offset=denoiser_seq_offset,
                         context_kv_cache=past_kv,
                         draft_size=BLOCK_SIZE + 1,
                         elasticity=batch["elasticity"],
+                        genre=batch["genre"],
+                        multi_hot=batch["multi_hot"],
                     )
                     
                     flat_logits = logits.view(-1, VOCAB_SIZE)
@@ -716,6 +731,8 @@ def evaluate_validation(model_ar, model_denoiser, val_loader, device, max_batche
                 context_kv_cache=past_kv,
                 draft_size=BLOCK_SIZE + 1,
                 elasticity=batch["elasticity"],
+                genre=batch["genre"],
+                multi_hot=batch["multi_hot"],
             )
             
             flat_logits = logits.view(-1, VOCAB_SIZE)
