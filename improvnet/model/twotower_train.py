@@ -40,6 +40,26 @@ def _amp_dtype():
 
 AMP_DTYPE = _amp_dtype()
 
+
+def sample_target_first_window(tokens):
+    """Sample a nonempty target, then take up to PROMPT_MAX preceding tokens."""
+    if not tokens:
+        raise ValueError("Cannot sample a target window from an empty sequence")
+
+    target_length = min(BLOCK_SIZE, len(tokens))
+    max_target_start = len(tokens) - target_length
+
+    # When the piece is longer than one target block, retain at least one
+    # preceding token for ordinary (non-promptless) Tower A examples.
+    target_start = random.randint(1, max_target_start) if max_target_start > 0 else 0
+    prefix_start = max(0, target_start - PROMPT_MAX)
+
+    prefix_tokens = tokens[prefix_start:target_start]
+    target_tokens = tokens[target_start:target_start + target_length]
+    if not target_tokens:
+        raise RuntimeError("Target-first sampling produced an empty target")
+    return prefix_tokens, target_tokens
+
 class TwoTowerDataset(Dataset):
     def __init__(
         self,
@@ -97,18 +117,9 @@ class TwoTowerDataset(Dataset):
             
         if len(tokens) == 0: tokens = ['<S>', '<E>']
         
-        total_needed = PROMPT_MAX + BLOCK_SIZE
+        prefix_tokens, target_tokens = sample_target_first_window(tokens)
         
-        if len(tokens) > total_needed:
-            start_idx = random.randint(0, len(tokens) - total_needed)
-            sliced_tokens = tokens[start_idx : start_idx + total_needed]
-        else:
-            sliced_tokens = tokens
-
-        prefix_tokens = sliced_tokens[:PROMPT_MAX]
-        target_tokens = sliced_tokens[PROMPT_MAX:PROMPT_MAX + BLOCK_SIZE]
-        
-        multi_hot = self.processor.get_instrument_multihot(sliced_tokens)
+        multi_hot = self.processor.get_instrument_multihot(prefix_tokens + target_tokens)
 
         return {
             "prefix": prefix_tokens,
@@ -118,8 +129,14 @@ class TwoTowerDataset(Dataset):
         }
 
     def collate_fn(self, batch):
+        # PROMPT_MAX is a cap, not a forced cache length. Pad only to the
+        # longest prefix in this batch and mask the shorter examples below.
+        prefix_pad_length = max((len(item["prefix"]) for item in batch), default=0)
+
         padded_prefixes = []
+        padded_prefix_attention_masks = []
         padded_traj_inputs = []
+        padded_draft_attention_masks = []
         padded_traj_targets = []
         padded_traj_ts = []
         padded_traj_wts = []
@@ -180,7 +197,9 @@ class TwoTowerDataset(Dataset):
             elasticities.append(torch.tensor(elasticity, dtype=torch.float32))
             removed_instruments.append(torch.tensor(removed_instrument_id, dtype=torch.long))
 
-            prefix_tensor = self.processor.format_variable_sequence(prefix_tokens, PROMPT_MAX, pad_id=PAD_ID)
+            prefix_tensor = self.processor.format_variable_sequence(
+                prefix_tokens, prefix_pad_length, pad_id=PAD_ID
+            )
             target_tensor = self.processor.format_variable_sequence(target_tokens, BLOCK_SIZE, pad_id=PAD_ID)
             # Elasticity creates complete spare event slots. Presenting those
             # slots as <MASK>x4 teaches the same generation-time interface as
@@ -259,8 +278,11 @@ class TwoTowerDataset(Dataset):
                     traj_wt.append(torch.tensor([0.0], dtype=torch.float32))
                     traj_corruption_masks.append(torch.tensor([False], dtype=torch.bool))
 
+            draft_traj = torch.cat(traj_input)
             padded_prefixes.append(prefix_tensor)
-            padded_traj_inputs.append(torch.cat(traj_input))
+            padded_prefix_attention_masks.append(prefix_tensor != PAD_ID)
+            padded_traj_inputs.append(draft_traj)
+            padded_draft_attention_masks.append(draft_traj != PAD_ID)
             padded_traj_targets.append(torch.cat(traj_target))
             padded_traj_ts.append(torch.cat(traj_ts))
             padded_traj_wts.append(torch.cat(traj_wt))
@@ -268,7 +290,9 @@ class TwoTowerDataset(Dataset):
 
         return {
             "prefix": torch.stack(padded_prefixes),
+            "prefix_attention_mask": torch.stack(padded_prefix_attention_masks),
             "draft_traj": torch.stack(padded_traj_inputs),
+            "draft_attention_mask": torch.stack(padded_draft_attention_masks),
             "targets": torch.stack(padded_traj_targets),
             "timesteps": torch.stack(padded_traj_ts),
             "weights": torch.stack(padded_traj_wts),
@@ -329,43 +353,44 @@ def next_training_position(global_sample_idx, epoch, dataset_size, batch_size, w
         next_global_sample_idx = 0
     return next_epoch, next_batch_idx, next_sample_idx, next_global_sample_idx
 
-def build_scheduler(optimizer, warmup_steps: int, total_steps: int, last_epoch: int = -1) -> LambdaLR:
-    def lr_lambda(step: int) -> float:
-        if step < warmup_steps: return step / max(1, warmup_steps)
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        progress = min(1.0, max(0.0, progress))
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
-    return LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)
-
-def build_resume_warmup_scheduler(
+def build_scheduler(
     optimizer,
-    start_lrs: list[float],
-    target_lr: float,
     warmup_steps: int,
     total_steps: int,
-    resume_step: int
+    min_lr: float,
+    decay_steps: int,
+    last_epoch: int = -1,
 ) -> LambdaLR:
-    target_lrs = [target_lr for _ in optimizer.param_groups]
-    start_factors = [
-        start_lr / target_lr if target_lr > 0 else 1.0
-        for start_lr in start_lrs
-    ]
+    """Warm up, hold the peak LR, then cosine-decay over the final steps."""
+    if decay_steps <= 0 or warmup_steps + decay_steps > total_steps:
+        raise ValueError("DECAY_STEPS must be positive and fit after WARMUP_STEPS")
 
-    for group, lr in zip(optimizer.param_groups, target_lrs):
-        group['lr'] = lr
-        group['initial_lr'] = lr
+    peak_lrs = [group.get('initial_lr', group['lr']) for group in optimizer.param_groups]
+    if any(not 0.0 <= min_lr <= peak_lr for peak_lr in peak_lrs):
+        raise ValueError("MIN_LR must be between zero and each optimizer group's peak LR")
 
-    def make_lr_lambda(start_factor: float):
+    decay_start = total_steps - decay_steps
+
+    def make_lr_lambda(peak_lr: float):
+        min_factor = min_lr / peak_lr if peak_lr > 0 else 1.0
+
         def lr_lambda(step: int) -> float:
             if step < warmup_steps:
-                alpha = step / max(1, warmup_steps)
-                return start_factor + (1.0 - start_factor) * alpha
-            progress = (step - warmup_steps) / max(1, total_steps - resume_step - warmup_steps)
+                return step / max(1, warmup_steps)
+            if step <= decay_start:
+                return 1.0
+            progress = (step - decay_start) / decay_steps
             progress = min(1.0, max(0.0, progress))
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
+            cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_factor + (1.0 - min_factor) * cosine_factor
+
         return lr_lambda
 
-    return LambdaLR(optimizer, [make_lr_lambda(factor) for factor in start_factors])
+    return LambdaLR(
+        optimizer,
+        [make_lr_lambda(peak_lr) for peak_lr in peak_lrs],
+        last_epoch=last_epoch,
+    )
 
 def train(n_steps: int = N_STEPS):
     local_rank = setup_ddp()
@@ -391,9 +416,8 @@ def train(n_steps: int = N_STEPS):
 
     model_denoiser = DDP(model_denoiser, device_ids=[local_rank], find_unused_parameters=False)
     checkpoint = load_training_checkpoint(config=twotower_config) if RESUME_TRAINING else None
-    optimizer, optimizer_backend = build_optimizer(
+    optimizer = build_optimizer(
         model_denoiser.parameters(),
-        checkpoint=checkpoint,
         is_main_process=is_main_process,
         config=twotower_config
     )
@@ -401,9 +425,9 @@ def train(n_steps: int = N_STEPS):
 
     update_step, best_val_loss = 0, float('inf')
     resume_state = None
-    scheduler = build_scheduler(optimizer, WARMUP_STEPS, n_steps)
+    scheduler = build_scheduler(optimizer, WARMUP_STEPS, n_steps, MIN_LR, DECAY_STEPS)
     if RESUME_TRAINING:
-        update_step, best_val_loss, scheduler_restored, lr_changed, resume_start_lrs, resume_state = load_checkpoint(
+        update_step, best_val_loss, scheduler_restored, lr_changed, resume_state = load_checkpoint(
             model_denoiser,
             optimizer,
             scheduler,
@@ -412,27 +436,17 @@ def train(n_steps: int = N_STEPS):
             checkpoint=checkpoint,
             config=twotower_config
         )
-        if lr_changed and resume_start_lrs is not None:
-            resume_start_lrs = [RESUME_START_LR for _ in optimizer.param_groups]
-            scheduler = build_resume_warmup_scheduler(
-                optimizer,
-                resume_start_lrs,
-                LR,
-                RESUME_WARMUP_STEPS,
-                n_steps,
-                update_step,
-            )
-            if is_main_process:
-                print(
-                    f"Learning rate changed; warming up from {RESUME_START_LR:.2e} "
-                    f"to {LR:.2e} over {RESUME_WARMUP_STEPS} steps."
-                )
-        elif not scheduler_restored:
+        if lr_changed or not scheduler_restored:
+            for group in optimizer.param_groups:
+                group['lr'] = LR
+                group['initial_lr'] = LR
             scheduler = build_scheduler(
                 optimizer,
                 WARMUP_STEPS,
                 n_steps,
-                last_epoch=update_step - 1 if update_step > 0 else -1
+                MIN_LR,
+                DECAY_STEPS,
+                last_epoch=update_step - 1 if update_step > 0 else -1,
             )
     del checkpoint
 
@@ -490,7 +504,7 @@ def train(n_steps: int = N_STEPS):
         else:
             print(f"Resuming legacy checkpoint from step {update_step}; starting at epoch {start_epoch}, batch 0.")
         if resume_state.get('optimizer_restored'):
-            print(f"Restored optimizer state ({resume_state['optimizer_backend']}).")
+            print("Restored AdamW optimizer state.")
         else:
             print(f"Optimizer state not restored: {resume_state.get('optimizer_skipped_reason', 'not available')}.")
         if resume_state.get('rng_restored'):
@@ -527,7 +541,10 @@ def train(n_steps: int = N_STEPS):
                     is_promptless = random.random() < PROMPTLESS_BATCH_PROB
                     if is_promptless:
                         past_kv = None
-                        denoiser_seq_offset = 0
+                        context_attention_mask = None
+                        denoiser_seq_offset = torch.zeros(
+                            batch["prefix"].shape[0], device=device, dtype=torch.long
+                        )
                     else:
                         # Tower A remains frozen and unchanged.
                         with torch.no_grad():
@@ -539,7 +556,16 @@ def train(n_steps: int = N_STEPS):
                                 past_key_values=None,
                                 seq_offset=0
                             )
-                        denoiser_seq_offset = PROMPT_MAX + 2
+                        # Tower A is causal and prefixes are right-padded, so
+                        # real prefix states never attend to PAD tokens. Mask
+                        # those cached PAD keys when Tower B consumes them.
+                        condition_mask = torch.ones(
+                            batch["prefix"].shape[0], 2, device=device, dtype=torch.bool
+                        )
+                        context_attention_mask = torch.cat(
+                            [condition_mask, batch["prefix_attention_mask"]], dim=1
+                        )
+                        denoiser_seq_offset = batch["prefix_attention_mask"].sum(dim=1) + 2
 
                     # Tower B always gets controls directly, whether or not
                     # Tower A provides a musical-history cache.
@@ -548,6 +574,8 @@ def train(n_steps: int = N_STEPS):
                         timestep=batch["timesteps"],
                         seq_offset=denoiser_seq_offset,
                         context_kv_cache=past_kv,
+                        attention_mask=batch["draft_attention_mask"],
+                        context_attention_mask=context_attention_mask,
                         draft_size=BLOCK_SIZE + 1,
                         elasticity=batch["elasticity"],
                         genre=batch["genre"],
@@ -650,7 +678,6 @@ def train(n_steps: int = N_STEPS):
                             micro_step,
                             scaler,
                             is_best,
-                            optimizer_backend=optimizer_backend,
                             rng_state=checkpoint_rng_state,
                             config=twotower_config
                         )
@@ -681,7 +708,6 @@ def train(n_steps: int = N_STEPS):
                             next_global_sample_idx,
                             micro_step,
                             scaler,
-                            optimizer_backend=optimizer_backend,
                             rng_state=checkpoint_rng_state,
                             config=twotower_config
                         )
@@ -724,11 +750,21 @@ def evaluate_validation(model_ar, model_denoiser, val_loader, device, max_batche
                 seq_offset=0
             )
 
+            condition_mask = torch.ones(
+                batch["prefix"].shape[0], 2, device=device, dtype=torch.bool
+            )
+            context_attention_mask = torch.cat(
+                [condition_mask, batch["prefix_attention_mask"]], dim=1
+            )
+            denoiser_seq_offset = batch["prefix_attention_mask"].sum(dim=1) + 2
+
             logits = model_denoiser(
                 noisy_target=batch["draft_traj"],
                 timestep=batch["timesteps"],
-                seq_offset=PROMPT_MAX + 2,
+                seq_offset=denoiser_seq_offset,
                 context_kv_cache=past_kv,
+                attention_mask=batch["draft_attention_mask"],
+                context_attention_mask=context_attention_mask,
                 draft_size=BLOCK_SIZE + 1,
                 elasticity=batch["elasticity"],
                 genre=batch["genre"],

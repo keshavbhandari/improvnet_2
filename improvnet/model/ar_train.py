@@ -169,73 +169,44 @@ def next_training_position(global_sample_idx, epoch, dataset_size, batch_size, w
         next_global_sample_idx = 0
     return next_epoch, next_batch_idx, next_sample_idx, next_global_sample_idx
 
-def build_scheduler(optimizer, warmup_steps: int, total_steps: int, last_epoch: int = -1) -> LambdaLR:
-    def lr_lambda(step: int) -> float:
-        if step < warmup_steps: return step / max(1, warmup_steps)
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        progress = min(1.0, max(0.0, progress))
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
-    return LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)
-
-def build_resume_warmup_scheduler(
+def build_scheduler(
     optimizer,
-    start_lrs: list[float],
-    target_lr: float,
     warmup_steps: int,
     total_steps: int,
-    resume_step: int
+    min_lr: float,
+    decay_steps: int,
+    last_epoch: int = -1,
 ) -> LambdaLR:
-    target_lrs = [target_lr for _ in optimizer.param_groups]
-    start_factors = [
-        start_lr / target_lr if target_lr > 0 else 1.0
-        for start_lr in start_lrs
-    ]
-    
-    for group, lr in zip(optimizer.param_groups, target_lrs):
-        group['lr'] = lr
-        group['initial_lr'] = lr
+    """Warm up, hold the peak LR, then cosine-decay over the final steps."""
+    if decay_steps <= 0 or warmup_steps + decay_steps > total_steps:
+        raise ValueError("DECAY_STEPS must be positive and fit after WARMUP_STEPS")
 
-    def make_lr_lambda(start_factor: float):
+    peak_lrs = [group.get('initial_lr', group['lr']) for group in optimizer.param_groups]
+    if any(not 0.0 <= min_lr <= peak_lr for peak_lr in peak_lrs):
+        raise ValueError("MIN_LR must be between zero and each optimizer group's peak LR")
+
+    decay_start = total_steps - decay_steps
+
+    def make_lr_lambda(peak_lr: float):
+        min_factor = min_lr / peak_lr if peak_lr > 0 else 1.0
+
         def lr_lambda(step: int) -> float:
             if step < warmup_steps:
-                alpha = step / max(1, warmup_steps)
-                return start_factor + (1.0 - start_factor) * alpha
-            progress = (step - warmup_steps) / max(1, total_steps - resume_step - warmup_steps)
+                return step / max(1, warmup_steps)
+            if step <= decay_start:
+                return 1.0
+            progress = (step - decay_start) / decay_steps
             progress = min(1.0, max(0.0, progress))
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
+            cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_factor + (1.0 - min_factor) * cosine_factor
+
         return lr_lambda
 
-    return LambdaLR(optimizer, [make_lr_lambda(factor) for factor in start_factors])
-
-def build_terminal_decay_scheduler(
-    optimizer,
-    start_step: int,
-    end_step: int,
-    start_lr: float,
-    min_lr: float,
-    current_step: int,
-) -> LambdaLR:
-    """Build an absolute-step cosine cooldown that survives job resumes."""
-    if end_step <= start_step:
-        raise ValueError("TERMINAL_DECAY_END_STEP must be greater than TERMINAL_DECAY_START_STEP")
-    if not 0.0 <= min_lr <= start_lr:
-        raise ValueError("TERMINAL_DECAY_MIN_LR must be between zero and TERMINAL_DECAY_START_LR")
-
-    min_factor = min_lr / start_lr if start_lr > 0 else 1.0
-    for group in optimizer.param_groups:
-        group['lr'] = start_lr
-        group['initial_lr'] = start_lr
-
-    def lr_lambda(step: int) -> float:
-        if step <= start_step:
-            return 1.0
-        progress = (step - start_step) / (end_step - start_step)
-        progress = min(1.0, max(0.0, progress))
-        cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return min_factor + (1.0 - min_factor) * cosine_factor
-
-    last_epoch = current_step - 1 if current_step > 0 else -1
-    return LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)
+    return LambdaLR(
+        optimizer,
+        [make_lr_lambda(peak_lr) for peak_lr in peak_lrs],
+        last_epoch=last_epoch,
+    )
 
 def train(n_steps: int = N_STEPS):
     local_rank = setup_ddp()
@@ -256,53 +227,31 @@ def train(n_steps: int = N_STEPS):
         print(f"Model Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
     checkpoint = load_training_checkpoint() if RESUME_TRAINING else None
-    optimizer, optimizer_backend = build_optimizer(
+    optimizer = build_optimizer(
         model.parameters(),
-        checkpoint=checkpoint,
         is_main_process=is_main_process
     )
     scaler = torch.amp.GradScaler('cuda', enabled=(AMP_DTYPE == torch.float16))
 
     update_step, best_val_loss = 0, float('inf')
     resume_state = None
-    scheduler = build_scheduler(optimizer, WARMUP_STEPS, n_steps)
+    scheduler = build_scheduler(optimizer, WARMUP_STEPS, n_steps, MIN_LR, DECAY_STEPS)
     if RESUME_TRAINING:
-        update_step, best_val_loss, scheduler_restored, lr_changed, resume_start_lrs, resume_state = load_checkpoint(
+        update_step, best_val_loss, scheduler_restored, lr_changed, resume_state = load_checkpoint(
             model, optimizer, scheduler, device, scaler, checkpoint=checkpoint
         )
-        if resume_state is not None:
-            scheduler = build_terminal_decay_scheduler(
+        if lr_changed or not scheduler_restored:
+            for group in optimizer.param_groups:
+                group['lr'] = LR
+                group['initial_lr'] = LR
+            scheduler = build_scheduler(
                 optimizer,
-                TERMINAL_DECAY_START_STEP,
-                TERMINAL_DECAY_END_STEP,
-                TERMINAL_DECAY_START_LR,
-                TERMINAL_DECAY_MIN_LR,
-                update_step,
-            )
-            if is_main_process:
-                print(
-                    f"Terminal cooldown: {TERMINAL_DECAY_START_LR:.2e} at step "
-                    f"{TERMINAL_DECAY_START_STEP} to {TERMINAL_DECAY_MIN_LR:.2e} "
-                    f"at step {TERMINAL_DECAY_END_STEP}; current LR "
-                    f"{optimizer.param_groups[0]['lr']:.2e}."
-                )
-        elif lr_changed and resume_start_lrs is not None:
-            resume_start_lrs = [RESUME_START_LR for _ in optimizer.param_groups]
-            scheduler = build_resume_warmup_scheduler(
-                optimizer,
-                resume_start_lrs,
-                LR,
-                RESUME_WARMUP_STEPS,
+                WARMUP_STEPS,
                 n_steps,
-                update_step,
+                MIN_LR,
+                DECAY_STEPS,
+                last_epoch=update_step - 1 if update_step > 0 else -1,
             )
-            if is_main_process:
-                print(
-                    f"Learning rate changed; warming up from {RESUME_START_LR:.2e} "
-                    f"to {LR:.2e} over {RESUME_WARMUP_STEPS} steps."
-                )
-        elif not scheduler_restored:
-            scheduler = build_scheduler(optimizer, WARMUP_STEPS, n_steps, last_epoch=update_step - 1 if update_step > 0 else -1)
     del checkpoint
     
     has_resume_position = resume_state is not None and resume_state['has_resume_position']
@@ -359,7 +308,7 @@ def train(n_steps: int = N_STEPS):
         else:
             print(f"Resuming legacy checkpoint from step {update_step}; starting at epoch {start_epoch}, batch 0.")
         if resume_state.get('optimizer_restored'):
-            print(f"Restored optimizer state ({resume_state['optimizer_backend']}).")
+            print("Restored AdamW optimizer state.")
         else:
             print(f"Optimizer state not restored: {resume_state.get('optimizer_skipped_reason', 'not available')}.")
         if resume_state.get('rng_restored'):
@@ -492,7 +441,6 @@ def train(n_steps: int = N_STEPS):
                             micro_step,
                             scaler,
                             is_best,
-                            optimizer_backend=optimizer_backend,
                             rng_state=checkpoint_rng_state
                         )
                     if dist.is_initialized():
@@ -522,7 +470,6 @@ def train(n_steps: int = N_STEPS):
                             next_global_sample_idx,
                             micro_step,
                             scaler,
-                            optimizer_backend=optimizer_backend,
                             rng_state=checkpoint_rng_state
                         )
                         print(f"Saved resumable checkpoint at step {update_step}.")

@@ -16,11 +16,6 @@ from improvnet.tokenizer.midi import MidiDict
 from improvnet.tokenizer.absolute import AbsTokenizer
 from improvnet.model.ar_config import GENRES
 
-try:
-    import bitsandbytes as bnb
-except ImportError:
-    bnb = None
-
 _SPLIT_INDEX_CACHE: dict[
     tuple[str, int, tuple[tuple[str, float], ...], tuple[str, ...]],
     dict[str, list[int]],
@@ -408,13 +403,6 @@ def resume_epoch_loader(
     remaining_indices = list(loader.sampler)[start_sample_idx:]
     return _loader_from_indices(loader, remaining_indices)
 
-_BNB_STATE_KEYS = {
-    "state1", "state2", "qmap1", "qmap2", "absmax1", "absmax2",
-    "max1", "max2", "new_max1", "new_max2", "unorm_vec",
-    "__bnb_optimizer_quant_state__"
-}
-_TORCH_ADAMW_STATE_KEYS = {"exp_avg", "exp_avg_sq", "max_exp_avg_sq"}
-
 def checkpoint_path(config=None):
     return os.path.join(_cfg("SAVE_DIR", config=config), "latest_checkpoint.pt")
 
@@ -439,171 +427,16 @@ def _move_state_to_cpu(value):
         return tuple(_move_state_to_cpu(v) for v in value)
     return value
 
-def _normalize_optimizer_backend(backend):
-    if backend is None:
-        return "auto"
-    backend = str(backend).lower().replace("-", "_")
-    aliases = {
-        "torch": "adamw",
-        "torch_adamw": "adamw",
-        "adamw32": "adamw",
-        "adamw_32bit": "adamw",
-        "bnb": "paged_adamw8bit",
-        "bitsandbytes": "paged_adamw8bit",
-        "8bit": "paged_adamw8bit",
-        "adamw_8bit": "adamw8bit",
-        "adamw8": "adamw8bit",
-        "paged_adamw_8bit": "paged_adamw8bit",
-        "paged_8bit": "paged_adamw8bit",
-    }
-    return aliases.get(backend, backend)
-
-def _optimizer_state_format(optimizer_state_dict):
-    if not optimizer_state_dict:
-        return None
-
-    state = optimizer_state_dict.get("state", {})
-    saw_state = False
-    for param_state in state.values():
-        if not isinstance(param_state, dict) or len(param_state) == 0:
-            continue
-        saw_state = True
-        keys = set(param_state.keys())
-        wrapped_quant_state = param_state.get("__bnb_optimizer_quant_state__")
-        if isinstance(wrapped_quant_state, dict):
-            keys.update(wrapped_quant_state.keys())
-
-        if keys & _BNB_STATE_KEYS:
-            return "bitsandbytes"
-        if keys & _TORCH_ADAMW_STATE_KEYS:
-            return "torch_adamw"
-
-    return "empty" if not saw_state else "unknown"
-
-def _default_8bit_backend(config=None):
-    if bnb is None:
-        return None
-    if _cfg("PREFER_PAGED_8BIT_OPTIMIZER", True, config=config) and hasattr(bnb.optim, "PagedAdamW8bit"):
-        return "paged_adamw8bit"
-    if hasattr(bnb.optim, "AdamW8bit"):
-        return "adamw8bit"
-    return None
-
-def optimizer_backend_from_instance(optimizer):
-    module_name = optimizer.__class__.__module__.lower()
-    class_name = optimizer.__class__.__name__.lower()
-    if module_name.startswith("bitsandbytes"):
-        if "paged" in class_name:
-            return "paged_adamw8bit"
-        if "8bit" in class_name:
-            return "adamw8bit"
-    return "adamw"
-
-def _checkpoint_optimizer_backend(checkpoint, config=None):
-    if checkpoint is None:
-        return None
-
-    backend = checkpoint.get("optimizer_backend")
-    if backend is not None:
-        return _normalize_optimizer_backend(backend)
-
-    optimizer_class = str(checkpoint.get("optimizer_class", "")).lower()
-    if "pagedadamw8bit" in optimizer_class:
-        return "paged_adamw8bit"
-    if "adamw8bit" in optimizer_class:
-        return "adamw8bit"
-    if "adamw" in optimizer_class:
-        return "adamw"
-
-    state_format = _optimizer_state_format(checkpoint.get("optimizer_state_dict"))
-    if state_format == "bitsandbytes":
-        return _default_8bit_backend(config=config) or "adamw8bit"
-    if state_format == "torch_adamw":
-        return "adamw"
-    return None
-
-def _is_bitsandbytes_backend(backend):
-    return backend in ("adamw8bit", "paged_adamw8bit")
-
-def _is_bitsandbytes_optimizer(optimizer):
-    return optimizer.__class__.__module__.lower().startswith("bitsandbytes")
-
-def _choose_optimizer_backend(checkpoint, config=None):
-    requested_backend = _normalize_optimizer_backend(_cfg("OPTIMIZER_BACKEND", "auto", config=config))
-    valid_backends = {"auto", "adamw", "adamw8bit", "paged_adamw8bit"}
-    if requested_backend not in valid_backends:
-        raise ValueError(
-            f"Unsupported OPTIMIZER_BACKEND={_cfg('OPTIMIZER_BACKEND', 'auto', config=config)!r}. "
-            f"Use one of {sorted(valid_backends)}."
-        )
-
-    if requested_backend != "auto":
-        return requested_backend
-
-    checkpoint_backend = _checkpoint_optimizer_backend(checkpoint, config=config)
-    if checkpoint_backend is not None:
-        return checkpoint_backend
-
-    return _default_8bit_backend(config=config) or "adamw"
-
-def build_optimizer(parameters, checkpoint=None, is_main_process=True, config=None):
-    params = list(parameters)
-    backend = _choose_optimizer_backend(checkpoint, config=config)
-    requested_backend = _normalize_optimizer_backend(_cfg("OPTIMIZER_BACKEND", "auto", config=config))
-    auto_requested = requested_backend == "auto"
-    checkpoint_format = _optimizer_state_format(
-        checkpoint.get("optimizer_state_dict") if checkpoint is not None else None
-    )
-
-    if _is_bitsandbytes_backend(backend) and bnb is None:
-        if auto_requested and checkpoint_format != "bitsandbytes":
-            backend = "adamw"
-        else:
-            raise RuntimeError(
-                "This checkpoint needs a bitsandbytes optimizer, but bitsandbytes "
-                "could not be imported in this environment."
-            )
-
-    optimizer_kwargs = dict(
+def build_optimizer(parameters, is_main_process=True, config=None):
+    optimizer = AdamW(
+        list(parameters),
         lr=_cfg("LR", config=config),
         weight_decay=_cfg("WEIGHT_DECAY", 1e-2, config=config),
         betas=_cfg("BETAS", (0.9, 0.95), config=config),
     )
-    if backend == "adamw":
-        optimizer = AdamW(params, **optimizer_kwargs)
-    elif backend == "paged_adamw8bit":
-        if not hasattr(bnb.optim, "PagedAdamW8bit"):
-            backend = "adamw8bit"
-            optimizer = bnb.optim.AdamW8bit(params, **optimizer_kwargs)
-        else:
-            optimizer = bnb.optim.PagedAdamW8bit(params, **optimizer_kwargs)
-    elif backend == "adamw8bit":
-        optimizer = bnb.optim.AdamW8bit(params, **optimizer_kwargs)
-    else:
-        raise ValueError(f"Unsupported optimizer backend: {backend}")
-
     if is_main_process:
-        print(f"Using optimizer backend: {backend} ({optimizer.__class__.__name__}).")
-    return optimizer, backend
-
-def _optimizer_state_is_compatible(optimizer, optimizer_state_dict):
-    state_format = _optimizer_state_format(optimizer_state_dict)
-    if state_format in (None, "empty"):
-        return True
-    if state_format == "unknown":
-        return True
-    if _is_bitsandbytes_optimizer(optimizer):
-        return state_format == "bitsandbytes"
-    return state_format == "torch_adamw"
-
-def _load_optimizer_state_dict(optimizer, optimizer_state_dict):
-    if _is_bitsandbytes_optimizer(optimizer):
-        try:
-            optimizer.load_state_dict(optimizer_state_dict, move_to_device=True)
-            return
-        except TypeError:
-            pass
-    optimizer.load_state_dict(optimizer_state_dict)
+        print("Using optimizer: AdamW.")
+    return optimizer
 
 def _current_rank_rng_state(device):
     return {
@@ -674,7 +507,6 @@ def save_checkpoint(
     micro_step,
     scaler=None,
     is_best=False,
-    optimizer_backend=None,
     rng_state=None,
     config=None,
 ):
@@ -686,8 +518,6 @@ def save_checkpoint(
         'step': step,
         'model_state_dict': model_to_save.state_dict(),
         'optimizer_state_dict': optimizer_state_dict,
-        'optimizer_backend': optimizer_backend or optimizer_backend_from_instance(optimizer),
-        'optimizer_class': f"{optimizer.__class__.__module__}.{optimizer.__class__.__name__}",
         'scheduler_state_dict': scheduler.state_dict(),
         'best_val_loss': best_val_loss,
         'epoch': epoch,
@@ -740,7 +570,7 @@ def load_checkpoint(model, optimizer, scheduler, device, scaler=None, checkpoint
     if checkpoint is None:
         checkpoint = load_training_checkpoint(config=config)
     if checkpoint is None:
-        return 0, float('inf'), False, False, None, None
+        return 0, float('inf'), False, False, None
 
     has_resume_position = all(
         key in checkpoint for key in ('epoch', 'next_batch_idx', 'micro_step')
@@ -755,8 +585,6 @@ def load_checkpoint(model, optimizer, scheduler, device, scaler=None, checkpoint
         'checkpoint_accum_steps': checkpoint.get('accum_steps', _cfg("RESUME_CHECKPOINT_ACCUM_STEPS", config=config)),
         'checkpoint_world_size': checkpoint.get('world_size', _cfg("RESUME_CHECKPOINT_WORLD_SIZE", config=config)),
         'micro_step': checkpoint.get('micro_step'),
-        'optimizer_backend': optimizer_backend_from_instance(optimizer),
-        'checkpoint_optimizer_backend': _checkpoint_optimizer_backend(checkpoint, config=config),
         'optimizer_restored': False,
         'rng_restored': False
     }
@@ -765,30 +593,14 @@ def load_checkpoint(model, optimizer, scheduler, device, scaler=None, checkpoint
 
     optimizer_state_dict = checkpoint.get('optimizer_state_dict')
     if optimizer_state_dict is not None:
-        if _optimizer_state_is_compatible(optimizer, optimizer_state_dict):
-            _load_optimizer_state_dict(optimizer, optimizer_state_dict)
-            resume_state['optimizer_restored'] = True
-        elif _cfg("ALLOW_OPTIMIZER_MIGRATION_TO_8BIT", False, config=config):
-            resume_state['optimizer_skipped_reason'] = (
-                "optimizer backend changed; ALLOW_OPTIMIZER_MIGRATION_TO_8BIT=True"
-            )
-        else:
-            checkpoint_format = _optimizer_state_format(optimizer_state_dict)
-            current_backend = optimizer_backend_from_instance(optimizer)
-            raise RuntimeError(
-                "Optimizer checkpoint is not compatible with the current optimizer. "
-                f"Checkpoint format={checkpoint_format!r}, current backend={current_backend!r}. "
-                "Leave OPTIMIZER_BACKEND='auto' to resume exactly, or set "
-                "ALLOW_OPTIMIZER_MIGRATION_TO_8BIT=True if you intentionally want "
-                "to skip the old optimizer moments and continue with the new optimizer."
-            )
+        optimizer.load_state_dict(optimizer_state_dict)
+        resume_state['optimizer_restored'] = True
     else:
         resume_state['optimizer_skipped_reason'] = "checkpoint has no optimizer_state_dict"
 
     checkpoint_lrs = _checkpoint_base_lrs(checkpoint, optimizer, config=config)
     lr_changed = not _lrs_match_config(checkpoint_lrs, _cfg("LR", config=config))
     scheduler_restored = 'scheduler_state_dict' in checkpoint
-    resume_start_lrs = [group['lr'] for group in optimizer.param_groups]
 
     if scheduler_restored and not lr_changed:
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -806,4 +618,4 @@ def load_checkpoint(model, optimizer, scheduler, device, scaler=None, checkpoint
     if device.type == 'cuda':
         torch.cuda.empty_cache()
 
-    return step, best_val_loss, scheduler_restored, lr_changed, resume_start_lrs, resume_state
+    return step, best_val_loss, scheduler_restored, lr_changed, resume_state

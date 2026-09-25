@@ -114,27 +114,29 @@ class RotaryEmbedding(nn.Module):
         sin = emb.sin().unsqueeze(2).to(dtype=qk.dtype)
         return (qk * cos) + (rotate_half(qk) * sin)
 
-def sdpa_attn_func(q, k, v, dropout_p=0.0, causal=False):
+def sdpa_attn_func(q, k, v, dropout_p=0.0, causal=False, attn_mask=None):
     """flash_attn_func-compatible SDPA fallback.
 
     Inputs use FlashAttention layout: q is (B, Tq, Hq, D), while k and v
-    are (B, Tk, Hkv, D). Grouped-query KV heads are expanded for PyTorch
-    versions that do not expose SDPA's enable_gqa argument.
+    are (B, Tk, Hkv, D). PyTorch SDPA handles grouped-query attention without
+    explicitly repeating the cached KV heads.
     """
     hq = q.shape[2]
     hkv = k.shape[2]
 
     q, k, v = (tensor.transpose(1, 2) for tensor in (q, k, v))
 
-    if hq != hkv:
-        if hq % hkv != 0:
-            raise ValueError(f"Query heads ({hq}) must be divisible by KV heads ({hkv})")
-        repeats = hq // hkv
-        k = k.repeat_interleave(repeats, dim=1)
-        v = v.repeat_interleave(repeats, dim=1)
+    if hq % hkv != 0:
+        raise ValueError(f"Query heads ({hq}) must be divisible by KV heads ({hkv})")
 
     output = F.scaled_dot_product_attention(
-        q, k, v, dropout_p=dropout_p, is_causal=causal
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=causal,
+        enable_gqa=(hq != hkv),
     )
     return output.transpose(1, 2).contiguous()
 
@@ -156,8 +158,37 @@ class HybridGroupedQueryAttention(nn.Module):
         self.rope = RotaryEmbedding(self.head_dim)
         self.attn_fn = flash_attn_func if HAS_FLASH else sdpa_attn_func
 
-    def forward(self, x, seq_pos, context_kv=None, draft_size=0):
+    def _attend(self, q, k, v, dropout_p, key_mask=None):
+        if key_mask is None:
+            return self.attn_fn(q, k, v, dropout_p=dropout_p, causal=False)
+
+        # FlashAttention's dense API has no key-padding-mask argument. SDPA
+        # accepts a broadcastable boolean mask and still supports GQA.
+        sdpa_mask = key_mask[:, None, None, :].to(device=q.device, dtype=torch.bool)
+        return sdpa_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=dropout_p,
+            causal=False,
+            attn_mask=sdpa_mask,
+        )
+
+    def forward(
+        self,
+        x,
+        seq_pos,
+        context_kv=None,
+        draft_size=0,
+        attention_mask=None,
+        context_attention_mask=None,
+    ):
         B, T, C = x.shape
+
+        if attention_mask is not None and attention_mask.shape != (B, T):
+            raise ValueError(
+                f"attention_mask must have shape ({B}, {T}), got {tuple(attention_mask.shape)}"
+            )
         
         q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim)
         k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim)
@@ -172,11 +203,41 @@ class HybridGroupedQueryAttention(nn.Module):
         # Concatenate the frozen AR KV cache with the active Denoiser KV cache
         if context_kv is not None:
             k_ctx, v_ctx = context_kv
+            if (
+                context_attention_mask is not None
+                and context_attention_mask.shape != (B, k_ctx.shape[1])
+            ):
+                raise ValueError(
+                    "context_attention_mask must have shape "
+                    f"({B}, {k_ctx.shape[1]}), got {tuple(context_attention_mask.shape)}"
+                )
             k = torch.cat([k_ctx, k], dim=1)
             v = torch.cat([v_ctx, v], dim=1)
             prefix_len = k_ctx.shape[1]
         else:
+            if context_attention_mask is not None:
+                raise ValueError("context_attention_mask requires context_kv")
             prefix_len = 0
+
+        if attention_mask is None and context_attention_mask is None:
+            # Preserve the fast FlashAttention path for callers that do not
+            # need padding masks (for example, full-length inference blocks).
+            key_mask = None
+        else:
+            active_key_mask = (
+                attention_mask.to(device=x.device, dtype=torch.bool)
+                if attention_mask is not None
+                else torch.ones(B, T, device=x.device, dtype=torch.bool)
+            )
+            if prefix_len:
+                prefix_key_mask = (
+                    context_attention_mask.to(device=x.device, dtype=torch.bool)
+                    if context_attention_mask is not None
+                    else torch.ones(B, prefix_len, device=x.device, dtype=torch.bool)
+                )
+                key_mask = torch.cat([prefix_key_mask, active_key_mask], dim=1)
+            else:
+                key_mask = active_key_mask
 
         dropout_p = self.dropout.p if self.training else 0.0
 
@@ -198,7 +259,17 @@ class HybridGroupedQueryAttention(nn.Module):
                 v_d = v[:, :prefix_len + next_idx]
                 
                 # causal=False triggers bidirectional visibility WITHIN the visible window
-                out_d = self.attn_fn(q_d, k_d, v_d, dropout_p=dropout_p, causal=False)
+                out_d = self._attend(
+                    q_d,
+                    k_d,
+                    v_d,
+                    dropout_p=dropout_p,
+                    key_mask=(
+                        key_mask[:, :prefix_len + next_idx]
+                        if key_mask is not None
+                        else None
+                    ),
+                )
                 q_drafts.append(out_d)
                 
                 curr_idx = next_idx
@@ -206,7 +277,7 @@ class HybridGroupedQueryAttention(nn.Module):
             attn_out = torch.cat(q_drafts, dim=1)
         else:
             # Fallback for inference (1 token)
-            attn_out = self.attn_fn(q, k, v, dropout_p=dropout_p, causal=False)
+            attn_out = self._attend(q, k, v, dropout_p=dropout_p, key_mask=key_mask)
 
         out = self.o_proj(attn_out.reshape(B, T, C))
         return out
@@ -219,9 +290,25 @@ class DenoiserTransformerBlock(nn.Module):
         self.attn  = HybridGroupedQueryAttention(embed_dim, n_heads, n_kv_heads, dropout)
         self.ffn = SwiGLU(embed_dim, mult=ffn_mult, dropout=dropout)
 
-    def forward(self, x, t_emb, seq_pos, context_kv=None, draft_size=0):
+    def forward(
+        self,
+        x,
+        t_emb,
+        seq_pos,
+        context_kv=None,
+        draft_size=0,
+        attention_mask=None,
+        context_attention_mask=None,
+    ):
         h = self.norm1(x, t_emb)
-        attn_out = self.attn(h, seq_pos=seq_pos, context_kv=context_kv, draft_size=draft_size)
+        attn_out = self.attn(
+            h,
+            seq_pos=seq_pos,
+            context_kv=context_kv,
+            draft_size=draft_size,
+            attention_mask=attention_mask,
+            context_attention_mask=context_attention_mask,
+        )
         x = x + attn_out
         
         h = self.norm2(x, t_emb)
@@ -266,6 +353,8 @@ class TwoTowerDenoiser(nn.Module):
         timestep,
         seq_offset=0,
         context_kv_cache=None,
+        attention_mask=None,
+        context_attention_mask=None,
         draft_size=0,
         elasticity=None,
         genre=None,
@@ -274,7 +363,9 @@ class TwoTowerDenoiser(nn.Module):
         """
         noisy_target: [Batch, Sequence_Length] (e.g., Draft 1 <SEP> Draft 2 <SEP> Draft 3)
         timestep: [Batch, Sequence_Length] (Distinct t-values for each token)
-        seq_offset: Proved by AR Context (e.g., PROMPT_MAX + 2)
+        seq_offset: scalar or [Batch] true prefix lengths, including AR controls
+        attention_mask: [Batch, Sequence_Length] valid denoiser tokens
+        context_attention_mask: [Batch, Cached_Length] valid Tower A cache entries
         draft_size: Determines the staircase slicing logic (e.g., BLOCK_SIZE + 1)
         elasticity: [Batch] requested <BLANK> fraction; 0 disables elasticity
         genre: [Batch] target genre, supplied directly to Tower B
@@ -314,16 +405,40 @@ class TwoTowerDenoiser(nn.Module):
         t_emb = t_emb + self.multihot_proj(multi_hot).unsqueeze(1).to(t_emb.dtype)
         
         # Continuous RoPE coordinates for the entire concatenated trajectory
-        seq_pos = torch.arange(seq_offset, seq_offset + T, device=device).unsqueeze(0).expand(B, -1)
+        if torch.is_tensor(seq_offset):
+            if seq_offset.ndim != 1 or seq_offset.shape[0] != B:
+                raise ValueError(f"seq_offset must be scalar or have shape ({B},)")
+            offsets = seq_offset.to(device=device, dtype=torch.long).unsqueeze(1)
+            seq_pos = offsets + torch.arange(T, device=device).unsqueeze(0)
+        else:
+            seq_pos = torch.arange(seq_offset, seq_offset + T, device=device).unsqueeze(0).expand(B, -1)
             
         h = x
         for i, layer in enumerate(self.layers):
             layer_context_kv = context_kv_cache[i] if context_kv_cache is not None else None
             
             if self.training:
-                h = checkpoint(layer, h, t_emb, seq_pos, layer_context_kv, draft_size, use_reentrant=False)
+                h = checkpoint(
+                    layer,
+                    h,
+                    t_emb,
+                    seq_pos,
+                    layer_context_kv,
+                    draft_size,
+                    attention_mask,
+                    context_attention_mask,
+                    use_reentrant=False,
+                )
             else:
-                h = layer(h, t_emb=t_emb, seq_pos=seq_pos, context_kv=layer_context_kv, draft_size=draft_size)
+                h = layer(
+                    h,
+                    t_emb=t_emb,
+                    seq_pos=seq_pos,
+                    context_kv=layer_context_kv,
+                    draft_size=draft_size,
+                    attention_mask=attention_mask,
+                    context_attention_mask=context_attention_mask,
+                )
 
         h = self.out_norm(h, t_emb)
         logits = self.lm_head(h)
