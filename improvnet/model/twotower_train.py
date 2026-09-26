@@ -49,9 +49,17 @@ def sample_target_first_window(tokens):
     target_length = min(BLOCK_SIZE, len(tokens))
     max_target_start = len(tokens) - target_length
 
-    # When the piece is longer than one target block, retain at least one
-    # preceding token for ordinary (non-promptless) Tower A examples.
-    target_start = random.randint(1, max_target_start) if max_target_start > 0 else 0
+    if max_target_start > 0:
+        # Endpoint windows ensure <E> and its lead-in are represented during
+        # training. Other windows remain uniformly sampled at token level.
+        if random.random() < END_ANCHORED_TARGET_PROB:
+            target_start = max_target_start
+        else:
+            # Retain at least one preceding token for ordinary
+            # (non-promptless) Tower A examples.
+            target_start = random.randint(1, max_target_start)
+    else:
+        target_start = 0
     prefix_start = max(0, target_start - PROMPT_MAX)
 
     prefix_tokens = tokens[prefix_start:target_start]

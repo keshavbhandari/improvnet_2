@@ -174,6 +174,45 @@ class HybridGroupedQueryAttention(nn.Module):
             attn_mask=sdpa_mask,
         )
 
+    def _attend_with_weights(self, q, k, v, key_mask=None):
+        """Attend explicitly and return head-mean probabilities for ADAS.
+
+        This path is intentionally evaluation-only and is used for the final
+        draft chunk of the final denoiser layer.  Keeping the calculation here
+        makes the returned probabilities use the same normalized Q/K tensors,
+        RoPE coordinates, GQA mapping, and key padding mask as the model output.
+        """
+        hq = q.shape[2]
+        hkv = k.shape[2]
+        if hq % hkv != 0:
+            raise ValueError(f"Query heads ({hq}) must be divisible by KV heads ({hkv})")
+
+        q_heads = q.transpose(1, 2)
+        k_heads = k.transpose(1, 2)
+        v_heads = v.transpose(1, 2)
+        if hq != hkv:
+            repeats = hq // hkv
+            k_heads = k_heads.repeat_interleave(repeats, dim=1)
+            v_heads = v_heads.repeat_interleave(repeats, dim=1)
+
+        # Compute probabilities in fp32 for stable confidence re-ranking, then
+        # cast them for the value projection just as SDPA would do internally.
+        scores = torch.matmul(
+            q_heads.float(), k_heads.float().transpose(-2, -1)
+        ) * (self.head_dim ** -0.5)
+        if key_mask is not None:
+            scores = scores.masked_fill(
+                ~key_mask[:, None, None, :].to(device=scores.device, dtype=torch.bool),
+                float("-inf"),
+            )
+
+        probabilities = torch.softmax(scores, dim=-1)
+        output = torch.matmul(probabilities.to(v_heads.dtype), v_heads)
+        return (
+            output.transpose(1, 2).contiguous(),
+            probabilities.mean(dim=1),
+        )
+
     def forward(
         self,
         x,
@@ -182,6 +221,7 @@ class HybridGroupedQueryAttention(nn.Module):
         draft_size=0,
         attention_mask=None,
         context_attention_mask=None,
+        return_last_attention=False,
     ):
         B, T, C = x.shape
 
@@ -240,6 +280,10 @@ class HybridGroupedQueryAttention(nn.Module):
                 key_mask = active_key_mask
 
         dropout_p = self.dropout.p if self.training else 0.0
+        if return_last_attention and self.training:
+            raise ValueError("Attention capture is only supported in evaluation mode")
+
+        last_attention = None
 
         # -------------------------------------------------------------------
         # THE STAIRCASE ROUTER (Macro-Causal, Micro-Bidirectional)
@@ -259,17 +303,23 @@ class HybridGroupedQueryAttention(nn.Module):
                 v_d = v[:, :prefix_len + next_idx]
                 
                 # causal=False triggers bidirectional visibility WITHIN the visible window
-                out_d = self._attend(
-                    q_d,
-                    k_d,
-                    v_d,
-                    dropout_p=dropout_p,
-                    key_mask=(
-                        key_mask[:, :prefix_len + next_idx]
-                        if key_mask is not None
-                        else None
-                    ),
+                draft_key_mask = (
+                    key_mask[:, :prefix_len + next_idx]
+                    if key_mask is not None
+                    else None
                 )
+                if return_last_attention and next_idx == T:
+                    out_d, last_attention = self._attend_with_weights(
+                        q_d, k_d, v_d, key_mask=draft_key_mask
+                    )
+                else:
+                    out_d = self._attend(
+                        q_d,
+                        k_d,
+                        v_d,
+                        dropout_p=dropout_p,
+                        key_mask=draft_key_mask,
+                    )
                 q_drafts.append(out_d)
                 
                 curr_idx = next_idx
@@ -277,9 +327,16 @@ class HybridGroupedQueryAttention(nn.Module):
             attn_out = torch.cat(q_drafts, dim=1)
         else:
             # Fallback for inference (1 token)
-            attn_out = self._attend(q, k, v, dropout_p=dropout_p, key_mask=key_mask)
+            if return_last_attention:
+                attn_out, last_attention = self._attend_with_weights(
+                    q, k, v, key_mask=key_mask
+                )
+            else:
+                attn_out = self._attend(q, k, v, dropout_p=dropout_p, key_mask=key_mask)
 
         out = self.o_proj(attn_out.reshape(B, T, C))
+        if return_last_attention:
+            return out, last_attention
         return out
 
 class DenoiserTransformerBlock(nn.Module):
@@ -299,20 +356,28 @@ class DenoiserTransformerBlock(nn.Module):
         draft_size=0,
         attention_mask=None,
         context_attention_mask=None,
+        return_last_attention=False,
     ):
         h = self.norm1(x, t_emb)
-        attn_out = self.attn(
+        attn_result = self.attn(
             h,
             seq_pos=seq_pos,
             context_kv=context_kv,
             draft_size=draft_size,
             attention_mask=attention_mask,
             context_attention_mask=context_attention_mask,
+            return_last_attention=return_last_attention,
         )
+        if return_last_attention:
+            attn_out, last_attention = attn_result
+        else:
+            attn_out = attn_result
         x = x + attn_out
         
         h = self.norm2(x, t_emb)
         x = x + self.ffn(h)
+        if return_last_attention:
+            return x, last_attention
         return x
 
 class TwoTowerDenoiser(nn.Module):
@@ -359,6 +424,7 @@ class TwoTowerDenoiser(nn.Module):
         elasticity=None,
         genre=None,
         multi_hot=None,
+        return_last_attention=False,
     ):
         """
         noisy_target: [Batch, Sequence_Length] (e.g., Draft 1 <SEP> Draft 2 <SEP> Draft 3)
@@ -370,6 +436,8 @@ class TwoTowerDenoiser(nn.Module):
         elasticity: [Batch] requested <BLANK> fraction; 0 disables elasticity
         genre: [Batch] target genre, supplied directly to Tower B
         multi_hot: [Batch, NUM_INSTRUMENTS] desired output instrumentation
+        return_last_attention: return head-mean final-layer attention for the
+            last staircase chunk. Evaluation only; the default remains logits.
         """
         B, T = noisy_target.shape
         device = noisy_target.device
@@ -413,7 +481,11 @@ class TwoTowerDenoiser(nn.Module):
         else:
             seq_pos = torch.arange(seq_offset, seq_offset + T, device=device).unsqueeze(0).expand(B, -1)
             
+        if return_last_attention and self.training:
+            raise ValueError("return_last_attention is only supported in evaluation mode")
+
         h = x
+        last_attention = None
         for i, layer in enumerate(self.layers):
             layer_context_kv = context_kv_cache[i] if context_kv_cache is not None else None
             
@@ -430,7 +502,7 @@ class TwoTowerDenoiser(nn.Module):
                     use_reentrant=False,
                 )
             else:
-                h = layer(
+                layer_result = layer(
                     h,
                     t_emb=t_emb,
                     seq_pos=seq_pos,
@@ -438,9 +510,18 @@ class TwoTowerDenoiser(nn.Module):
                     draft_size=draft_size,
                     attention_mask=attention_mask,
                     context_attention_mask=context_attention_mask,
+                    return_last_attention=(
+                        return_last_attention and i == len(self.layers) - 1
+                    ),
                 )
+                if return_last_attention and i == len(self.layers) - 1:
+                    h, last_attention = layer_result
+                else:
+                    h = layer_result
 
         h = self.out_norm(h, t_emb)
         logits = self.lm_head(h)
 
+        if return_last_attention:
+            return logits, last_attention
         return logits
