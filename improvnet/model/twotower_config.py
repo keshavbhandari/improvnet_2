@@ -80,6 +80,10 @@ N_LAYERS = 20
 # ==========================================
 BATCH_SIZE = 64
 ACCUM_STEPS = 1
+# Validation has no effect on the optimizer batch. Keep it smaller so long
+# 4096-token prefixes do not exhaust memory while Tower A builds its KV cache.
+VALIDATION_BATCH_SIZE = 16
+VALIDATION_MAX_BATCHES = 200
 LR = 1.5e-4
 WEIGHT_DECAY = 0.1
 BETAS = (0.9, 0.95)

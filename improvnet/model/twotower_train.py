@@ -409,7 +409,13 @@ def train(n_steps: int = N_STEPS):
     writer = SummaryWriter(log_dir=os.path.join(SAVE_DIR, "runs", RUN_NAME)) if is_main_process else None
 
     train_loader = build_dataloader(JSONL_FILES, "train", BATCH_SIZE, augment=True, distributed=True)
-    val_loader = build_dataloader(JSONL_FILES, "validation", BATCH_SIZE, augment=False, distributed=True)
+    val_loader = build_dataloader(
+        JSONL_FILES,
+        "validation",
+        VALIDATION_BATCH_SIZE,
+        augment=False,
+        distributed=True,
+    )
 
     if is_main_process: print("Initializing Tower A (Frozen AR Musician)...")
     model_ar = ARContextModel().to(device)
@@ -556,14 +562,19 @@ def train(n_steps: int = N_STEPS):
                     else:
                         # Tower A remains frozen and unchanged.
                         with torch.no_grad():
-                            _, past_kv = model_ar(
+                            ar_hidden, past_kv = model_ar(
                                 target=batch["prefix"],
                                 genre=batch["genre"],
                                 multi_hot=batch["multi_hot"],
                                 use_cache=True,
                                 past_key_values=None,
-                                seq_offset=0
+                                seq_offset=0,
+                                return_hidden=True,
                             )
+                            # Tower B needs only the KV cache. Returning hidden
+                            # states bypasses Tower A's large, unused vocab
+                            # projection; release the hidden output immediately.
+                            del ar_hidden
                         # Tower A is causal and prefixes are right-padded, so
                         # real prefix states never attend to PAD tokens. Mask
                         # those cached PAD keys when Tower B consumes them.
@@ -663,7 +674,14 @@ def train(n_steps: int = N_STEPS):
 
                 validation_due = update_step > 0 and update_step % VAL_EVERY == 0
                 if validation_due:
+                    # The loop variables otherwise keep the final training
+                    # graph outputs and KV cache alive throughout validation.
+                    del logits, flat_logits, flat_targets, flat_weights
+                    del ce_loss, loss, past_kv, context_attention_mask
+                    del denoiser_seq_offset, batch
+                    torch.cuda.empty_cache()
                     val_loss = evaluate_validation(model_ar, model_denoiser, val_loader, device)
+                    torch.cuda.empty_cache()
                     checkpoint_rng_state = collect_rng_state_for_checkpoint(device)
                     if is_main_process:
                         print(f"\n--- Validation Step {update_step} | Val Loss: {val_loss:.4f} ---")
@@ -737,8 +755,14 @@ def train(n_steps: int = N_STEPS):
     cleanup_ddp()
     return model_denoiser
 
-@torch.no_grad()
-def evaluate_validation(model_ar, model_denoiser, val_loader, device, max_batches: int = 50):
+@torch.inference_mode()
+def evaluate_validation(
+    model_ar,
+    model_denoiser,
+    val_loader,
+    device,
+    max_batches: int = VALIDATION_MAX_BATCHES,
+):
     model_denoiser.eval()
     total_loss, steps = 0.0, 0
     rank, _ = distributed_rank_world()
@@ -749,14 +773,16 @@ def evaluate_validation(model_ar, model_denoiser, val_loader, device, max_batche
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         
         with torch.amp.autocast(DEVICE, dtype=AMP_DTYPE):
-            _, past_kv = model_ar(
+            ar_hidden, past_kv = model_ar(
                 target=batch["prefix"],          
                 genre=batch["genre"],
                 multi_hot=batch["multi_hot"],
                 use_cache=True,
                 past_key_values=None,
-                seq_offset=0
+                seq_offset=0,
+                return_hidden=True,
             )
+            del ar_hidden
 
             condition_mask = torch.ones(
                 batch["prefix"].shape[0], 2, device=device, dtype=torch.bool
@@ -788,6 +814,12 @@ def evaluate_validation(model_ar, model_denoiser, val_loader, device, max_batche
             
         total_loss += loss.item()
         steps += 1
+
+        # Do not overlap the previous batch's large AR KV cache, Tower B
+        # logits, or loss buffers with the next validation forward.
+        del batch, past_kv, condition_mask, context_attention_mask
+        del denoiser_seq_offset, logits, flat_logits, flat_targets, flat_weights
+        del ce_loss, loss
 
     local_avg_loss = total_loss / max(1, steps)
     if torch.distributed.is_initialized():
