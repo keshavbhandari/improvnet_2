@@ -8,6 +8,10 @@ Two inference strategies are supported:
 Each target block is refined through the same four-block staircase used during
 training.  The confidence sampler and ADAS share the same fixed reveal quota;
 ADAS changes only the order in which positions are committed.
+Newly revealed token values are sampled with ``--temperature`` (zero is greedy).
+ADAS scores the proposed token's probability and uses raw final-layer,
+head-averaged candidate-to-selected attention, matching the reference Top-k ADAS.
+Visible-token revisions retain their probability-improvement threshold.
 """
 
 from __future__ import annotations
@@ -25,6 +29,9 @@ from improvnet.model.ar_model import ARContextModel
 from improvnet.model.twotower_config import (
     AR_MODEL_PATH,
     BLOCK_SIZE,
+    DIFFUSION_STEPS,
+    ELASTICITY_MAX_RATIO,
+    ELASTICITY_MIN_RATIO,
     MASK_ID,
     NUM_DRAFTS,
     PAD_ID,
@@ -39,6 +46,8 @@ from improvnet.utils.ar_utils import ProcessData
 EVENT_CATEGORIES = frozenset({"instrument", "note", "onset", "dur"})
 TIMING_CATEGORIES = frozenset({"onset", "dur"})
 FULL_POOL = "allowed"
+ELASTIC_POOL = "allowed_with_blank"
+ELASTIC_SLOT_PREFIX = "elastic:"
 
 
 def token_category(token: Any) -> str:
@@ -73,6 +82,10 @@ class VocabularyConstraints:
                 allowed.append(token_id)
 
         pools[FULL_POOL] = allowed
+        blank_id = tokenizer.tok_to_id["<BLANK>"]
+        pools[ELASTIC_POOL] = allowed + [blank_id]
+        for category in EVENT_CATEGORIES:
+            pools[f"{ELASTIC_SLOT_PREFIX}{category}"] = pools[category] + [blank_id]
         for name, pool in pools.items():
             if not pool:
                 raise ValueError(f"Vocabulary pool {name!r} is empty")
@@ -84,14 +97,21 @@ class VocabularyConstraints:
         return torch.tensor(self.pools[category], dtype=torch.long, device=device)
 
 
-def constrained_top_predictions(
+def constrained_predictions(
     logits: torch.Tensor,
     categories: Sequence[str | None],
     constraints: VocabularyConstraints,
     temperature: float = 1.0,
     current_ids: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Find constrained argmax tokens, confidence, and current-token probability.
+    sampling_temperature: float = 0.0,
+    sample_mask: torch.Tensor | None = None,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Propose tokens and return ADAS confidence, current and proposal probabilities.
+
+    ADAS uses the proposed token's probability, as in the reference sampler.
+    Sample masked positions at sampling_temperature; visible-token revisions
+    retain the best-proposal/margin rule. Zero sampling temperature is greedy.
 
     Positions whose category is ``None`` are left with prediction ``-1`` and
     zero probability. Probabilities are normalized inside the relevant pool,
@@ -101,8 +121,12 @@ def constrained_top_predictions(
         raise ValueError(f"logits must be [length, vocab], got {tuple(logits.shape)}")
     if len(categories) != logits.shape[0]:
         raise ValueError("categories must contain one entry per logit position")
-    if temperature <= 0:
+    if not math.isfinite(temperature) or temperature <= 0:
         raise ValueError("confidence_temperature must be greater than zero")
+    if not math.isfinite(sampling_temperature) or sampling_temperature < 0:
+        raise ValueError("temperature must be finite and nonnegative")
+    if sample_mask is not None and sample_mask.shape != (logits.shape[0],):
+        raise ValueError("sample_mask must have shape [length]")
     if current_ids is not None and current_ids.shape != (logits.shape[0],):
         raise ValueError("current_ids must have shape [length]")
 
@@ -111,6 +135,7 @@ def constrained_top_predictions(
     )
     confidence = torch.zeros(logits.shape[0], dtype=torch.float32, device=logits.device)
     current_probability = torch.zeros_like(confidence)
+    proposal_probability = torch.zeros_like(confidence)
 
     grouped_positions: dict[str, list[int]] = defaultdict(list)
     for position, category in enumerate(categories):
@@ -121,11 +146,27 @@ def constrained_top_predictions(
         position_ids = torch.tensor(positions, dtype=torch.long, device=logits.device)
         pool_ids = constraints.ids(category, logits.device)
         selected_logits = logits.index_select(0, position_ids).index_select(1, pool_ids)
-        probabilities = torch.softmax(selected_logits.float() / temperature, dim=-1)
-        category_confidence, relative_prediction = probabilities.max(dim=-1)
+        score_temperature = (sampling_temperature or 1.0) * temperature
+        probabilities = torch.softmax(selected_logits.float() / score_temperature, dim=-1)
+        relative_prediction = probabilities.argmax(dim=-1)
+        if sampling_temperature > 0:
+            rows = (
+                torch.ones(len(positions), dtype=torch.bool, device=logits.device)
+                if sample_mask is None else sample_mask[position_ids]
+            )
+            if bool(rows.any()):
+                sampling_probs = torch.softmax(
+                    selected_logits[rows].float() / sampling_temperature, dim=-1
+                )
+                relative_prediction[rows] = torch.multinomial(
+                    sampling_probs, 1, generator=generator
+                ).squeeze(-1)
 
         predictions[position_ids] = pool_ids[relative_prediction]
-        confidence[position_ids] = category_confidence
+        proposal_probability[position_ids] = probabilities.gather(
+            1, relative_prediction.unsqueeze(-1)
+        ).squeeze(-1)
+        confidence[position_ids] = proposal_probability[position_ids]
 
         if current_ids is not None:
             relative_by_id = {
@@ -137,6 +178,16 @@ def constrained_top_predictions(
                 if relative_id is not None:
                     current_probability[position] = probabilities[row, relative_id]
 
+    return predictions, confidence, current_probability, proposal_probability
+
+
+def constrained_top_predictions(
+    logits, categories, constraints, temperature=1.0, current_ids=None,
+):
+    """Compatibility helper for greedy predictions and confidence scoring."""
+    predictions, confidence, current_probability, _ = constrained_predictions(
+        logits, categories, constraints, temperature, current_ids
+    )
     return predictions, confidence, current_probability
 
 
@@ -263,6 +314,41 @@ def truncate_to_complete_events(tokens: Sequence[Any]) -> list[Any]:
     return list(tokens[:last_complete])
 
 
+def insert_elastic_scaffold_slots(
+    tokens: Sequence[Any], roles: Sequence[str], num_groups: int
+) -> tuple[list[Any], list[str], list[tuple[int, int]]]:
+    """Insert four masked fields at note-event boundaries without consuming source."""
+    if len(tokens) != len(roles):
+        raise ValueError("tokens and roles must have the same length")
+    boundaries = [index for index, role in enumerate(roles) if role == "instrument"]
+    if not boundaries or num_groups <= 0:
+        return list(tokens), list(roles), []
+
+    inserted_tokens = list(tokens)
+    inserted_roles = list(roles)
+    groups: list[tuple[int, int]] = []
+    # Work backwards so original boundary offsets remain valid. The same
+    # boundary may receive several groups when the scaffold is very short.
+    chosen = [
+        boundaries[min(len(boundaries) - 1, (group * len(boundaries)) // num_groups)]
+        for group in range(num_groups)
+    ]
+    for boundary in sorted(chosen, reverse=True):
+        inserted_tokens[boundary:boundary] = ["<MASK>"] * 4
+        inserted_roles[boundary:boundary] = [
+            f"{ELASTIC_SLOT_PREFIX}{category}"
+            for category in ("instrument", "note", "onset", "dur")
+        ]
+
+    for index in range(len(inserted_roles) - 3):
+        if inserted_roles[index:index + 4] == [
+            f"{ELASTIC_SLOT_PREFIX}{category}"
+            for category in ("instrument", "note", "onset", "dur")
+        ]:
+            groups.append((index, index + 4))
+    return inserted_tokens, inserted_roles, groups
+
+
 def _load_checkpoint_state(path: str) -> dict[str, torch.Tensor]:
     try:
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
@@ -343,6 +429,7 @@ class TwoTowerInference:
         source_roles: Sequence[str],
         strategy: str,
         revision_mode: str,
+        elasticity: float = 0.0,
     ) -> list[str | None]:
         categories: list[str | None] = [None] * BLOCK_SIZE
         for position in range(BLOCK_SIZE):
@@ -350,27 +437,80 @@ class TwoTowerInference:
                 continue
             if int(state[position].item()) == MASK_ID:
                 categories[position] = (
-                    FULL_POOL if strategy == "full-mask" else source_roles[position]
+                    (ELASTIC_POOL if elasticity > 0 else FULL_POOL)
+                    if strategy == "full-mask" else source_roles[position]
                 )
                 continue
             if revision_mode == "freeze":
                 continue
             if revision_mode == "timing":
-                category = (
-                    token_category(self.tokenizer.id_to_tok[int(state[position].item())])
-                    if strategy == "full-mask"
-                    else source_roles[position]
-                )
-                if category in TIMING_CATEGORIES:
+                token = self.tokenizer.id_to_tok[int(state[position].item())]
+                category = token_category(token) if strategy == "full-mask" else source_roles[position]
+                if category.removeprefix(ELASTIC_SLOT_PREFIX) in TIMING_CATEGORIES:
                     categories[position] = category
             elif revision_mode == "all":
                 if strategy == "full-mask":
-                    categories[position] = FULL_POOL
+                    categories[position] = ELASTIC_POOL if elasticity > 0 else FULL_POOL
                 elif source_roles[position] in EVENT_CATEGORIES:
+                    categories[position] = source_roles[position]
+                elif source_roles[position].startswith(ELASTIC_SLOT_PREFIX):
                     categories[position] = source_roles[position]
             else:
                 raise ValueError(f"Unknown revision mode {revision_mode!r}")
         return categories
+
+    def _refinement_candidates(
+        self,
+        state: torch.Tensor,
+        valid_mask: torch.Tensor,
+        source_roles: Sequence[str],
+        strategy: str,
+        revision_mode: str,
+    ) -> torch.Tensor:
+        """Return positions that an additional refinement pass may re-mask."""
+        candidates = torch.zeros_like(valid_mask)
+        if revision_mode == "freeze":
+            return candidates
+
+        for position in valid_mask.nonzero(as_tuple=True)[0].tolist():
+            if revision_mode == "all":
+                if (
+                    strategy == "full-mask"
+                    or source_roles[position] in EVENT_CATEGORIES
+                    or source_roles[position].startswith(ELASTIC_SLOT_PREFIX)
+                ):
+                    candidates[position] = True
+                continue
+
+            category = (
+                token_category(self.tokenizer.id_to_tok[int(state[position].item())])
+                if strategy == "full-mask"
+                else source_roles[position]
+            )
+            if category.removeprefix(ELASTIC_SLOT_PREFIX) in TIMING_CATEGORIES:
+                candidates[position] = True
+        return candidates
+
+    @staticmethod
+    def _remask_for_refinement(
+        state: torch.Tensor,
+        confidence: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        valid_count: int,
+        noise_step: int,
+    ) -> tuple[torch.Tensor, list[int]]:
+        """Re-mask the least-confident editable positions at ``noise_step/16``."""
+        candidates = candidate_mask.nonzero(as_tuple=True)[0]
+        target_masks = math.ceil(valid_count * noise_step / DIFFUSION_STEPS)
+        target_masks = min(target_masks, int(candidates.numel()))
+        if target_masks <= 0:
+            return state.clone(), []
+
+        order = torch.argsort(confidence[candidates], descending=False, stable=True)
+        selected = candidates[order[:target_masks]]
+        remasked = state.clone()
+        remasked[selected] = MASK_ID
+        return remasked, selected.tolist()
 
     @torch.no_grad()
     def _decode_block(
@@ -389,16 +529,26 @@ class TwoTowerInference:
         seq_offset: int,
         genre: torch.Tensor,
         multi_hot: torch.Tensor,
-    ) -> tuple[torch.Tensor, int]:
+        elasticity: float = 0.0,
+        quantize_timesteps: bool = False,
+        temperature: float = 1.0,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, int, torch.Tensor]:
         state = initial_state.clone()
         snapshots: list[torch.Tensor] = []
         snapshot_timesteps: list[float] = []
         total_revisions = 0
         valid_count = max(int(valid_mask.sum().item()), 1)
+        final_confidence = torch.zeros(
+            BLOCK_SIZE, dtype=torch.float32, device=self.device
+        )
 
         for draft_index in range(NUM_DRAFTS):
             masked = (state == MASK_ID) & valid_mask
             timestep = float(masked.sum().item()) / valid_count
+            if quantize_timesteps:
+                discrete_step = round(timestep * DIFFUSION_STEPS)
+                timestep = discrete_step / float(DIFFUSION_STEPS)
             snapshots.append(state.clone())
             snapshot_timesteps.append(timestep)
             trajectory, trajectory_times, trajectory_mask = build_trajectory(
@@ -415,7 +565,7 @@ class TwoTowerInference:
                     attention_mask=trajectory_mask.unsqueeze(0),
                     context_attention_mask=context_attention_mask,
                     draft_size=BLOCK_SIZE + 1,
-                    elasticity=torch.zeros(1, dtype=torch.float32, device=self.device),
+                    elasticity=torch.tensor([elasticity], dtype=torch.float32, device=self.device),
                     genre=genre,
                     multi_hot=multi_hot,
                     return_last_attention=need_attention,
@@ -432,14 +582,17 @@ class TwoTowerInference:
             current_start = (len(snapshots) - 1) * (BLOCK_SIZE + 1)
             current_logits = logits[0, current_start : current_start + BLOCK_SIZE]
             categories = self._prediction_categories(
-                state, valid_mask, source_roles, strategy, revision_mode
+                state, valid_mask, source_roles, strategy, revision_mode, elasticity
             )
-            predictions, confidence, current_probability = constrained_top_predictions(
+            predictions, confidence, current_probability, proposal_probability = constrained_predictions(
                 current_logits,
                 categories,
                 self.constraints,
                 temperature=confidence_temperature,
                 current_ids=state,
+                sampling_temperature=temperature,
+                sample_mask=masked,
+                generator=generator,
             )
 
             remaining_drafts = NUM_DRAFTS - draft_index
@@ -479,20 +632,23 @@ class TwoTowerInference:
                 if predicted == current:
                     continue
                 improvement = float(
-                    (confidence[position] - current_probability[position]).item()
+                    (proposal_probability[position] - current_probability[position]).item()
                 )
                 if improvement >= revision_margin:
                     revision_positions.append(position)
 
             updated = state.clone()
+            final_confidence = current_probability.clone()
             if selected:
                 selected_tensor = torch.tensor(selected, dtype=torch.long, device=self.device)
                 updated[selected_tensor] = predictions[selected_tensor]
+                final_confidence[selected_tensor] = proposal_probability[selected_tensor]
             if revision_positions:
                 revision_tensor = torch.tensor(
                     revision_positions, dtype=torch.long, device=self.device
                 )
                 updated[revision_tensor] = predictions[revision_tensor]
+                final_confidence[revision_tensor] = proposal_probability[revision_tensor]
             state = updated
             total_revisions += len(revision_positions)
 
@@ -506,7 +662,7 @@ class TwoTowerInference:
         unresolved = (state == MASK_ID) & valid_mask
         if bool(unresolved.any()):
             raise RuntimeError(f"{int(unresolved.sum().item())} masks remain after final draft")
-        return state, total_revisions
+        return state, total_revisions, final_confidence
 
     @torch.no_grad()
     def generate(
@@ -521,6 +677,10 @@ class TwoTowerInference:
         revision_mode: str = "timing",
         revision_margin: float = 0.10,
         confidence_temperature: float = 1.0,
+        refinement_passes: int = 1,
+        elasticity: float = 0.0,
+        temperature: float = 1.0,
+        seed: int | None = None,
     ) -> list[Any]:
         if strategy not in {"full-mask", "onset-duration"}:
             raise ValueError(f"Unknown generation strategy {strategy!r}")
@@ -534,6 +694,26 @@ class TwoTowerInference:
             raise ValueError("max_tokens must be at least one token")
         if revision_margin < 0:
             raise ValueError("revision_margin cannot be negative")
+        if not math.isfinite(temperature) or temperature < 0:
+            raise ValueError("temperature must be finite and nonnegative")
+        if not math.isfinite(confidence_temperature) or confidence_temperature <= 0:
+            raise ValueError("confidence_temperature must be finite and positive")
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=self.device).manual_seed(seed)
+        if not (elasticity == 0.0 or ELASTICITY_MIN_RATIO <= elasticity <= ELASTICITY_MAX_RATIO):
+            raise ValueError(
+                f"elasticity must be 0 or between {ELASTICITY_MIN_RATIO} and "
+                f"{ELASTICITY_MAX_RATIO}, matching training"
+            )
+        if not 1 <= refinement_passes <= DIFFUSION_STEPS:
+            raise ValueError(
+                f"refinement_passes must be between 1 and {DIFFUSION_STEPS}"
+            )
+        if refinement_passes > 1 and revision_mode == "freeze":
+            raise ValueError(
+                "Iterative refinement requires revision_mode='timing' or 'all'"
+            )
 
         normalized_source = self.processor.normalize_token_sequence(list(source_tokens))
         if not normalized_source:
@@ -559,10 +739,13 @@ class TwoTowerInference:
 
         while len(committed) < max_tokens:
             remaining_budget = max_tokens - len(committed)
+            slot_groups: list[tuple[int, int]] = []
+            source_consumed = 0
             if strategy == "full-mask":
                 valid_length = min(BLOCK_SIZE, remaining_budget)
                 block_tokens: list[Any] = []
-                block_roles = [FULL_POOL] * valid_length
+                block_roles = [ELASTIC_POOL if elasticity > 0 else FULL_POOL] * valid_length
+                block_elasticity = elasticity
                 initial_ids = torch.full(
                     (BLOCK_SIZE,), PAD_ID, dtype=torch.long, device=self.device
                 )
@@ -571,18 +754,35 @@ class TwoTowerInference:
                 available = len(normalized_source) - source_cursor
                 if available <= 0:
                     break
-                valid_length = min(BLOCK_SIZE, remaining_budget, available)
+                capacity = min(BLOCK_SIZE, remaining_budget)
+                num_groups = 0
+                if elasticity > 0 and capacity >= 8:
+                    num_groups = max(1, round(capacity * elasticity / 4))
+                    # Short final fragments cannot support the training-time
+                    # blank fraction; keep them rigid instead.
+                    while num_groups > 0:
+                        source_count = min(available, capacity - 4 * num_groups)
+                        fraction = 4 * num_groups / max(1, source_count + 4 * num_groups)
+                        if source_count > 0 and fraction <= ELASTICITY_MAX_RATIO:
+                            break
+                        num_groups -= 1
+                source_consumed = min(available, capacity - 4 * num_groups)
                 block_tokens = list(
-                    normalized_source[source_cursor : source_cursor + valid_length]
+                    normalized_source[source_cursor : source_cursor + source_consumed]
                 )
-                block_roles = source_roles[source_cursor : source_cursor + valid_length]
+                block_roles = source_roles[source_cursor : source_cursor + source_consumed]
+                block_tokens, block_roles, slot_groups = insert_elastic_scaffold_slots(
+                    block_tokens, block_roles, num_groups
+                )
+                valid_length = len(block_tokens)
+                block_elasticity = 4 * len(slot_groups) / valid_length if valid_length else 0.0
                 initial_ids = torch.full(
                     (BLOCK_SIZE,), PAD_ID, dtype=torch.long, device=self.device
                 )
                 source_ids = self.processor.tokens_to_tensor(block_tokens).to(self.device)
                 initial_ids[:valid_length] = source_ids
                 for position, category in enumerate(block_roles):
-                    if category in TIMING_CATEGORIES:
+                    if category in TIMING_CATEGORIES or category.startswith(ELASTIC_SLOT_PREFIX):
                         initial_ids[position] = MASK_ID
 
             valid_mask = torch.zeros(BLOCK_SIZE, dtype=torch.bool, device=self.device)
@@ -596,44 +796,88 @@ class TwoTowerInference:
             block_number += 1
             print(
                 f"Block {block_number}: strategy={strategy}, valid_tokens={valid_length}, "
-                f"history={min(len(committed), PROMPT_MAX)}"
+                f"history={min(len(committed), PROMPT_MAX)}, elasticity={block_elasticity:.3f}"
             )
-            final_ids, revision_count = self._decode_block(
-                initial_state=initial_ids,
-                valid_mask=valid_mask,
-                source_roles=padded_roles,
-                strategy=strategy,
-                sampler=sampler,
-                adas_alpha=adas_alpha,
-                revision_mode=revision_mode,
-                revision_margin=revision_margin,
-                confidence_temperature=confidence_temperature,
-                context_kv=context_kv,
-                context_attention_mask=context_attention_mask,
-                seq_offset=seq_offset,
-                genre=genre,
-                multi_hot=multi_hot,
+            pass_input = initial_ids
+            block_revisions = 0
+            final_confidence = torch.zeros(
+                BLOCK_SIZE, dtype=torch.float32, device=self.device
             )
+            for refinement_index in range(refinement_passes):
+                if refinement_index > 0:
+                    # Start a fresh four-draft trajectory from the previous
+                    # final estimate. Descending integer noise levels use the
+                    # same 1/16 grid seen during training.
+                    noise_step = refinement_passes - refinement_index
+                    candidates = self._refinement_candidates(
+                        final_ids,
+                        valid_mask,
+                        padded_roles,
+                        strategy,
+                        revision_mode,
+                    )
+                    pass_input, remasked_positions = self._remask_for_refinement(
+                        final_ids,
+                        final_confidence,
+                        candidates,
+                        valid_length,
+                        noise_step,
+                    )
+                    print(
+                        f"  refinement pass {refinement_index + 1}/{refinement_passes}: "
+                        f"noise_step={noise_step}/{DIFFUSION_STEPS}, "
+                        f"remasked={len(remasked_positions)}"
+                    )
+                elif refinement_passes > 1:
+                    print(f"  refinement pass 1/{refinement_passes}: initial denoising")
+
+                final_ids, revision_count, final_confidence = self._decode_block(
+                    initial_state=pass_input,
+                    valid_mask=valid_mask,
+                    source_roles=padded_roles,
+                    strategy=strategy,
+                    sampler=sampler,
+                    adas_alpha=adas_alpha,
+                    revision_mode=revision_mode,
+                    revision_margin=revision_margin,
+                    confidence_temperature=confidence_temperature,
+                    context_kv=context_kv,
+                    context_attention_mask=context_attention_mask,
+                    seq_offset=seq_offset,
+                    genre=genre,
+                    multi_hot=multi_hot,
+                    elasticity=block_elasticity,
+                    quantize_timesteps=(refinement_index > 0),
+                    temperature=temperature,
+                    generator=generator,
+                )
+                block_revisions += revision_count
 
             generated = [
                 self.tokenizer.id_to_tok[int(token_id)]
                 for token_id in final_ids[:valid_length].tolist()
             ]
+            for start, end in slot_groups:
+                if "<BLANK>" in generated[start:end]:
+                    generated[start:end] = ["<BLANK>"] * (end - start)
+            generated = [token for token in generated if token != "<BLANK>"]
+            if not generated and strategy == "full-mask":
+                raise RuntimeError("The block generated only blanks; try lower elasticity")
             if eos_token in generated:
                 generated = generated[: generated.index(eos_token) + 1]
                 committed.extend(generated)
                 print(
                     f"Block {block_number} finalized {len(generated)} tokens with "
-                    f"{revision_count} revisions and produced <E>."
+                    f"{block_revisions} revisions and produced <E>."
                 )
                 break
 
             committed.extend(generated)
             if strategy == "onset-duration":
-                source_cursor += valid_length
+                source_cursor += source_consumed
             print(
                 f"Block {block_number} finalized {len(generated)} tokens with "
-                f"{revision_count} revisions."
+                f"{block_revisions} revisions."
             )
 
             if strategy == "onset-duration" and source_cursor >= len(normalized_source):
@@ -649,9 +893,9 @@ class TwoTowerInference:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", required=True, help="Input MIDI used for the prompt/scaffold")
+    parser.add_argument("--input", type=str, help="Input MIDI used for the prompt/scaffold", default="/e/home/jusers/bhandari1/jupiter/improvnet_2/improvnet/inference/examples/debussy-clair-de-lune_original.mid")
     parser.add_argument(
-        "--output", default="generated_twotower.mid", help="Generated MIDI output path"
+        "--output", default="/e/home/jusers/bhandari1/jupiter/improvnet_2/improvnet/inference/generated_twotower.mid", help="Generated MIDI output path"
     )
     parser.add_argument("--ar-model", default=AR_MODEL_PATH)
     parser.add_argument(
@@ -669,7 +913,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--revision-mode", choices=("freeze", "timing", "all"), default="timing"
     )
     parser.add_argument("--revision-margin", type=float, default=0.10)
-    parser.add_argument("--confidence-temperature", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Token sampling temperature; 0 uses greedy decoding.")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducible token sampling.")
+    parser.add_argument("--confidence-temperature", type=float, default=1.0,
+                        help="Extra confidence-temperature multiplier; keep 1 for reference ADAS scoring.")
+    parser.add_argument(
+        "--elasticity",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of generated positions available as <BLANK> insertion slots: "
+            "0 (rigid, default) or 0.10-0.20, matching training. "
+            "Blank positions are omitted from the MIDI and subsequent context."
+        ),
+    )
+    parser.add_argument(
+        "--refinement-passes",
+        type=int,
+        default=1,
+        help=(
+            "Number of four-draft refinement passes (1-16). Extra passes re-mask "
+            "low-confidence editable tokens on the trained 1/16 timestep grid."
+        ),
+    )
     return parser
 
 
@@ -691,11 +959,16 @@ def main() -> None:
         revision_mode=args.revision_mode,
         revision_margin=args.revision_margin,
         confidence_temperature=args.confidence_temperature,
+        refinement_passes=args.refinement_passes,
+        elasticity=args.elasticity,
+        temperature=args.temperature,
+        seed=args.seed,
     )
 
     output_directory = os.path.dirname(os.path.abspath(args.output))
     os.makedirs(output_directory, exist_ok=True)
     print(f"Saving {len(generated_tokens)} tokens to {args.output}...")
+    print(generated_tokens)
     output_midi = inference.processor.tokens_to_midi(generated_tokens)
     inference.processor.save_midi(output_midi, args.output)
     print("Generation complete.")
