@@ -1,0 +1,168 @@
+{
+  "schema_version": 1,
+  "complete": true,
+  "sources": [
+    {
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/misc_data_tokenized.jsonl",
+      "size": 165183265368,
+      "mtime_ns": 1788368902671454709,
+      "index": {
+        "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/misc_data_tokenized_index.pkl",
+        "size": 5462300,
+        "mtime_ns": 1788383020278445215
+      },
+      "records": 783358,
+      "unknown": 238170,
+      "genre_counts": {
+        "ambient": 11448,
+        "atonal": 301,
+        "blues": 2307,
+        "classical": 279079,
+        "folk": 8945,
+        "jazz": 34009,
+        "pop": 105186,
+        "ragtime": 6437,
+        "rock": 9740,
+        "soundtrack": 87736
+      }
+    },
+    {
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/gigamidi_data_tokenized.jsonl",
+      "size": 249130316457,
+      "mtime_ns": 1788377205545417909,
+      "index": {
+        "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/gigamidi_data_tokenized_index.pkl",
+        "size": 14775496,
+        "mtime_ns": 1788383018949368286
+      },
+      "records": 2133674,
+      "unknown": 2064191,
+      "genre_counts": {
+        "blues": 66,
+        "classical": 43913,
+        "folk": 102,
+        "game": 21665,
+        "jazz": 190,
+        "metal": 1032,
+        "pop": 479,
+        "rock": 1951,
+        "soundtrack": 85
+      }
+    }
+  ],
+  "records": 2917032,
+  "unknown": 2302361,
+  "labeled": 614671,
+  "labels": [
+    "ambient",
+    "atonal",
+    "blues",
+    "classical",
+    "folk",
+    "game",
+    "jazz",
+    "metal",
+    "pop",
+    "ragtime",
+    "rock",
+    "soundtrack"
+  ],
+  "genre_counts": {
+    "ambient": 11448,
+    "atonal": 301,
+    "blues": 2373,
+    "classical": 322992,
+    "folk": 9047,
+    "game": 21665,
+    "jazz": 34199,
+    "metal": 1032,
+    "pop": 105665,
+    "ragtime": 6437,
+    "rock": 11691,
+    "soundtrack": 87821
+  },
+  "manifest_genre_counts": {
+    "ambient": 11448,
+    "atonal": 301,
+    "blues": 2373,
+    "classical": 322992,
+    "folk": 9047,
+    "game": 21665,
+    "jazz": 34199,
+    "metal": 1032,
+    "pop": 105665,
+    "ragtime": 6437,
+    "rock": 11691,
+    "soundtrack": 87821
+  },
+  "raw_genre_counts": {
+    "\"ambient\"": 11448,
+    "\"atonal\"": 301,
+    "\"blues\"": 2373,
+    "\"classical\"": 322992,
+    "\"folk\"": 9047,
+    "\"game\"": 21665,
+    "\"jazz\"": 34199,
+    "\"metal\"": 1032,
+    "\"pop\"": 105665,
+    "\"ragtime\"": 6437,
+    "\"rock\"": 11691,
+    "\"soundtrack\"": 87821,
+    "null": 2302361
+  },
+  "split_counts": {
+    "train": {
+      "ambient": 10304,
+      "atonal": 270,
+      "blues": 2120,
+      "classical": 290630,
+      "folk": 8147,
+      "game": 19466,
+      "jazz": 30722,
+      "metal": 915,
+      "pop": 95123,
+      "ragtime": 5824,
+      "rock": 10489,
+      "soundtrack": 79141
+    },
+    "validation": {
+      "ambient": 558,
+      "atonal": 15,
+      "blues": 135,
+      "classical": 16157,
+      "folk": 457,
+      "game": 1066,
+      "jazz": 1691,
+      "metal": 59,
+      "pop": 5246,
+      "ragtime": 315,
+      "rock": 606,
+      "soundtrack": 4278
+    },
+    "test": {
+      "ambient": 586,
+      "atonal": 16,
+      "blues": 118,
+      "classical": 16205,
+      "folk": 443,
+      "game": 1133,
+      "jazz": 1786,
+      "metal": 58,
+      "pop": 5296,
+      "ragtime": 298,
+      "rock": 596,
+      "soundtrack": 4402
+    }
+  },
+  "piece_groups": 614215,
+  "groups_with_multiple_genre_labels": 0,
+  "split_seed": 42,
+  "split_fractions": [
+    0.9,
+    0.05,
+    0.049999999999999975
+  ],
+  "grouping": "piece_id/midi_hash if present; otherwise casefolded MIDI filename stem across sources",
+  "database": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/genre_classifier_v3/dataset_manifest.sqlite",
+  "elapsed_seconds": 68.51826454000548
+}
