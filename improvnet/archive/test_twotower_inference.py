@@ -5,7 +5,7 @@ from unittest.mock import patch
 import torch
 
 import improvnet.model.twotower_denoiser as denoiser_module
-from improvnet.inference.twotower_inference import (
+from improvnet_2.improvnet.archive.twotower_inference import (
     ELASTIC_POOL,
     ELASTIC_SLOT_PREFIX,
     FULL_POOL,

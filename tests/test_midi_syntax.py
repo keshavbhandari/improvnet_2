@@ -158,7 +158,7 @@ class MidiSyntaxTests(unittest.TestCase):
                                                          boundary_suffix=original[end:5])
                     self.assertEqual(result.score, 1, result.issue)
         self.assertEqual(original, saved)
-        result = self.metric.evaluate_canvas(original[1:4], history=original[:1])
+        result = self.metric.evaluate_canvas(original[1:4], history=original[:1], allow_incomplete_tail=False)
         self.assertEqual(result.issue.code, "incomplete_event")
         with self.assertRaises(ValueError):
             self.metric.evaluate_canvas(event(), boundary_suffix=event())
@@ -172,6 +172,82 @@ class MidiSyntaxTests(unittest.TestCase):
         self.assertEqual(result.score, 1, result.issue)
         result = self.metric.evaluate_canvas(source[start:end], history=source[:start])
         self.assertEqual(result.validity_score, 0)
+        self.assertTrue(result.prefix_valid)
+        self.assertEqual(result.score, 1)
+
+    def test_open_tail_is_appendable_but_not_claimed_compilable(self):
+        history = ["<S>"] + event()
+        for instrument in ("Acoustic Piano", "drum"):
+            full = event(instrument=instrument)
+            for cut in (1, 2, 3):
+                with self.subTest(instrument=instrument, cut=cut):
+                    canvas = full[:cut]
+                    saved = deepcopy(canvas)
+                    with patch.object(self.tokenizer, "detokenize") as compile_call:
+                        result = self.metric.evaluate_canvas(canvas, history=history)
+                        compile_call.assert_not_called()
+                    self.assertTrue(result.prefix_valid)
+                    self.assertTrue(result.syntax_valid)
+                    self.assertFalse(result.valid)
+                    self.assertIsNone(result.midi_compiles)
+                    self.assertEqual(result.score, 1)
+                    self.assertEqual(result.error_count, 0)
+                    self.assertEqual(result.issues, ())
+                    self.assertEqual(result.pending_tail_fields, ("note", "onset", "dur")[cut - 1:])
+                    self.assertEqual(len(result.boundary_issues), 4 - cut)
+                    self.assertEqual(canvas, saved)
+                    completed = self.metric.evaluate_canvas(full[cut:], history=history + canvas)
+                    self.assertTrue(completed.valid, completed)
+                    self.assertTrue(completed.prefix_valid)
+                    self.assertTrue(completed.midi_compiles)
+                    closed = self.metric.evaluate_canvas(canvas, history=history, allow_incomplete_tail=False)
+                    self.assertFalse(closed.prefix_valid)
+                    self.assertLess(closed.score, 1)
+
+    def test_deferred_tail_does_not_hide_internal_or_terminal_faults(self):
+        full = event()
+        bad_canvases = [
+            full[:3] + ["<E>"],  # End marker closes the event: cannot defer.
+            full[:2] + ["<T>"] + full[:3],
+            full[:2] + [full[3]],  # Duration without onset.
+            [full[0], full[2]],  # Instrument followed by onset.
+            full + [full[0], ("note", 500, 80)],
+            full + ["<T>", "<T>"] + full[:3],
+            full + ["<MASK>"] + full[:3],
+        ]
+        for canvas in bad_canvases:
+            with self.subTest(canvas=canvas):
+                result = self.metric.evaluate_canvas(canvas, history=["<S>"] + full)
+                self.assertFalse(result.prefix_valid, result)
+                self.assertFalse(result.valid)
+                self.assertLess(result.score, 1)
+                self.assertGreater(result.error_count, 0)
+        # Closed whole sequences remain strict even without wrapper requirements.
+        result = self.metric.evaluate_sequence(full + full[:3], require_bos=False, require_eos=False)
+        self.assertFalse(result.prefix_valid)
+        self.assertEqual(result.issue.code, "incomplete_event")
+
+    def test_open_tail_with_padding_cropped_history_and_batch_options(self):
+        history = event()[1:] + event()
+        canvas = event()[:3] + ["<P>"] * 4
+        result = self.metric.evaluate_canvas(canvas, history=history, valid_mask=[1]*3 + [0]*4,
+                                             allow_cropped_history=True)
+        self.assertTrue(result.prefix_valid)
+        self.assertEqual(result.scored_tokens, 3)
+        rows = self.metric.evaluate_batch([canvas], canvas=True, histories=[history],
+                                          valid_masks=[[1]*3 + [0]*4], allow_cropped_history=True)
+        self.assertEqual(rows[0], result)
+        rows = self.metric.evaluate_batch([canvas], canvas=True, histories=[history],
+                                          valid_masks=[[1]*3 + [0]*4], allow_cropped_history=True,
+                                          allow_incomplete_tail=False)
+        self.assertFalse(rows[0].prefix_valid)
+
+    def test_open_tail_keeps_empty_and_all_time_quality_guards(self):
+        for canvas in ([], ["<T>"], ["<T>", "<T>"], event(velocity=0)[:3]):
+            with self.subTest(canvas=canvas):
+                result = self.metric.evaluate_canvas(canvas)
+                self.assertFalse(result.prefix_valid)
+                self.assertEqual(result.score, 0)
 
     def test_cropped_clean_history_only(self):
         history = event()[1:] + event()
