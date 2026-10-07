@@ -300,7 +300,7 @@ class MidiSyntaxTests(unittest.TestCase):
         self.assertEqual(strict.evaluate_sequence(ordered).score, 1)
 
     def test_delimiter_and_no_pedal_configuration(self):
-        path = Path(__file__).resolve().parents[1] / "improvnet/tokenizer/config.json"
+        path = Path(__file__).resolve().parents[1] / "improvnet/archive/tokenizer_legacy/config.json"
         with path.open() as handle:
             config = json.load(handle)
         config["tokenizer"]["abs"].update(include_delimiter=True)

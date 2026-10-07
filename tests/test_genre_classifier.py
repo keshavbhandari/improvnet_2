@@ -126,7 +126,7 @@ class GenreClassifierTests(unittest.TestCase):
             GenreClassifierConfig(vocab_size=32, num_genres=1)
 
     def test_defaults_match_uniform_backbone_without_allocating_real_weights(self):
-        from improvnet.model.uniform_diffusion_config import UniformDiffusionConfig
+        from improvnet.archive.uniform_diffusion.model.uniform_diffusion_config import UniformDiffusionConfig
         classifier, uniform = GenreClassifierConfig(), UniformDiffusionConfig()
         for field in ("embed_dim", "n_heads", "n_kv_heads", "n_layers", "ffn_mult", "dropout", "gradient_checkpointing", "vocab_size"):
             self.assertEqual(getattr(classifier, field), getattr(uniform, field), field)
@@ -153,7 +153,7 @@ class GenreClassifierTests(unittest.TestCase):
             torch.testing.assert_close(one.grad, two.grad)
 
     def test_block_matches_uniform_backbone_math_with_identical_weights(self):
-        from improvnet.model.uniform_diffusion_model import SharedBlock
+        from improvnet.archive.uniform_diffusion.model.uniform_diffusion_model import SharedBlock
         from improvnet.metrics.genre_classifier.genre_classifier_model import EncoderBlock
         cfg = replace(self.config, n_kv_heads=2)
         classifier, uniform = EncoderBlock(cfg).eval(), SharedBlock(cfg).eval()

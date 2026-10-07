@@ -1,0 +1,47 @@
+{
+  "step": 8000,
+  "vae_step": 35000,
+  "weights": "ema",
+  "task": "transfer",
+  "genre": "classical",
+  "target_program": 0,
+  "is_drum": false,
+  "prompt_bins": 0,
+  "generated_bins": 32,
+  "passes": 48,
+  "noise_strength": 0.2,
+  "external_accompaniment": false,
+  "vae_only": {
+    "activity_f1": 0.9984,
+    "onset_f1": 1.0,
+    "notes_f1": 0.9663,
+    "boundary_f1": 0.9983,
+    "missed_notes": 0,
+    "extra_notes": 6,
+    "onset_mae_ms": 0.6977,
+    "offset_mae_ms": 101.0465,
+    "velocity_mae": 0.0103,
+    "pedal_mae": 0.0
+  },
+  "generated_vs_source": {
+    "activity_f1": 0.9675,
+    "onset_f1": 0.541,
+    "notes_f1": 0.4706,
+    "boundary_f1": 0.9696,
+    "missed_notes": 6,
+    "extra_notes": 174,
+    "onset_mae_ms": 6.875,
+    "offset_mae_ms": 314.375,
+    "velocity_mae": 1.14,
+    "pedal_mae": 0.0147
+  },
+  "latent_nrmse_vs_source": 0.08197,
+  "interpretation": "Transfer/continuation: source distances include intentional musical changes, not only denoising errors. Use --task reconstruct at several noise strengths to diagnose stage 1 versus stage 2.",
+  "accompaniment": {
+    "mode": "rhythm",
+    "max_tracks": 3,
+    "event_budget": 1024,
+    "max_tracks_used": 0,
+    "omitted_events": 0
+  }
+}

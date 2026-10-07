@@ -1,0 +1,56 @@
+{
+  "format": "hierarchical_piano_events_v2",
+  "input": "/e/home/jusers/bhandari1/jupiter/improvnet_2/improvnet/inference/examples/beethoven_string-trio_3_6_(nc)wittenburg.mid",
+  "config": {
+    "coarse_ms": 1000,
+    "fine_ms": 10
+  },
+  "target_channel": 0,
+  "target_program": 40,
+  "target_kind": "pitched",
+  "target_selection": "random-fallback",
+  "selection_seed": null,
+  "pedal_enabled": false,
+  "source_target_notes": 1483,
+  "target_notes": 1483,
+  "accompaniment_notes": 2387,
+  "bins": 459,
+  "frames": 45873,
+  "velocity_shape": [
+    459,
+    128,
+    100
+  ],
+  "onset_shape": [
+    459,
+    128,
+    100
+  ],
+  "pedal_shape": [
+    459,
+    100
+  ],
+  "normalization": {
+    "overlap_normalizations": 0,
+    "same_frame_collisions": 0,
+    "collision_frames": 0,
+    "short_notes_extended": 0
+  },
+  "skipped_nonpositive_notes": 1,
+  "context_short_notes_extended": 0,
+  "comparison_to_source": {
+    "notes_before": 3870,
+    "notes_after": 3870,
+    "pitch_velocity_instrument_counts_match": true,
+    "max_onset_error_ms": 4.99999,
+    "max_offset_error_ms": 4.99999
+  },
+  "comparison_to_normalized_reference": {
+    "notes_before": 3870,
+    "notes_after": 3870,
+    "pitch_velocity_instrument_counts_match": true,
+    "max_onset_error_ms": 0.026008,
+    "max_offset_error_ms": 0.026039
+  },
+  "normalized_reference_matches": true
+}

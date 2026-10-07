@@ -1,8 +1,22 @@
 # ImprovNet
 
+On branch `hierarchical-pianoroll-tokenizer`, the new representation is a
+hierarchical instrument roll (piano-first, with other instruments/drums supported;
+no overlap lanes), plus aligned
+accompaniment events. Same-pitch overlaps/collisions are normalized and reported.
+See the concise
+[design and round-trip guide](docs/hierarchical_tokenizer.md). Existing training
+commands below still use the archived event tokenizer through compatibility imports.
+
+```bash
+python -m improvnet.tokenizer.roundtrip \
+  --input improvnet/inference/examples/debussy-clair-de-lune_original.mid
+```
+
 Symbolic music generation and genre style transfer with an autoregressive (AR)
-model and a shared-backbone uniform discrete diffusion model. Independent MIDI
-syntax, genre, continuity and pitch-preservation metrics support evaluation.
+model and a new hierarchical instrument-roll pipeline. Independent MIDI syntax,
+genre, continuity and pitch-preservation metrics support evaluation. Legacy
+uniform discrete diffusion is [archived](improvnet/archive/uniform_diffusion/README.md).
 
 ## Setup
 
@@ -18,8 +32,65 @@ export IMPROVNET_ARTIFACTS=/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/arti
 ```
 
 Data paths, batch sizes, run directories and training settings live in
-`improvnet/model/ar_config.py`, `uniform_diffusion_train_config.py`, and each
+`improvnet/model/ar_config.py`, `local_vae_config.py`, and each
 metric's config file. Adjust them before launching; batch sizes are **per GPU**.
+
+## Local VAE for the hierarchical roll
+
+The new branch also has an unconditional local VAE: each 1-second patch contains
+all 100 fine frames, compressed to a spatial latent grid. It trains directly from
+indexed MIDI, not the old JSONL. Paths/settings are in `local_vae_config.py`.
+The 96-channel version trains on clean reconstruction, conservative note-event
+corruption and latent jitter; validation reports clean and perturbed scores.
+
+```bash
+# Index only, no training (the full MIDI index has already been prepared).
+python -m improvnet.model.local_vae_train --build-index
+
+# Start/resume on one node with four GPUs.
+torchrun --standalone --nproc_per_node=4 -m improvnet.model.local_vae_train
+
+# Reconstruct one MIDI; checkpoint defaults to local_vae_v1/best_model.pt.
+python -m improvnet.inference.local_vae_inference \
+  --input improvnet/inference/examples/bach_846.mid
+
+# Held-out reconstruction/latent checks, 100 files and 8 bins per file.
+python -m improvnet.inference.local_vae_evaluate --num-files 100 --bins-per-file 8
+
+# Focused CPU/synthetic tests.
+OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES='' python -m unittest discover -s tests -p 'test_local_vae*.py'
+```
+
+See [tensors, architecture, genre metadata and debug commands](docs/local_vae.md).
+ARIA genres are available; stage 2 now uses GigaMIDI's supplied curated-genre CSV
+through a separate labelled index. Missing genres do not block unconditional VAE
+training. The original VAE index is unchanged. Retraining its encoder requires
+a fresh stage-2 run and new latent calibration, even if the latent shape matches.
+
+## Stage-2 latent diffusion
+
+Frozen-VAE continuous diffusion with soft per-second pitch guidance, genre/instrument
+conditioning, clean history, and up to three full or rhythm-only accompaniment parts.
+Settings are in `latent_diffusion_config.py`. See the
+[training, accompaniment and diagnostic inference guide](docs/latent_diffusion.md).
+
+```bash
+# Read-only forward check; does NOT start training.
+python -m improvnet.model.latent_diffusion_train --check
+
+# Start/resume only when ready.
+torchrun --standalone --nproc_per_node=4 -m improvnet.model.latent_diffusion_train
+
+# Evaluate a saved stage-2 checkpoint; outputs go to a fresh scratch directory.
+python -m improvnet.inference.latent_diffusion_inference \
+  --input improvnet/inference/examples/debussy-clair-de-lune_original.mid \
+  --genre jazz --accompaniment-mode rhythm --noise-strength 0.8 --passes 48
+
+# Separate the VAE reconstruction floor from stage-2 reconstruction errors.
+python -m improvnet.inference.latent_diffusion_inference \
+  --input improvnet/inference/examples/debussy-clair-de-lune_original.mid \
+  --task reconstruct --genre classical --noise-strength 0.2 --passes 48
+```
 
 ## Training
 
@@ -29,9 +100,6 @@ These commands start or resume training, so run them only on available GPUs.
 ```bash
 # Autoregressive model
 torchrun --standalone --nproc_per_node=4 -m improvnet.model.ar_train
-
-# Uniform diffusion SFT, initialized from the configured AR checkpoint
-torchrun --standalone --nproc_per_node=4 -m improvnet.model.uniform_diffusion_train
 
 # Genre classifier and contrastive continuity encoder
 torchrun --standalone --nproc_per_node=4 -m improvnet.metrics.genre_classifier.genre_classifier_train
@@ -53,7 +121,6 @@ Two-node Jupiter launchers are in the sibling `run_scripts/improvnet` directory:
 
 ```bash
 sbatch ../run_scripts/improvnet/ar_multi_node_launch.sh
-sbatch ../run_scripts/improvnet/uniform_multi_node_launch.sh
 sbatch ../run_scripts/improvnet/genre_multi_node_launch.sh
 sbatch ../run_scripts/improvnet/continuity_multi_node_launch.sh
 ```
@@ -73,40 +140,6 @@ python -m improvnet.inference.ar_inference \
 
 `max_tokens` includes the prompt. AR inference uses underscore flags; diffusion
 evaluators use hyphenated flags. Outputs stop when the model emits `<E>`.
-
-## Uniform diffusion style transfer
-
-Keep the source event scaffold; refine timing first, then pitch/velocity.
-Instruments, structure and metadata stay fixed. The first block is promptless;
-later blocks use generated history. Source/output MIDI and all four metrics are
-saved in a new scratch directory. No training is started.
-
-```bash
-# Twenty held-out classical pieces, conditioned on jazz, up to eight blocks
-python -m improvnet.inference.uniform_diffusion_evaluate \
-  --test-examples 20 --steps 48 --max-blocks 8 --noise-levels 1 .8 .6 .4 .2
-
-# One piece, with the same complete metric report
-python -m improvnet.inference.uniform_diffusion_evaluate \
-  --input improvnet/inference/examples/debussy-clair-de-lune_original.mid \
-  --genre jazz --steps 48 --max-blocks 8 --noise-levels .8 .4 .2
-
-# Timing-only Clair de lune → blues; pitches/velocities stay fixed
-python -m improvnet.inference.uniform_diffusion_evaluate \
-  --input improvnet/inference/examples/debussy-clair-de-lune_original.mid \
-  --genre blues --strategy timing --metrics genre --steps 16 32 48 \
-  --max-blocks 8 --noise-levels 1 .8 .6 .4 .2 --batch-size 1
-```
-
-`--steps` is **per stage**, limited to 48 (96 total passes/block); adaptive
-stopping can use fewer. Noise applies only to editable slots in each stage.
-Default `--sampler flow` retains low-noise source information; `entropy` is an
-alternative that repeatedly re-noises unselected editable slots. Timing slots
-cannot become notes; note slots jointly sample pitch/velocity, including drums.
-The last source block closes at an event boundary before generation. This is
-constrained reconstruction, not novel prompt completion or event insertion.
-Reports use one compact JSON row per result; large token/trace dumps require
-explicit `--save-details`. `--steps` also accepts multiple budgets for a sweep.
 
 ## Metrics
 
@@ -151,11 +184,9 @@ music—listen to the saved examples too.
 
 ```bash
 OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES='' python -m unittest discover -s tests -p test_midi_syntax.py
-OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES='' python -m unittest discover -s tests -p 'test_uniform_diffusion*py'
+OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES='' python -m unittest discover -s tests -p test_local_vae.py
 ```
 
-More: [diffusion architecture](docs/uniform_diffusion_architecture.md),
-[training](docs/uniform_diffusion_training.md),
-[evaluation](docs/uniform_diffusion_evaluation.md), and
-[metrics](improvnet/metrics/README.md).
+More: [local VAE](docs/local_vae.md), [metrics](improvnet/metrics/README.md),
+and [legacy uniform diffusion](improvnet/archive/uniform_diffusion/README.md).
 Legacy masked TwoTower/FSQ experiments are under `improvnet/archive`.
