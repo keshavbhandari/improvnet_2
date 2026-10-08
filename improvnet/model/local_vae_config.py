@@ -17,7 +17,7 @@ INDEX_PATH = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/local_v
 # Checkpoints: vae/<run>/; logs: vae/tensorboard/<run>/.
 RUNS_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/vae"
 TENSORBOARD_ROOT = RUNS_DIR + "/tensorboard"
-RUN_NAME = "vae176"
+RUN_NAME = "vae176_onset"
 SAVE_DIR = RUNS_DIR + "/" + RUN_NAME
 DATA_SPLIT_SEED = 42
 DATA_SPLIT_RATIOS = {"train": .97, "validation": .02, "test": .01}
@@ -29,7 +29,7 @@ MAX_FRAMES = 360000
 # No genre/instrument/accompaniment conditioning in the VAE.
 BASE_CHANNELS = 176
 CHANNEL_MULTIPLIERS = (1, 2, 4)
-LATENT_CHANNELS = 8
+LATENT_CHANNELS = 4
 RES_BLOCKS = 2
 
 SEED = 42
