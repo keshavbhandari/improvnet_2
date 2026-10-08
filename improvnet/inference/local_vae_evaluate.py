@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from improvnet.inference.local_vae_inference import (
-    LatentStats, Scores, common_args, load_model, output_directory, reconstruct, write_report,
+    LatentStats, Scores, common_args, load_model, output_directory, reconstruct, resolve_thresholds, write_report,
 )
 from improvnet.utils.local_vae_data import LocalVAEDataset, seed_for
 
@@ -70,6 +70,7 @@ def main(argv=None):
         parser.error("File/bin counts must be positive, example count nonnegative")
     device = torch.device(args.device)
     model, tokenizer, step, saved = load_model(args.checkpoint, device)
+    resolve_thresholds(args, model)
     config = SimpleNamespace(**saved)
     if args.index:
         config.INDEX_PATH = str(args.index)

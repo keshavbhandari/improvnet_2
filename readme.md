@@ -40,8 +40,9 @@ metric's config file. Adjust them before launching; batch sizes are **per GPU**.
 The new branch also has an unconditional local VAE: each 1-second patch contains
 all 100 fine frames, compressed to a spatial latent grid. It trains directly from
 indexed MIDI, not the old JSONL. Paths/settings are in `local_vae_config.py`.
-The 96-channel version trains on clean reconstruction, conservative note-event
-corruption and latent jitter; validation reports clean and perturbed scores.
+The 176-channel version trains on clean reconstruction, conservative note-event
+corruption and latent jitter. Validation jointly tunes activity/onset thresholds;
+the 96-channel baseline's checkpoints and logs are retained for comparison.
 
 ```bash
 # Index only, no training (the full MIDI index has already been prepared).
@@ -50,7 +51,10 @@ python -m improvnet.model.local_vae_train --build-index
 # Start/resume on one node with four GPUs.
 torchrun --standalone --nproc_per_node=4 -m improvnet.model.local_vae_train
 
-# Reconstruct one MIDI; checkpoint defaults to local_vae_v1/best_model.pt.
+# Compare all VAE runs using one shared log directory.
+tensorboard --logdir /e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/vae/tensorboard
+
+# Reconstruct one MIDI; checkpoint defaults to the configured VAE run.
 python -m improvnet.inference.local_vae_inference \
   --input improvnet/inference/examples/bach_846.mid
 

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from improvnet.inference.local_vae_inference import Scores, inputs, load_model as load_vae, write_report
+from improvnet.inference.local_vae_inference import Scores, inputs, load_model as load_vae, resolve_thresholds, write_report
 from improvnet.model import latent_diffusion_config as defaults
 from improvnet.model.latent_diffusion_model import LatentDiffusionConfig, LatentDiffusionModel
 from improvnet.model.local_vae_train import amp_context
@@ -228,8 +228,8 @@ def main(argv=None):
     parser.add_argument("--target-channel", type=int)
     parser.add_argument("--target-program", type=int)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--activity-threshold", type=float, default=.5)
-    parser.add_argument("--onset-threshold", type=float, default=.99)
+    parser.add_argument("--activity-threshold", type=float, help="Override VAE checkpoint calibration")
+    parser.add_argument("--onset-threshold", type=float, help="Override VAE checkpoint calibration")
     parser.add_argument("--raw-weights", action="store_true", help="Use raw rather than EMA stage-2 weights")
     args = parser.parse_args(argv)
     if args.output_dir and args.output_dir.exists() and any(args.output_dir.iterdir()):
@@ -237,6 +237,7 @@ def main(argv=None):
     device = torch.device(args.device)
     model, vae, tokenizer, normalizer, config, info = load_model(args.checkpoint, device,
         vae_checkpoint=args.vae_checkpoint, use_ema=not args.raw_weights)
+    resolve_thresholds(args, vae)
     if args.genre.lower() == "none":
         genre = 0
     elif args.genre.lower() in info["genres"]:

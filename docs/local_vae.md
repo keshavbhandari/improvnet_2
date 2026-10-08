@@ -40,8 +40,8 @@ have a sustain channel. Existing same-pitch overlap normalization applies.
 ## Model and objective
 
 - A convolutional 2-D residual encoder downsamples pitch and time by 4.
-- The backbone starts at **96 channels**, about **18.55M parameters**
-  (previous baseline: 64 channels).
+- The backbone starts at **176 channels**, about **62.22M parameters**
+  (retained baseline: 96 channels, 18.55M parameters).
   Latent shape and 1-second / 10-ms clock are unchanged.
 - A separate 1-D encoder handles pedal; hidden pedal features fuse into the
   posterior. Stored pedal remains one value per frame.
@@ -58,7 +58,7 @@ Each reconstruction loss is activity BCE + onset BCE + active-cell velocity L1
 + enabled-pedal L1 + a small onset/activity consistency penalty. Weights are
 **activity 1, onset 2, velocity 5, pedal 1, consistency 0.1**. Previously onset
 was 1 and velocity 10. BCE averages each present class separately, then assigns
-40% of the activity loss / 35% of the onset loss to positives; the rest penalizes
+40% of the activity loss / 20% of the onset loss to positives; the rest penalizes
 false positives. Silent patches still receive the entire negative-class loss.
 These weighted sigmoid outputs are **not calibrated probabilities**; evaluate
 thresholds on validation rather than treating 0.99 as a universal requirement.
@@ -248,14 +248,84 @@ Architecture, world size, data index and optimization settings must match for an
 exact resume. Logging cadence, worker count and cache budget may change. An
 unrelated checkpoint in the run directory is refused, not overwritten.
 
-The default save directory remains `artifacts/local_vae_v1`, as requested. The
-96-channel model must start fresh, not resume a 64-channel checkpoint. Existing
+The default save directory is `artifacts/vae/vae176`. The
+176-channel model must start fresh, not resume a 96-channel checkpoint. Existing
 checkpoint architecture metadata still lets inference load older models;
 model state keys and default inference behavior have not changed. Once the new
 encoder is trained, recompute stage-2 latent statistics and **retrain stage 2**;
 the old diffusion model is not compatible merely because the latent shape matches.
 The denoising branches increase training work/memory; the wider model's batch
 capacity has not yet been benchmarked at full GPU occupancy.
+
+### Separate experiments and TensorBoard comparison
+
+Set `RUN_NAME` in the config or pass `--run-name` for a separate experiment.
+All named runs share one TensorBoard root but keep independent checkpoints:
+
+```text
+artifacts/vae/
+  baseline96/       best_model.pt, latest_checkpoint.pt, data_errors/
+  vae176/          best_model.pt, latest_checkpoint.pt (created when training starts)
+  tensorboard/
+    baseline96/    preserved events from the previous run
+    vae176/        events for the new run
+```
+
+```bash
+# Fresh architecture, independent weights/logs.
+# Adjust per-GPU batch size if the larger model does not fit.
+torchrun --standalone --nproc_per_node=4 -m improvnet.model.local_vae_train \
+  --run-name vae176 --base-channels 176
+
+# Compare the existing baseline with the new run in the same TensorBoard.
+tensorboard --logdir /e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/vae/tensorboard
+```
+
+Named runs use `RUNS_DIR/<name>/{latest_checkpoint.pt,best_model.pt}` and
+`TENSORBOARD_ROOT/<name>/` for logs. The existing run was moved intact to
+`vae/baseline96`; `local_vae_v1` is a compatibility link, so existing stage-2
+checkpoint paths still work. The baseline's old `tensorboard/` path also links
+to the shared log root. No checkpoint/event contents were changed or deleted.
+Identical metric tags remain comparable; the Text tab records each run's settings.
+Reuse the same command/name to resume that experiment. Existing-checkpoint guards
+still prevent replacing a different architecture, even with `--allow-resume-changes`.
+`--save-dir` is an alternative explicit path, mutually exclusive with `--run-name`.
+Reconstruction tools accept `--checkpoint` pointing to either run's `best_model.pt`;
+their default follows `SAVE_DIR`, currently the new `vae176` run. Pass
+`--checkpoint /.../artifacts/vae/baseline96/best_model.pt` to evaluate the baseline.
+
+Width 176 yields **62,221,828 parameters** versus 18,548,468 at width 96. This
+matches the approximate parameter budget of Huang et al.'s released VAE, not its
+architecture/compression ratio. Our latent shape remains `[8,32,25]`. For a
+capacity-only comparison keep the data, loss settings and effective batch fixed
+where practical. The new defaults also change onset positive-class share to 20%,
+so this default run compares the combined capacity/loss update, not capacity alone.
+
+### Joint threshold calibration
+
+Every validation pass searches configurable activity/onset threshold pairs using
+streaming score histograms; it does not keep rolls/logits in memory or perform
+extra model forwards. Onsets are gated by activity, exactly as in decoding.
+Counts are summed across GPUs, including uneven/empty validation shards.
+
+Selection maximizes the worst branch's mean activity/onset F1, subject to at least
+99% activity **and** onset recall on both clean and latent-jitter branches. If no
+pair meets the floor, the best unconstrained pair is returned with an explicit
+`recall_floor_met=False`; silent-only validation cannot certify success. Semantic
+denoising is still scored but excluded from threshold selection because restoring
+deleted/shifted notes can be intrinsically ambiguous in a one-second window.
+
+Fixed-threshold `validation/onset_*` and `activity_*` tags remain unchanged for
+fair comparison. Selected thresholds and branch precision/recall/F1 appear under
+`validation/calibration/`. Their scores are tuning-set measurements, not an
+unbiased estimate of test performance or a guarantee of 99% reconstruction.
+
+Checkpoints save the selected pair and its validation step under
+`decoder_calibration`, without new model parameters. Reconstruction, robustness
+and stage-2 inference CLIs use this pair automatically. Explicit
+`--activity-threshold`/`--onset-threshold` override it; older checkpoints retain
+the previous `.5/.99` fallback. These are score cutoffs, not probability
+calibration. Calibration never changes training targets, loss, or posterior RNG.
 
 To continue the same run after changing batch size, accumulation, the GigaMIDI
 drum-only fraction, validation sizes, loss weights, KL warmup, gradient clipping
@@ -300,7 +370,7 @@ python -m improvnet.inference.local_vae_evaluate \
 Both default to `SAVE_DIR/best_model.pt`; override with `--checkpoint /path/model.pt`.
 Use `--device cpu` if needed, `--batch-size` to control memory, and `--output-dir`
 for a **new/empty** destination. Otherwise each run creates a unique directory in
-scratch `artifacts/local_vae_evaluation`. No checkpoints or input MIDIs are changed.
+scratch alongside the configured run directories. No checkpoints or input MIDIs are changed.
 
 Single-file inference saves `reconstructed.mid` (original accompaniment kept),
 `reference_target.mid`, `reconstructed_target.mid`, and one small `report.json`.

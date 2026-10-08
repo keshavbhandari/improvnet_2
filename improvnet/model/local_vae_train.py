@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import random
+import re
 import signal
 import sqlite3
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from improvnet.model.local_vae_model import LocalVAE, LocalVAEConfig, reconstruction_losses
 from improvnet.utils.local_vae_data import LocalVAEDataset, build_midi_index, collate_bins, index_settings
+from improvnet.utils.local_vae_calibration import ThresholdCalibrator, calibration_scalars
 
 LOSS_KEYS = ("activity", "onset", "velocity", "pedal", "consistency", "kl")
 QUALITY_KEYS = ("activity_tp", "activity_fp", "activity_fn", "onset_tp", "onset_fp", "onset_fn",
@@ -52,6 +54,25 @@ def model_config(config):
     return LocalVAEConfig(frames_per_bin=config.COARSE_MS // config.FINE_MS,
                           base_channels=config.BASE_CHANNELS, channel_multipliers=tuple(config.CHANNEL_MULTIPLIERS),
                           latent_channels=config.LATENT_CHANNELS, res_blocks=config.RES_BLOCKS)
+
+
+def configure_run_directory(config):
+    """Select an isolated experiment directory without creating/moving files."""
+    name = getattr(config, "RUN_NAME", None)
+    if name is None:
+        return
+    if not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) is None:
+        raise ValueError("RUN_NAME must be a single name starting with a letter/digit; use letters, digits, _, -, or .")
+    if name == "tensorboard":
+        raise ValueError("RUN_NAME 'tensorboard' is reserved for shared logs")
+    root = Path(getattr(config, "RUNS_DIR", Path(config.SAVE_DIR).parent / "local_vae_runs"))
+    config.SAVE_DIR = str(root / name)
+    config.TENSORBOARD_DIR = str(Path(getattr(config, "TENSORBOARD_ROOT", root / "tensorboard")) / name)
+
+
+def tensorboard_directory(config):
+    # Explicit --save-dir/legacy direct callers keep their self-contained layout.
+    return Path(getattr(config, "TENSORBOARD_DIR", None) or Path(config.SAVE_DIR) / "tensorboard")
 
 
 def lr_factor(step, config):
@@ -93,7 +114,7 @@ def quality_stats(reconstruction, batch):
                 pedal_cells=p_mask.sum(), invalid_onsets=(raw_onset & ~predicted_active).sum(), raw_onsets=raw_onset.sum())
 
 
-def batch_objective(model, batch, config, step, *, sample=True, generator=None):
+def batch_objective(model, batch, config, step, *, sample=True, generator=None, calibration=None):
     ramp = robustness_ramp(step, config)
     semantic_weight = getattr(config, "SEMANTIC_WEIGHT", 0.) if getattr(config, "SEMANTIC_CORRUPTION", False) else 0.
     jitter_weight = getattr(config, "LATENT_JITTER_WEIGHT", 0.)
@@ -126,6 +147,10 @@ def batch_objective(model, batch, config, step, *, sample=True, generator=None):
     robust = (reconstruction + active_semantic_weight * denoising + active_jitter_weight * jitter) / (
         1 + active_semantic_weight + active_jitter_weight)
     with torch.no_grad():
+        if calibration is not None:
+            calibration.update(output.reconstruction, batch, "clean")
+            if output.jittered is not None:
+                calibration.update(output.jittered.reconstruction, batch, "jitter")
         quality_batch = dict(batch, activity_threshold=config.ACTIVITY_THRESHOLD, onset_threshold=config.ONSET_THRESHOLD)
         s = dict(loss=total.sum(), reconstruction=reconstruction.sum(), examples=total.new_tensor(len(batch["roll"])),
                  denoising_reconstruction=denoising.sum(), jitter_reconstruction=jitter.sum(), robust_reconstruction=robust.sum(),
@@ -167,19 +192,29 @@ def evaluate(model, loader, config, device, step):
     raw.eval()
     totals = torch.zeros(len(STAT_KEYS), device=device, dtype=torch.float64)
     generator = torch.Generator(device=device).manual_seed(config.SEED + 7919 + int(os.environ.get("RANK", 0)))
+    calibration = None
+    if getattr(config, "CALIBRATE_THRESHOLDS", False):
+        calibration = ThresholdCalibrator(config.CALIBRATION_ACTIVITY_THRESHOLDS, config.CALIBRATION_ONSET_THRESHOLDS,
+            defaults=(config.ACTIVITY_THRESHOLD, config.ONSET_THRESHOLD), min_recall=config.CALIBRATION_MIN_RECALL,
+            branches=("clean", "jitter") if getattr(config, "LATENT_JITTER_WEIGHT", 0.) else ("clean",), device=device)
     try:
         # Fixed stress noise, without consuming the posterior RNG used to train.
         for index, batch in enumerate(loader):
             if index >= config.MAX_VALIDATION_BATCHES:
                 break
             with amp_context(device):
-                _, stats = batch_objective(raw, to_device(batch, device), config, step, sample=False, generator=generator)
+                _, stats = batch_objective(raw, to_device(batch, device), config, step, sample=False,
+                                          generator=generator, calibration=calibration)
             totals += stats
         if dist.is_initialized():
             dist.all_reduce(totals)
         if not bool(torch.isfinite(totals).all()) or totals[STAT_KEYS.index("examples")] == 0:
             raise RuntimeError("Validation produced no examples or non-finite values")
-        return summarize(totals)
+        values = summarize(totals)
+        if calibration is not None:
+            raw.decoder_calibration = dict(calibration.select(), step=step + 1)
+            values.update(calibration_scalars(raw.decoder_calibration))
+        return values
     finally:
         raw.train(was_training)
 
@@ -219,7 +254,7 @@ def save_state(model, optimizer, scheduler, scaler, config, *, step, epoch, next
                  model_state_dict=cpu_tree(raw.state_dict()), optimizer_state_dict=cpu_tree(optimizer.state_dict()),
                  scheduler_state_dict=scheduler.state_dict(), scaler_state_dict=scaler.state_dict(),
                  step=step, epoch=epoch, next_batch=next_batch, best_val=best_val, world_size=world, rng=rng,
-                 index_identity=index_id)
+                 index_identity=index_id, decoder_calibration=getattr(raw, "decoder_calibration", None))
     directory = Path(config.SAVE_DIR)
     directory.mkdir(parents=True, exist_ok=True)
     for name in (["latest_checkpoint.pt", "best_model.pt"] if best else ["latest_checkpoint.pt"]):
@@ -246,6 +281,10 @@ def validate_config(config):
     for name in ("ACTIVITY_THRESHOLD", "ONSET_THRESHOLD"):
         if not 0 < getattr(config, name) < 1:
             raise ValueError(f"{name} must be in (0,1)")
+    if getattr(config, "CALIBRATE_THRESHOLDS", False):
+        ThresholdCalibrator(config.CALIBRATION_ACTIVITY_THRESHOLDS, config.CALIBRATION_ONSET_THRESHOLDS,
+                            defaults=(config.ACTIVITY_THRESHOLD, config.ONSET_THRESHOLD),
+                            min_recall=config.CALIBRATION_MIN_RECALL)
     if not config.PITCH_SHIFT_RANGE[0] <= 0 <= config.PITCH_SHIFT_RANGE[1]:
         raise ValueError("Pitch shift range must include zero")
     fraction = getattr(config, "GIGAMIDI_DRUM_ONLY_FRACTION", .05)
@@ -320,9 +359,10 @@ def train(config, *, force_cpu=False, allow_resume_changes=False):
         if state is not None:
             if state.get("index_identity") != index_id:
                 raise ValueError("MIDI index changed since checkpoint; choose a fresh SAVE_DIR")
-            ignored = {"SAVE_DIR", "RESUME_TRAINING", "NUM_WORKERS", "LOG_EVERY", "VALIDATE_EVERY", "SAVE_EVERY", "CACHE_MB_PER_WORKER", "LOG_DATA_ERRORS",
+            ignored = {"SAVE_DIR", "RUNS_DIR", "RUN_NAME", "TENSORBOARD_ROOT", "TENSORBOARD_DIR", "RESUME_TRAINING", "NUM_WORKERS", "LOG_EVERY", "VALIDATE_EVERY", "SAVE_EVERY", "CACHE_MB_PER_WORKER", "LOG_DATA_ERRORS",
                        "ACTIVITY_THRESHOLD", "ONSET_THRESHOLD"}  # Metrics only; not part of the objective.
-            changed = [k for k, v in vars(config).items() if k not in ignored and state["train_config"].get(k) != v]
+            changed = [k for k, v in vars(config).items() if k not in ignored and not k.startswith("CALIBRAT")
+                       and state["train_config"].get(k) != v]
             compatible = {"BATCH_SIZE", "ACCUM_STEPS", "GIGAMIDI_DRUM_ONLY_FRACTION",
                           "VALIDATION_BATCH_SIZE", "MAX_VALIDATION_BATCHES", "VALIDATION_SAMPLES",
                           "ACTIVITY_WEIGHT", "ONSET_WEIGHT", "VELOCITY_WEIGHT", "PEDAL_WEIGHT",
@@ -341,6 +381,7 @@ def train(config, *, force_cpu=False, allow_resume_changes=False):
                                  "sampling/augmentation and batch/validation settings; "
                                  "architecture, world size, index and optimizer schedule remain protected.")
             model.load_state_dict(state["model_state_dict"])
+            model.decoder_calibration = state.get("decoder_calibration")
             optimizer.load_state_dict(state["optimizer_state_dict"])
             scheduler.load_state_dict(state["scheduler_state_dict"])
             scaler.load_state_dict(state["scaler_state_dict"])
@@ -375,8 +416,11 @@ def train(config, *, force_cpu=False, allow_resume_changes=False):
                                 sampler=range(rank, len(val_data), world), generator=torch.Generator().manual_seed(config.SEED + 1), **options)
         if rank == 0:
             from torch.utils.tensorboard import SummaryWriter
-            writer = SummaryWriter(str(directory / "tensorboard"))
+            log_directory = tensorboard_directory(config)
+            writer = SummaryWriter(str(log_directory))
             raw = model.module if isinstance(model, DDP) else model
+            writer.add_text("run/settings", json.dumps(vars(config), sort_keys=True, indent=2, default=str), step)
+            print(f"Checkpoints: {directory}; TensorBoard: {log_directory}", flush=True)
             print(f"Local VAE: {sum(p.numel() for p in raw.parameters()):,} parameters; latent={raw.config.latent_shape}; "
                   f"effective batch={config.BATCH_SIZE * world * config.ACCUM_STEPS}; resumed step={step}", flush=True)
             print(f"Denoising={getattr(config, 'SEMANTIC_CORRUPTION', False)}; "
@@ -456,6 +500,11 @@ def train(config, *, force_cpu=False, allow_resume_changes=False):
                               f"robust={values['robust_reconstruction']:.4f}, onset_F1/P="
                               f"{values['onset_f1']:.3f}/{values['onset_precision']:.3f}, jitter_onset_F1/P="
                               f"{values['jitter_onset_f1']:.3f}/{values['jitter_onset_precision']:.3f}", flush=True)
+                        if "calibration/activity_threshold" in values:
+                            print(f"calibration: activity={values['calibration/activity_threshold']:.4f}, "
+                                  f"onset={values['calibration/onset_threshold']:.4f}, "
+                                  f"{config.CALIBRATION_MIN_RECALL:.0%}-recall target met="
+                                  f"{bool(values['calibration/recall_floor_met'])}", flush=True)
                         for k, v in values.items():
                             writer.add_scalar("validation/" + k, v, step)
                 request = os.environ.get("CHECKPOINT_REQUEST_FILE")
@@ -482,7 +531,10 @@ def main():
     parser.add_argument("--build-index", action="store_true")
     parser.add_argument("--max-index-files", type=int, help="Per collection, debug index only")
     parser.add_argument("--index")
-    parser.add_argument("--save-dir")
+    run_group = parser.add_mutually_exclusive_group()
+    run_group.add_argument("--save-dir")
+    run_group.add_argument("--run-name", help="Isolated experiment under RUNS_DIR; reuse its name to resume")
+    parser.add_argument("--base-channels", type=int, help="Backbone width; 176 gives approximately 62.22M parameters")
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--accum-steps", type=int)
     parser.add_argument("--num-workers", type=int)
@@ -497,11 +549,20 @@ def main():
         parser.error("--allow-resume-changes cannot be combined with --no-resume")
     module = importlib.import_module(args.config)
     config = SimpleNamespace(**{k: v for k, v in vars(module).items() if k.isupper()})
+    if args.run_name is not None:
+        config.RUN_NAME = args.run_name
+    if args.save_dir is not None:
+        config.RUN_NAME = None  # Explicit paths override a config's named run.
+        config.TENSORBOARD_DIR = None
     for arg, key in (("index", "INDEX_PATH"), ("save_dir", "SAVE_DIR"), ("batch_size", "BATCH_SIZE"),
                      ("accum_steps", "ACCUM_STEPS"), ("num_workers", "NUM_WORKERS"), ("steps", "N_STEPS"),
-                     ("samples_per_epoch", "SAMPLES_PER_EPOCH")):
+                     ("samples_per_epoch", "SAMPLES_PER_EPOCH"), ("base_channels", "BASE_CHANNELS")):
         if getattr(args, arg) is not None:
             setattr(config, key, getattr(args, arg))
+    try:
+        configure_run_directory(config)
+    except ValueError as error:
+        parser.error(str(error))
     if args.no_resume:
         config.RESUME_TRAINING = False
     if args.build_index:

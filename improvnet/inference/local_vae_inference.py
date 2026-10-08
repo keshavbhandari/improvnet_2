@@ -20,12 +20,25 @@ def load_model(path, device):
         raise ValueError("Expected a local VAE training checkpoint")
     model = LocalVAE(LocalVAEConfig(**state["model_config"]))
     model.load_state_dict(state["model_state_dict"], strict=True)
+    model.decoder_calibration = state.get("decoder_calibration")
     config = state["train_config"]
     grid = GridConfig(coarse_ms=config["COARSE_MS"], fine_ms=config["FINE_MS"],
                       piano_programs=tuple(config["PIANO_PROGRAMS"]), max_frames=config["MAX_FRAMES"])
     if grid.frames_per_bin != model.config.frames_per_bin:
         raise ValueError("Checkpoint model and tokenizer frame counts disagree")
     return model.to(device).eval(), HierarchicalTokenizer(grid), state["step"], config
+
+
+def resolve_thresholds(args, model):
+    """CLI overrides > checkpoint calibration > legacy .5/.99 defaults."""
+    calibration = getattr(model, "decoder_calibration", None) or {}
+    for name, fallback in (("activity_threshold", .5), ("onset_threshold", .99)):
+        value = getattr(args, name)
+        if value is None:
+            value = calibration.get(name, fallback)
+        if not np.isfinite(value) or not 0 < value < 1:
+            raise ValueError("Thresholds must be finite and strictly between zero and one")
+        setattr(args, name, float(value))
 
 
 def safe_ratio(a, b):
@@ -204,8 +217,8 @@ def common_args(parser):
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--activity-threshold", type=float, default=.5)
-    parser.add_argument("--onset-threshold", type=float, default=.99)
+    parser.add_argument("--activity-threshold", type=float, help="Override saved calibration (legacy fallback .5)")
+    parser.add_argument("--onset-threshold", type=float, help="Override saved calibration (legacy fallback .99)")
 
 
 def main(argv=None):
@@ -218,6 +231,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     device = torch.device(args.device)
     model, tokenizer, step, _ = load_model(args.checkpoint, device)
+    resolve_thresholds(args, model)
     piece = tokenizer.encode(args.input, recover=True, seed=args.seed,
                              target_channel=args.target_channel, target_program=args.target_program)
     if not piece.metadata["target_present"]:

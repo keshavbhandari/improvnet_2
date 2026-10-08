@@ -14,7 +14,7 @@ import torch
 
 from improvnet.inference.local_vae_evaluate import candidates
 from improvnet.inference.local_vae_inference import (
-    LatentStats, Scores, common_args, inputs, load_model, output_directory, write_report,
+    LatentStats, Scores, common_args, inputs, load_model, output_directory, resolve_thresholds, write_report,
 )
 from improvnet.model.local_vae_model import Posterior
 from improvnet.utils.local_vae_data import LocalVAEDataset, seed_for
@@ -218,7 +218,7 @@ def checkpoint_digest(path):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     common_args(parser)
-    parser.set_defaults(batch_size=8, onset_threshold=.99)
+    parser.set_defaults(batch_size=8)
     parser.add_argument("--num-files", type=int, default=200)
     parser.add_argument("--calibration-files", type=int, default=64)
     parser.add_argument("--bins-per-file", type=int, default=8)
@@ -229,8 +229,6 @@ def main(argv=None):
         parser.error("All counts must be positive")
     if not all(np.isfinite(a) and a >= 0 for a in args.alphas):
         parser.error("Alphas must be finite and nonnegative")
-    if not 0 < args.activity_threshold < 1 or not 0 < args.onset_threshold < 1:
-        parser.error("Thresholds must lie strictly between zero and one")
     alphas = sorted(set([0., *args.alphas]))
     if len(alphas) < 2:
         parser.error("Include at least one nonzero noise level")
@@ -238,6 +236,7 @@ def main(argv=None):
     # Guard the exact checkpoint used; never overwrite or fine-tune it.
     digest = checkpoint_digest(args.checkpoint)
     model, tokenizer, step, saved = load_model(args.checkpoint, device)
+    resolve_thresholds(args, model)
     if checkpoint_digest(args.checkpoint) != digest:
         raise RuntimeError("Checkpoint changed while loading; rerun with a stable checkpoint")
     for parameter in model.parameters():

@@ -14,7 +14,11 @@ ARIA_METADATA = DATA_ROOT + "/aria-midi-v1-deduped-ext/aria-midi-v1-deduped-ext/
 # Separate upstream genre CSV is not included in the uploaded MIDI ZIP.
 GIGAMIDI_METADATA = None
 INDEX_PATH = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/local_vae_dataset/midi_index.sqlite"
-SAVE_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/local_vae_v1"
+# Checkpoints: vae/<run>/; logs: vae/tensorboard/<run>/.
+RUNS_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/vae"
+TENSORBOARD_ROOT = RUNS_DIR + "/tensorboard"
+RUN_NAME = "vae176"
+SAVE_DIR = RUNS_DIR + "/" + RUN_NAME
 DATA_SPLIT_SEED = 42
 DATA_SPLIT_RATIOS = {"train": .97, "validation": .02, "test": .01}
 
@@ -23,7 +27,7 @@ FINE_MS = 10
 PIANO_PROGRAMS = tuple(range(8))
 MAX_FRAMES = 360000
 # No genre/instrument/accompaniment conditioning in the VAE.
-BASE_CHANNELS = 96
+BASE_CHANNELS = 176
 CHANNEL_MULTIPLIERS = (1, 2, 4)
 LATENT_CHANNELS = 8
 RES_BLOCKS = 2
@@ -40,7 +44,7 @@ PITCH_SHIFT_RANGE = (-5, 6)  # Inclusive; drums never pitch-transposed.
 CACHE_MB_PER_WORKER = 128
 MAX_DATA_RETRIES = 16
 LOG_DATA_ERRORS = False  # No per-file logs by default; retry metric remains visible.
-NUM_WORKERS = 8
+NUM_WORKERS = 16
 
 BATCH_SIZE = 64  # Per GPU; conservative initial setting, not a measured maximum.
 VALIDATION_BATCH_SIZE = 16
@@ -60,10 +64,10 @@ ONSET_WEIGHT = 2.
 VELOCITY_WEIGHT = 5.
 PEDAL_WEIGHT = 1.
 CONSISTENCY_WEIGHT = .1
-# Still class-balanced, but modestly favour suppressing false-positive cells.
+# Class-balanced loss shares, with extra weight on suppressing false positives.
 # These are class loss shares, NOT calibrated onset/activity probabilities.
 ACTIVITY_POSITIVE_FRACTION = .40
-ONSET_POSITIVE_FRACTION = .35
+ONSET_POSITIVE_FRACTION = .20  # 80% of class-balanced onset loss penalizes negatives.
 
 # Conservative event-level denoising. Targets/pedal/accompaniment remain clean.
 SEMANTIC_CORRUPTION = True
@@ -79,6 +83,12 @@ LATENT_JITTER_VALIDATION_STD = .10  # Fixed 10% stress test, not diffusion time.
 ROBUSTNESS_WARMUP_STEPS = 5000  # Ramp auxiliary weights and training jitter std.
 ACTIVITY_THRESHOLD = .5
 ONSET_THRESHOLD = .9 # Changed from .5
+# Joint validation calibration; fixed-threshold tags above remain comparable.
+# Select on clean + latent-jitter branches, not ambiguous semantic recovery.
+CALIBRATE_THRESHOLDS = True
+CALIBRATION_ACTIVITY_THRESHOLDS = (.3, .5, .6, .7, .8, .9, .95, .99)
+CALIBRATION_ONSET_THRESHOLDS = (.5, .8, .9, .95, .98, .99, .995, .999, .9999)
+CALIBRATION_MIN_RECALL = .99  # If unattainable, report it and select best F1.
 LOG_EVERY = 10
 VALIDATE_EVERY = 1000
 SAVE_EVERY = 1000

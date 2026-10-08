@@ -22,7 +22,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from improvnet.model import local_vae_config as defaults
 from improvnet.model.local_vae_model import LocalVAE, LocalVAEConfig, Posterior, reconstruction_losses
-from improvnet.model.local_vae_train import batch_objective, model_config, summarize, train, validate_config
+from improvnet.model.local_vae_train import (
+    batch_objective, configure_run_directory, main, model_config, summarize, train, validate_config,
+)
 from improvnet.tokenizer.hierarchical import GridConfig, HierarchicalTokenizer, read_performance
 from improvnet.utils.local_vae_data import (
     LocalVAEDataset, bin_tensors, build_midi_index, collate_bins, genres_from, transpose_bin,
@@ -62,7 +64,9 @@ def fixture(root):
     directory.mkdir()
     for i in range(35):
         midi([(0, 60 + i % 5, 60 + i % 40, .1, .3), (0, 64, 95, .99, 1.08)], pedal=[(.1, 90), (1.1, 0)]).save(directory / f"piece{i:02d}.mid")
-    c = config(DATASETS={"classical_archives": str(directory)}, INDEX_PATH=str(root / "index.sqlite"), SAVE_DIR=str(root / "run"))
+    c = config(DATASETS={"classical_archives": str(directory)}, INDEX_PATH=str(root / "index.sqlite"),
+               SAVE_DIR=str(root / "run"), RUN_NAME=None, RUNS_DIR=str(root / "experiments"),
+               TENSORBOARD_ROOT=str(root / "tensorboard"))
     with redirect_stdout(io.StringIO()):
         build_midi_index(c)
     return c
@@ -433,6 +437,70 @@ class DataTests(unittest.TestCase):
 
 
 class TrainingTests(unittest.TestCase):
+    def test_named_run_paths_are_isolated_and_selection_has_no_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            c = config(SAVE_DIR=str(root / "baseline"), RUNS_DIR=str(root / "experiments"), RUN_NAME=None,
+                       TENSORBOARD_ROOT=str(root / "tensorboard"))
+            configure_run_directory(c)
+            self.assertEqual(c.SAVE_DIR, str(root / "baseline"))
+            c.RUN_NAME = "vae176"
+            configure_run_directory(c)
+            self.assertEqual(c.SAVE_DIR, str(root / "experiments" / "vae176"))
+            self.assertEqual(c.TENSORBOARD_DIR, str(root / "tensorboard" / "vae176"))
+            self.assertFalse((root / "experiments").exists())
+            for name in ("", ".", "..", "../baseline", "/absolute", "nested/name", "space name"):
+                with self.subTest(name=name), self.assertRaisesRegex(ValueError, "single name"):
+                    configure_run_directory(config(RUN_NAME=name))
+            with self.assertRaisesRegex(ValueError, "reserved"):
+                configure_run_directory(config(RUN_NAME="tensorboard"))
+
+    def test_cli_named_run_width_and_explicit_path(self):
+        for args, name in ((["--run-name", "vae176", "--base-channels", "176"], "vae176"),
+                           (["--save-dir", "/tmp/explicit-vae"], None)):
+            with self.subTest(args=args), patch("sys.argv", ["local_vae_train", *args]), \
+                    patch("improvnet.model.local_vae_train.train") as mocked:
+                main()
+                c = mocked.call_args.args[0]
+                self.assertEqual(c.RUN_NAME, name)
+                if name:
+                    self.assertEqual(c.BASE_CHANNELS, 176)
+                    self.assertEqual(c.SAVE_DIR, str(Path(defaults.RUNS_DIR) / name))
+                else:
+                    self.assertEqual(c.SAVE_DIR, "/tmp/explicit-vae")
+        with patch("sys.argv", ["local_vae_train", "--run-name", "x", "--save-dir", "/tmp/y"]), \
+                redirect_stdout(io.StringIO()), patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            main()
+
+    def test_new_named_run_preserves_baseline_and_has_separate_checkpoints_and_logs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            c = fixture(root)
+            c.N_STEPS = 1
+            with redirect_stdout(io.StringIO()):
+                train(c, force_cpu=True)
+            baseline = Path(c.SAVE_DIR)
+            before = {p.name: p.read_bytes() for p in baseline.glob("*.pt")}
+            c.RUNS_DIR, c.RUN_NAME = str(root / "experiments"), "comparison"
+            configure_run_directory(c)
+            with redirect_stdout(io.StringIO()):
+                train(c, force_cpu=True)
+            for name, content in before.items():
+                self.assertEqual((baseline / name).read_bytes(), content)
+                self.assertTrue((Path(c.SAVE_DIR) / name).is_file())
+            self.assertTrue((baseline / "tensorboard").is_dir())
+            self.assertTrue((Path(c.TENSORBOARD_DIR)).is_dir())
+            self.assertFalse((Path(c.SAVE_DIR) / "tensorboard").exists())
+            checkpoint = Path(c.SAVE_DIR) / "latest_checkpoint.pt"
+            saved = torch.load(checkpoint, weights_only=False)
+            self.assertIn("decoder_calibration", saved)
+            from improvnet.inference.local_vae_inference import load_model, resolve_thresholds
+            loaded, _, _, _ = load_model(checkpoint, torch.device("cpu"))
+            args = SimpleNamespace(activity_threshold=None, onset_threshold=None)
+            resolve_thresholds(args, loaded)
+            self.assertEqual(args.activity_threshold, saved["decoder_calibration"]["activity_threshold"])
+            self.assertEqual(args.onset_threshold, saved["decoder_calibration"]["onset_threshold"])
+
     def test_distributed_training_with_uneven_validation_shards(self):
         with tempfile.TemporaryDirectory() as tmp:
             c = fixture(Path(tmp))
@@ -446,6 +514,7 @@ class TrainingTests(unittest.TestCase):
             self.assertEqual(state["world_size"], 2)
             self.assertEqual(len(state["rng"]), 2)
             self.assertTrue(np.isfinite(state["best_val"]))
+            self.assertEqual(state["decoder_calibration"]["branches"], ["clean", "jitter"])
 
     def test_exact_resume_matches_uninterrupted_training_and_validation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -464,6 +533,8 @@ class TrainingTests(unittest.TestCase):
             path = Path(c.SAVE_DIR) / "latest_checkpoint.pt"
             legacy_state = torch.load(path, weights_only=False)
             legacy_state["train_config"].pop("LOG_DATA_ERRORS")
+            legacy_state["train_config"].pop("RUNS_DIR")
+            legacy_state["train_config"].pop("RUN_NAME")
             torch.save(legacy_state, path)
             c.LOG_DATA_ERRORS = False
             with redirect_stdout(io.StringIO()):
