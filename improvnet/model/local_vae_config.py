@@ -17,7 +17,7 @@ INDEX_PATH = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/local_v
 # Checkpoints: vae/<run>/; logs: vae/tensorboard/<run>/.
 RUNS_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/vae"
 TENSORBOARD_ROOT = RUNS_DIR + "/tensorboard"
-RUN_NAME = "vae176_onset"
+RUN_NAME = "vae176_latent4"
 SAVE_DIR = RUNS_DIR + "/" + RUN_NAME
 DATA_SPLIT_SEED = 42
 DATA_SPLIT_RATIOS = {"train": .97, "validation": .02, "test": .01}
@@ -50,7 +50,7 @@ BATCH_SIZE = 64  # Per GPU; conservative initial setting, not a measured maximum
 VALIDATION_BATCH_SIZE = 16
 MAX_VALIDATION_BATCHES = 100
 ACCUM_STEPS = 1
-N_STEPS = 50000
+N_STEPS = 100000
 LR = 1e-4
 MIN_LR = 1e-5
 WARMUP_STEPS = 1000
