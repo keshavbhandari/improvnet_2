@@ -23,6 +23,7 @@ from improvnet.utils.latent_diffusion import (LatentNormalizer, checkpoint_diges
 from improvnet.utils.latent_diffusion_data import (LatentDiffusionDataset, accompaniment, collate_windows,
     genre_labels, transpose_window, window_tensors)
 from improvnet.inference.latent_diffusion_inference import generate, load_model, reference_events, resize_piece
+from improvnet.utils.note_decoding import NoteDecoding
 
 
 def midi():
@@ -255,11 +256,12 @@ class Stage2Tests(unittest.TestCase):
         c, vae, piece, _, model, norm = fixture("full")
         model.eval()
         output, baseline, ref, report = generate(model, vae, norm, piece, c, task="reconstruct", prompt_bins=1,
-            max_bins=3, steps=2, strength=.2, progress=False)
+            max_bins=3, steps=2, strength=.2, progress=False, note_decoding=NoteDecoding('held', .5, 20))
         self.assertTrue(np.array_equal(output.velocity[0], piece.velocity[0]))
         self.assertTrue(np.array_equal(output.onset[0], piece.onset[0]))
         self.assertIn("vae_jitter_at_measured_residual", report)
         self.assertIn("latent_nrmse_vs_source", report)
+        self.assertEqual(report['note_decoding']['mode'], 'held')
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "generated.mid"
             HierarchicalTokenizer().decode(output).save(path)

@@ -81,8 +81,10 @@ LATENT_JITTER_WEIGHT = .5
 LATENT_JITTER_MAX_STD = .10  # Uniform 0..10% of detached clean-batch channel std.
 LATENT_JITTER_VALIDATION_STD = .10  # Fixed 10% stress test, not diffusion time.
 ROBUSTNESS_WARMUP_STEPS = 5000  # Ramp auxiliary weights and training jitter std.
-ACTIVITY_THRESHOLD = .5
-ONSET_THRESHOLD = .9 # Changed from .5
+ACTIVITY_THRESHOLD = .95  # Calibrated held-note START threshold for the 92k best checkpoint.
+ONSET_THRESHOLD = .985
+# Held-note continuation (.70) and gap allowance (10 ms) live in the checkpoint's
+# decoder_calibration.note_decoding; they are inference rules, not training loss.
 # Joint validation calibration; fixed-threshold tags above remain comparable.
 # Select on clean + latent-jitter branches, not ambiguous semantic recovery.
 CALIBRATE_THRESHOLDS = True

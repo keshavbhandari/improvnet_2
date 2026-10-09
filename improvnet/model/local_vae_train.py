@@ -83,6 +83,35 @@ def lr_factor(step, config):
     return floor + (1 - floor) * .5 * (1 + math.cos(math.pi * progress))
 
 
+class CosineLRSchedule:
+    """Checkpointable cosine decay that can extend from the restored LR.
+
+    LambdaLR saves this callable's attributes in lr_lambdas. Legacy checkpoints
+    store None there; initializing from their saved config preserves their curve.
+    """
+    def __init__(self, config):
+        self.warmup_steps = config.WARMUP_STEPS
+        self.total_steps = config.N_STEPS
+        self.floor = config.MIN_LR / config.LR
+        self.anchor_step = None
+        self.anchor_factor = None
+
+    def __call__(self, step):
+        if step < self.warmup_steps:
+            return (step + 1) / max(1, self.warmup_steps)
+        start = self.warmup_steps if self.anchor_step is None else self.anchor_step
+        peak = 1. if self.anchor_factor is None else self.anchor_factor
+        progress = min(1., max(0., (step - start) / max(1, self.total_steps - start)))
+        return self.floor + (peak - self.floor) * .5 * (1 + math.cos(math.pi * progress))
+
+    def extend(self, total_steps, step, factor):
+        if total_steps <= self.total_steps:
+            raise ValueError("The learning-rate schedule can only be extended")
+        self.total_steps = total_steps
+        if step >= self.warmup_steps:
+            self.anchor_step, self.anchor_factor = step, factor
+
+
 def amp_context(device):
     return torch.autocast("cuda", dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16) if device.type == "cuda" else nullcontext()
 
@@ -353,14 +382,20 @@ def train(config, *, force_cpu=False, allow_resume_changes=False):
                     state = candidate
         model = LocalVAE(model_config(config)).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.LR, betas=config.BETAS, weight_decay=config.WEIGHT_DECAY)
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: lr_factor(step, config))
+        schedule_config = config if state is None else SimpleNamespace(**state["train_config"])
+        lr_schedule = CosineLRSchedule(schedule_config)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule)
         scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and not torch.cuda.is_bf16_supported())
         step, epoch, next_batch, best_val = 0, 0, 0, float("inf")
         if state is not None:
             if state.get("index_identity") != index_id:
                 raise ValueError("MIDI index changed since checkpoint; choose a fresh SAVE_DIR")
             ignored = {"SAVE_DIR", "RUNS_DIR", "RUN_NAME", "TENSORBOARD_ROOT", "TENSORBOARD_DIR", "RESUME_TRAINING", "NUM_WORKERS", "LOG_EVERY", "VALIDATE_EVERY", "SAVE_EVERY", "CACHE_MB_PER_WORKER", "LOG_DATA_ERRORS",
-                       "ACTIVITY_THRESHOLD", "ONSET_THRESHOLD"}  # Metrics only; not part of the objective.
+                       "ACTIVITY_THRESHOLD", "ONSET_THRESHOLD", "N_STEPS"}
+            saved_steps = state["train_config"]["N_STEPS"]
+            if config.N_STEPS < saved_steps:
+                raise ValueError(f"Resume permits increasing N_STEPS, not reducing it: "
+                                 f"saved={saved_steps}, requested={config.N_STEPS}")
             changed = [k for k, v in vars(config).items() if k not in ignored and not k.startswith("CALIBRAT")
                        and state["train_config"].get(k) != v]
             compatible = {"BATCH_SIZE", "ACCUM_STEPS", "GIGAMIDI_DRUM_ONLY_FRACTION",
@@ -384,6 +419,13 @@ def train(config, *, force_cpu=False, allow_resume_changes=False):
             model.decoder_calibration = state.get("decoder_calibration")
             optimizer.load_state_dict(state["optimizer_state_dict"])
             scheduler.load_state_dict(state["scheduler_state_dict"])
+            if config.N_STEPS > saved_steps:
+                lr_schedule.extend(config.N_STEPS, scheduler.last_epoch,
+                                   scheduler.get_last_lr()[0] / scheduler.base_lrs[0])
+                if rank == 0:
+                    print(f"Extended N_STEPS from {saved_steps} to {config.N_STEPS}; "
+                          f"continuing cosine decay from saved LR {scheduler.get_last_lr()[0]:.6g}. "
+                          "Warmup, data position and best-score tracking are preserved.", flush=True)
             scaler.load_state_dict(state["scaler_state_dict"])
             rng = state["rng"][rank]
             random.setstate(rng["python"])

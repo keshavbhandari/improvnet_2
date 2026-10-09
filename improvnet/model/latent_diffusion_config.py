@@ -9,9 +9,10 @@ GIGAMIDI_METADATA = DATASETS["gigamidi"] + "/Final-Metadata-Extended-GigaMIDI-Da
 GIGAMIDI_GENRE_FIELDS = ("music_styles_curated",)
 INDEX_PATH = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/local_vae_dataset/midi_index_gigamidi_genres.sqlite"
 
-VAE_CHECKPOINT = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/local_vae_v1/best_model.pt"
-SAVE_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/latent_diffusion_v1"
-EVALUATION_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/latent_diffusion_evaluation"
+VAE_CHECKPOINT = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/vae/vae176_latent4/best_model.pt"
+# Fresh stage-2 run: older diffusion checkpoints use a different frozen encoder.
+SAVE_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/latent_diffusion_vae176_latent4"
+EVALUATION_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/latent_diffusion_vae176_latent4_evaluation"
 
 HISTORY_BINS = 32
 TARGET_BINS = 128
@@ -43,7 +44,7 @@ CACHE_MB_PER_WORKER = 128
 MAX_DATA_RETRIES = 16
 LOG_DATA_ERRORS = False
 NUM_WORKERS = 8
-LATENT_CALIBRATION_SAMPLES = 128  # Training split only; stored in stage-2 checkpoint. # Change to 1024 for full run.
+LATENT_CALIBRATION_SAMPLES = 128  # Training windows; up to 16,384 target bins at TARGET_BINS=128.
 VAE_BATCH_SIZE = 16
 
 BATCH_SIZE = 32  # Windows per GPU, not individual VAE bins; not yet benchmarked.
@@ -62,5 +63,5 @@ LOG_EVERY = 10
 VALIDATE_EVERY = 1000
 SAVE_EVERY = 1000
 RESUME_TRAINING = True
-ACTIVITY_THRESHOLD = .5
-ONSET_THRESHOLD = .99
+ACTIVITY_THRESHOLD = .95  # Inference uses the frozen VAE's saved calibration by default.
+ONSET_THRESHOLD = .985

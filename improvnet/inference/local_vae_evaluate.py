@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from improvnet.inference.local_vae_inference import (
-    LatentStats, Scores, common_args, load_model, output_directory, reconstruct, resolve_thresholds, write_report,
+    LatentStats, Scores, common_args, load_model, note_decoding_options, output_directory, reconstruct, resolve_thresholds, write_report,
 )
 from improvnet.utils.local_vae_data import LocalVAEDataset, seed_for
 
@@ -100,7 +100,7 @@ def main(argv=None):
             ids = np.arange(start, start + length)
             predicted, stats, sampled, zero = reconstruct(model, piece, indices=ids, diagnostics=True,
                 batch_size=args.batch_size, activity_threshold=args.activity_threshold,
-                onset_threshold=args.onset_threshold, generator=generator)
+                onset_threshold=args.onset_threshold, generator=generator, note_decoding=note_decoding_options(args))
             score = Scores(); score.arrays(piece, predicted, ids); score.notes(piece, predicted, indices=ids)
             total.add(score)
             sampled_total.arrays(piece, sampled, ids); zero_total.arrays(piece, zero, ids)
@@ -115,7 +115,8 @@ def main(argv=None):
             if examples < args.save_examples:
                 # Reconstruct ALL bins for listening, not just the scored window.
                 full, _, _, _ = reconstruct(model, piece, batch_size=args.batch_size,
-                    activity_threshold=args.activity_threshold, onset_threshold=args.onset_threshold)
+                    activity_threshold=args.activity_threshold, onset_threshold=args.onset_threshold,
+                    note_decoding=note_decoding_options(args))
                 tokenizer.decode(piece, target_only=True).save(output / f"{examples:02d}_reference_target.mid")
                 tokenizer.decode(full, target_only=True).save(output / f"{examples:02d}_reconstructed_target.mid")
                 tokenizer.decode(full).save(output / f"{examples:02d}_reconstructed.mid")
@@ -131,6 +132,7 @@ def main(argv=None):
     sampled_f1, zero_f1 = sampled_total.report()["activity_f1"], zero_total.report()["activity_f1"]
     report = dict(checkpoint=str(args.checkpoint.resolve()), step=step, seed=args.seed, files=files, bins=bins,
                   thresholds=dict(activity=args.activity_threshold, onset=args.onset_threshold), skipped=sum(failures.values()),
+                  note_decoding=vars(note_decoding_options(args)),
                   errors=metrics, latent=latent_metrics,
                   checks=dict(sampled_activity_f1=sampled_f1, zero_latent_activity_f1=zero_f1,
                               sampled_onset_f1=sampled_total.report()["onset_f1"]),

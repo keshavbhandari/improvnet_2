@@ -11,6 +11,7 @@ import torch
 from improvnet.model import local_vae_config as defaults
 from improvnet.model.local_vae_model import LocalVAE, LocalVAEConfig
 from improvnet.tokenizer.hierarchical import GridConfig, HierarchicalTokenizer, roll_notes
+from improvnet.utils.note_decoding import NoteDecoding, apply_note_decoding, confidence_arrays
 
 
 def load_model(path, device):
@@ -21,6 +22,7 @@ def load_model(path, device):
     model = LocalVAE(LocalVAEConfig(**state["model_config"]))
     model.load_state_dict(state["model_state_dict"], strict=True)
     model.decoder_calibration = state.get("decoder_calibration")
+    model.note_decoding = NoteDecoding(**((model.decoder_calibration or {}).get("note_decoding") or {}))
     config = state["train_config"]
     grid = GridConfig(coarse_ms=config["COARSE_MS"], fine_ms=config["FINE_MS"],
                       piano_programs=tuple(config["PIANO_PROGRAMS"]), max_frames=config["MAX_FRAMES"])
@@ -39,6 +41,22 @@ def resolve_thresholds(args, model):
         if not np.isfinite(value) or not 0 < value < 1:
             raise ValueError("Thresholds must be finite and strictly between zero and one")
         setattr(args, name, float(value))
+    saved = getattr(model, "note_decoding", NoteDecoding())
+    mode = getattr(args, "note_decoding", None)
+    overrides = any(getattr(args, k, None) is not None for k in ("continuation_threshold", "max_gap_ms"))
+    if mode == "legacy" and overrides:
+        raise ValueError("Continuation/gap overrides require held-note decoding")
+    args.note_decoding = mode or ("held" if overrides else saved.mode)
+    for key in ("continuation_threshold", "max_gap_ms"):
+        if getattr(args, key, None) is None:
+            setattr(args, key, getattr(saved, key))
+    options = note_decoding_options(args)
+    if options.mode == "held" and options.continuation_threshold > args.activity_threshold:
+        raise ValueError("Continuation threshold cannot exceed the note-start activity threshold")
+
+
+def note_decoding_options(args):
+    return NoteDecoding(args.note_decoding, args.continuation_threshold, args.max_gap_ms)
 
 
 def safe_ratio(a, b):
@@ -50,11 +68,15 @@ class Scores:
     def __init__(self):
         self.counts = {k: 0. for k in ("activity_tp", "activity_fp", "activity_fn", "onset_tp", "onset_fp",
             "onset_fn", "velocity_error", "active", "pedal_error", "pedal_cells", "notes_tp", "notes_fp",
-            "notes_fn", "onset_ms", "offset_ms", "boundary_tp", "boundary_fp", "boundary_fn")}
+            "notes_fn", "onset_ms", "offset_ms", "boundary_tp", "boundary_fp", "boundary_fn",
+            "notes_with_offsets_tp", "notes_with_offsets_fp", "notes_with_offsets_fn", "offset_signed_ms",
+            "offset_within_20ms", "rapid_notes", "rapid_matched", "rapid_offsets_matched")}
+        self.offset_errors_ms = []
 
     def add(self, other):
         for key in self.counts:
             self.counts[key] += other.counts[key]
+        self.offset_errors_ms.extend(other.offset_errors_ms)
 
     def arrays(self, reference, prediction, indices=None):
         ids = slice(None) if indices is None else indices
@@ -83,18 +105,30 @@ class Scores:
             ids = slice(None) if indices is None else indices
             return roll_notes(piece.velocity[ids], piece.onset[ids], int(piece.valid_mask[ids].sum()), 0, 0, 0, strict=False)
         left, right = notes(reference), notes(prediction)
-        matched = 0
+        matched = offsets_matched = 0
         for pitch in range(128):
             a = sorted((n[5], n[6]) for n in left if n[3] == pitch)
             b = sorted((n[5], n[6]) for n in right if n[3] == pitch)
             i = j = 0
             frame_ms = reference.config.fine_ms
+            rapid = {k for k in range(1, len(a)) if (a[k][0] - a[k - 1][0]) * frame_ms <= 200}
+            self.counts["rapid_notes"] += len(rapid)
             while i < len(a) and j < len(b):
                 delta = (b[j][0] - a[i][0]) * frame_ms
                 if abs(delta) <= tolerance_ms:
                     matched += 1
                     self.counts["onset_ms"] += abs(delta)
-                    self.counts["offset_ms"] += abs(b[j][1] - a[i][1]) * frame_ms
+                    offset_error = (b[j][1] - a[i][1]) * frame_ms
+                    absolute = abs(offset_error)
+                    self.counts["offset_ms"] += absolute
+                    self.counts["offset_signed_ms"] += offset_error
+                    self.counts["offset_within_20ms"] += absolute <= 20
+                    self.offset_errors_ms.append(absolute)
+                    correct_offset = absolute <= max(50, .2 * (a[i][1] - a[i][0]) * frame_ms)
+                    offsets_matched += correct_offset
+                    if i in rapid:
+                        self.counts["rapid_matched"] += 1
+                        self.counts["rapid_offsets_matched"] += correct_offset
                     i += 1; j += 1
                 elif delta < 0:
                     j += 1
@@ -103,16 +137,28 @@ class Scores:
         self.counts["notes_tp"] += matched
         self.counts["notes_fn"] += len(left) - matched
         self.counts["notes_fp"] += len(right) - matched
+        self.counts["notes_with_offsets_tp"] += offsets_matched
+        self.counts["notes_with_offsets_fn"] += len(left) - offsets_matched
+        self.counts["notes_with_offsets_fp"] += len(right) - offsets_matched
 
     def report(self):
         c = self.counts
         result = {}
-        for name in ("activity", "onset", "notes", "boundary"):
+        for name in ("activity", "onset", "notes", "notes_with_offsets", "boundary"):
             tp, fp, fn = (c[name + "_" + k] for k in ("tp", "fp", "fn"))
+            result[name + "_precision"] = safe_ratio(tp, tp + fp)
+            result[name + "_recall"] = safe_ratio(tp, tp + fn)
             result[name + "_f1"] = safe_ratio(2 * tp, 2 * tp + fp + fn)
-        result.update(missed_notes=int(c["notes_fn"]), extra_notes=int(c["notes_fp"]),
+        result.update(reference_notes=int(c["notes_tp"] + c["notes_fn"]),
+                      missed_notes=int(c["notes_fn"]), extra_notes=int(c["notes_fp"]),
                       onset_mae_ms=safe_ratio(c["onset_ms"], c["notes_tp"]),
                       offset_mae_ms=safe_ratio(c["offset_ms"], c["notes_tp"]),
+                      offset_signed_mean_ms=safe_ratio(c["offset_signed_ms"], c["notes_tp"]),
+                      offset_p95_ms=float(np.percentile(self.offset_errors_ms, 95)) if self.offset_errors_ms else None,
+                      releases_within_20ms=safe_ratio(c["offset_within_20ms"], c["notes_tp"]),
+                      rapid_reference_notes=int(c["rapid_notes"]),
+                      rapid_note_recall=safe_ratio(c["rapid_matched"], c["rapid_notes"]),
+                      rapid_note_with_offset_recall=safe_ratio(c["rapid_offsets_matched"], c["rapid_notes"]),
                       velocity_mae=safe_ratio(c["velocity_error"], c["active"]),
                       pedal_mae=safe_ratio(c["pedal_error"], c["pedal_cells"]))
         return {k: round(v, 4) if isinstance(v, float) else v for k, v in result.items()}
@@ -155,8 +201,11 @@ def inputs(piece, indices, device):
 
 
 @torch.inference_mode()
-def reconstruct(model, piece, *, batch_size=16, activity_threshold=.5, onset_threshold=.5,
-                sample=False, generator=None, indices=None, diagnostics=False):
+def reconstruct(model, piece, *, batch_size=16, activity_threshold=None, onset_threshold=None,
+                sample=False, generator=None, indices=None, diagnostics=False, note_decoding=None):
+    calibration = getattr(model, 'decoder_calibration', None) or {}
+    activity_threshold = calibration.get('activity_threshold', .5) if activity_threshold is None else activity_threshold
+    onset_threshold = calibration.get('onset_threshold', .5) if onset_threshold is None else onset_threshold
     if batch_size < 1 or not 0 < activity_threshold < 1 or not 0 < onset_threshold < 1:
         raise ValueError("Positive batch size and thresholds strictly between zero and one required")
     piece.validate()
@@ -168,6 +217,10 @@ def reconstruct(model, piece, *, batch_size=16, activity_threshold=.5, onset_thr
     # Diagnostics compare the same bins, including genuine silence.
     sampled, zero = deepcopy(piece) if diagnostics else None, deepcopy(piece) if diagnostics else None
     stats = LatentStats()
+    options = note_decoding or getattr(model, "note_decoding", NoteDecoding())
+    options = options if isinstance(options, NoteDecoding) else NoteDecoding(**options)
+    targets = [output, sampled, zero] if diagnostics else [output]
+    confidences = [{k: [] for k in ("activity", "onset", "velocity")} for _ in targets]
     device = next(model.parameters()).device
     for start in range(0, len(indices), batch_size):
         ids = indices[start:start + batch_size]
@@ -181,7 +234,7 @@ def reconstruct(model, piece, *, batch_size=16, activity_threshold=.5, onset_thr
         if diagnostics:
             variants += [(sampled, model.decode(posterior.sample(generator))),
                          (zero, model.decode(torch.zeros_like(z)))]
-        for target, reconstruction in variants:
+        for variant, (target, reconstruction) in enumerate(variants):
             if not all(bool(torch.isfinite(t).all()) for t in (reconstruction.activity_logits,
                 reconstruction.onset_logits, reconstruction.velocity, reconstruction.pedal)):
                 raise FloatingPointError("Non-finite reconstruction")
@@ -189,7 +242,15 @@ def reconstruct(model, piece, *, batch_size=16, activity_threshold=.5, onset_thr
                                              onset_threshold=onset_threshold)
             for key, tensor in arrays.items():
                 getattr(target, key)[ids] = tensor.cpu().numpy()
-    output.refresh_coarse().validate()
+            if options.mode == "held":
+                for key, value in confidence_arrays(reconstruction).items():
+                    confidences[variant][key].append(value)
+    for target, parts in zip(targets, confidences):
+        if options.mode == "held":
+            confidence = {k: np.concatenate(v) for k, v in parts.items()}
+            apply_note_decoding(target, indices, confidence, options,
+                activity_threshold=activity_threshold, onset_threshold=onset_threshold)
+        target.refresh_coarse().validate()
     return output, stats, sampled, zero
 
 
@@ -219,6 +280,9 @@ def common_args(parser):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--activity-threshold", type=float, help="Override saved calibration (legacy fallback .5)")
     parser.add_argument("--onset-threshold", type=float, help="Override saved calibration (legacy fallback .99)")
+    parser.add_argument("--note-decoding", choices=("legacy", "held"), help="Override saved MIDI note assembly")
+    parser.add_argument("--continuation-threshold", type=float, help="Lower activity threshold for held notes")
+    parser.add_argument("--max-gap-ms", type=int, help="Maximum internal activity dip to bridge; releases are backdated")
 
 
 def main(argv=None):
@@ -239,7 +303,7 @@ def main(argv=None):
     generator = torch.Generator(device=device).manual_seed(args.seed)
     predicted, _, _, _ = reconstruct(model, piece, batch_size=args.batch_size,
         activity_threshold=args.activity_threshold, onset_threshold=args.onset_threshold,
-        sample=args.sample, generator=generator)
+        sample=args.sample, generator=generator, note_decoding=note_decoding_options(args))
     scores = Scores(); scores.arrays(piece, predicted); scores.notes(piece, predicted)
     output = output_directory(args.output_dir, "single-")
     tokenizer.decode(piece, target_only=True).save(output / "reference_target.mid")
@@ -248,6 +312,7 @@ def main(argv=None):
     report = dict(input=str(args.input.resolve()), checkpoint=str(args.checkpoint.resolve()), step=step, bins=len(piece.velocity),
                   target=dict(channel=piece.metadata["target_channel"], program=piece.metadata["target_program"]),
                   posterior="sample" if args.sample else "mean", seed=args.seed,
+                  note_decoding=vars(note_decoding_options(args)),
                   thresholds=dict(activity=args.activity_threshold, onset=args.onset_threshold), errors=scores.report())
     write_report(output / "report.json", report)
     print(json.dumps(report["errors"]))

@@ -23,7 +23,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from improvnet.model import local_vae_config as defaults
 from improvnet.model.local_vae_model import LocalVAE, LocalVAEConfig, Posterior, reconstruction_losses
 from improvnet.model.local_vae_train import (
-    batch_objective, configure_run_directory, main, model_config, summarize, train, validate_config,
+    CosineLRSchedule, batch_objective, configure_run_directory, lr_factor, main,
+    model_config, summarize, train, validate_config,
 )
 from improvnet.tokenizer.hierarchical import GridConfig, HierarchicalTokenizer, read_performance
 from improvnet.utils.local_vae_data import (
@@ -437,6 +438,82 @@ class DataTests(unittest.TestCase):
 
 
 class TrainingTests(unittest.TestCase):
+    def test_extended_cosine_schedule_preserves_lr_and_round_trips(self):
+        c = config(N_STEPS=50000, WARMUP_STEPS=1000, LR=1e-4, MIN_LR=1e-5)
+        curve = CosineLRSchedule(c)
+        for step in (0, 999, 1000, 14000, 50000):
+            self.assertEqual(curve(step), lr_factor(step, c))
+        restored_factor = curve(14000)
+        curve.extend(100000, 14000, restored_factor)
+        self.assertEqual(curve(14000), restored_factor)
+        self.assertLess(curve(14001), restored_factor)
+        self.assertGreater(curve(50000), c.MIN_LR / c.LR)
+        self.assertEqual(curve(100000), c.MIN_LR / c.LR)
+        optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))], lr=c.LR)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, curve)
+        saved = deepcopy(scheduler.state_dict())
+        other_curve = CosineLRSchedule(config(N_STEPS=100000))
+        other = torch.optim.lr_scheduler.LambdaLR(optimizer, other_curve)
+        other.load_state_dict(saved)
+        for step in (14000, 50000, 100000):
+            self.assertEqual(other_curve(step), curve(step))
+        # A later extension starts at the current curve, not the original peak.
+        factor = other_curve(50000)
+        other_curve.extend(150000, 50000, factor)
+        self.assertEqual(other_curve(50000), factor)
+        self.assertEqual(other_curve(150000), c.MIN_LR / c.LR)
+
+    def test_extension_during_warmup_does_not_restart_it(self):
+        c = config(N_STEPS=50000, WARMUP_STEPS=1000)
+        curve = CosineLRSchedule(c)
+        curve.extend(100000, 300, curve(300))
+        self.assertEqual(curve(301), 302 / 1000)
+        self.assertEqual(curve(1000), 1.)
+        self.assertEqual(curve(100000), c.MIN_LR / c.LR)
+
+    def test_longer_run_resumes_legacy_checkpoint_without_resetting_data_or_optimizer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            c = fixture(root)
+            c.SAMPLES_PER_EPOCH, c.ACCUM_STEPS, c.VALIDATE_EVERY = 16, 1, 100
+            request = root / "checkpoint_request"
+            request.touch()
+            with patch.dict(os.environ, CHECKPOINT_REQUEST_FILE=str(request)), redirect_stdout(io.StringIO()):
+                train(c, force_cpu=True)
+            path = Path(c.SAVE_DIR) / "latest_checkpoint.pt"
+            saved = torch.load(path, weights_only=False)
+            self.assertEqual((saved["step"], saved["epoch"], saved["next_batch"]), (1, 0, 1))
+            # Old trainers saved a function lambda, without callable state.
+            saved["scheduler_state_dict"]["lr_lambdas"] = [None]
+            saved["best_val"] = .12345
+            torch.save(saved, path)
+            old_lr = saved["optimizer_state_dict"]["param_groups"][0]["lr"]
+            c.N_STEPS = 8
+            output = io.StringIO()
+            with patch.dict(os.environ, CHECKPOINT_REQUEST_FILE=str(request)), redirect_stdout(output):
+                train(c, force_cpu=True)
+            self.assertIn("Extended N_STEPS", output.getvalue())
+            self.assertNotIn("non-exact continuation", output.getvalue())
+            actual = torch.load(path, weights_only=False)
+            self.assertEqual((actual["step"], actual["epoch"], actual["next_batch"]), (2, 0, 2))
+            self.assertEqual(actual["best_val"], .12345)
+            self.assertEqual(actual["train_config"]["N_STEPS"], 8)
+            self.assertTrue(all(int(v["step"]) == 2 for v in actual["optimizer_state_dict"]["state"].values()))
+            curve = actual["scheduler_state_dict"]["lr_lambdas"][0]
+            self.assertEqual(curve["anchor_factor"], old_lr / c.LR)
+            self.assertEqual((curve["anchor_step"], curve["total_steps"]), (1, 8))
+            # The extension is checkpointed and survives another ordinary resume.
+            with patch.dict(os.environ, CHECKPOINT_REQUEST_FILE=str(request)), redirect_stdout(io.StringIO()):
+                train(c, force_cpu=True)
+            again = torch.load(path, weights_only=False)
+            self.assertEqual((again["step"], again["epoch"], again["next_batch"]), (3, 0, 3))
+            self.assertEqual(again["scheduler_state_dict"]["lr_lambdas"][0], curve)
+            before = path.read_bytes()
+            c.N_STEPS = 7
+            with self.assertRaisesRegex(ValueError, "not reducing"):
+                train(c, force_cpu=True, allow_resume_changes=True)
+            self.assertEqual(path.read_bytes(), before)
+
     def test_named_run_paths_are_isolated_and_selection_has_no_writes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

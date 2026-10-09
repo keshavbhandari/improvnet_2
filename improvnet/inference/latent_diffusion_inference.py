@@ -9,13 +9,14 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from improvnet.inference.local_vae_inference import Scores, inputs, load_model as load_vae, resolve_thresholds, write_report
+from improvnet.inference.local_vae_inference import Scores, inputs, load_model as load_vae, note_decoding_options, resolve_thresholds, write_report
 from improvnet.model import latent_diffusion_config as defaults
 from improvnet.model.latent_diffusion_model import LatentDiffusionConfig, LatentDiffusionModel
 from improvnet.model.local_vae_train import amp_context
 from improvnet.tokenizer.hierarchical import TempoMap, read_performance
 from improvnet.utils.latent_diffusion import LatentNormalizer, checkpoint_digest, encode_windows, sample
 from improvnet.utils.latent_diffusion_data import collate_windows, window_tensors
+from improvnet.utils.note_decoding import NoteDecoding, apply_note_decoding, confidence_arrays
 
 
 def load_model(path, device, *, vae_checkpoint=None, use_ema=True):
@@ -103,7 +104,10 @@ def diagnostics(reference, vae_baseline, prediction, ids, latent_squared_sum, la
 @torch.inference_mode()
 def generate(model, vae, normalizer, piece, config, *, genre=0, task="transfer", prompt_bins=0,
              max_bins=32, steps=48, strength=1., mode="full", events=None, seed=42,
-             activity_threshold=.5, onset_threshold=.99, progress=True):
+             activity_threshold=None, onset_threshold=None, progress=True, note_decoding=None):
+    calibration = getattr(vae, 'decoder_calibration', None) or {}
+    activity_threshold = calibration.get('activity_threshold', .5) if activity_threshold is None else activity_threshold
+    onset_threshold = calibration.get('onset_threshold', .99) if onset_threshold is None else onset_threshold
     if task not in ("transfer", "reconstruct", "continue") or max_bins < 1 or prompt_bins < 0:
         raise ValueError("Invalid task/output/prompt length")
     if prompt_bins > len(piece.velocity) or (prompt_bins == len(piece.velocity) and task != "continue"):
@@ -117,6 +121,20 @@ def generate(model, vae, normalizer, piece, config, *, genre=0, task="transfer",
     length = prompt_bins + max_bins if task == "continue" else min(len(piece.velocity), prompt_bins + max_bins)
     reference = resize_piece(piece, length, extend=task == "continue")
     output, baseline = deepcopy(reference), deepcopy(reference)
+    options = note_decoding or getattr(vae, "note_decoding", NoteDecoding())
+    options = options if isinstance(options, NoteDecoding) else NoteDecoding(**options)
+
+    def new_confidence():
+        confidence = {k: np.zeros(reference.velocity.shape, dtype=np.float32)
+                      for k in ("activity", "onset", "velocity")}
+        # Only the explicitly preserved prompt supplies initial state. Generated
+        # target confidences are filled from model output, never the source roll.
+        confidence["activity"][:prompt_bins] = reference.velocity[:prompt_bins] > 0
+        confidence["onset"][:prompt_bins] = reference.onset[:prompt_bins]
+        confidence["velocity"][:prompt_bins] = reference.velocity[:prompt_bins] / 127.
+        return confidence
+
+    output_confidence, baseline_confidence = (new_confidence(), new_confidence()) if options.mode == "held" else (None, None)
     device = next(model.parameters()).device
     generator = torch.Generator(device=device).manual_seed(seed)
     # Prior target history is reused as latents, not decoded/re-encoded every window.
@@ -156,6 +174,9 @@ def generate(model, vae, normalizer, piece, config, *, genre=0, task="transfer",
         arrays = rebuilt.tensors(mask, enabled, activity_threshold=activity_threshold, onset_threshold=onset_threshold)
         for key, value in arrays.items():
             getattr(output, key)[ids] = value.cpu().numpy()
+        if output_confidence is not None:
+            for key, value in confidence_arrays(rebuilt).items():
+                output_confidence[key][ids] = value
         for offset, absolute in enumerate(ids):
             committed[int(absolute)] = prediction[0, h + offset].clone()
         # Bound cached history to the context actually used by the next window.
@@ -165,6 +186,9 @@ def generate(model, vae, normalizer, piece, config, *, genre=0, task="transfer",
             roll, pedal, valid, enabled = inputs(reference, ids, device)
             posterior = vae.encode(roll, pedal, valid)
             r = vae.decode(posterior.mean)
+        if baseline_confidence is not None:
+            for key, value in confidence_arrays(r).items():
+                baseline_confidence[key][ids] = value
         for key, value in r.tensors(valid, enabled, activity_threshold=activity_threshold, onset_threshold=onset_threshold).items():
             getattr(baseline, key)[ids] = value.cpu().numpy()
         target_normalized = normalizer.normalize(posterior.mean[None], posterior.weights[None])
@@ -180,9 +204,14 @@ def generate(model, vae, normalizer, piece, config, *, genre=0, task="transfer",
         if progress:
             print(f"Bins {start}:{start+count}: {steps} passes; source distance={block['latent_nrmse_vs_source']:.3f}; "
                   f"accompaniment={mode}, tracks={block['tracks']}, omitted events={block['dropped_events']}", flush=True)
+    if output_confidence is not None:
+        for target, confidence in ((output, output_confidence), (baseline, baseline_confidence)):
+            apply_note_decoding(target, np.arange(length), confidence, options,
+                activity_threshold=activity_threshold, onset_threshold=onset_threshold)
     output.refresh_coarse().validate(); baseline.refresh_coarse().validate()
     ids = np.arange(prompt_bins, length)
     report = diagnostics(reference, baseline, output, ids, latent_squared_sum, latent_cells, task)
+    report["note_decoding"] = vars(options)
     report["accompaniment"] = dict(mode=mode, max_tracks=config.MAX_ACCOMPANIMENT_TRACKS,
         event_budget=config.MAX_ACCOMPANIMENT_EVENTS, max_tracks_used=max(b["tracks"] for b in blocks),
         omitted_events=sum(b["dropped_events"] for b in blocks))
@@ -190,6 +219,7 @@ def generate(model, vae, normalizer, piece, config, *, genre=0, task="transfer",
     # This is illustrative isotropic jitter, not evidence that actual stage-2 errors are isotropic.
     if task == "reconstruct":
         jittered = deepcopy(reference)
+        jitter_confidence = new_confidence() if options.mode == "held" else None
         alpha = report["latent_nrmse_vs_source"]
         jitter_generator = torch.Generator(device=device).manual_seed(seed + 100003)
         for offset in range(0, len(ids), config.VAE_BATCH_SIZE):
@@ -200,8 +230,14 @@ def generate(model, vae, normalizer, piece, config, *, genre=0, task="transfer",
                 eps = torch.randn(p.mean.shape, device=device, generator=jitter_generator)
                 jitter = p.mean + alpha * normalizer.std.to(device)[None, :, None, None] * eps
                 r = vae.decode(jitter.masked_fill(~(p.weights > 0), 0))
+            if jitter_confidence is not None:
+                for key, value in confidence_arrays(r).items():
+                    jitter_confidence[key][selected] = value
             for key, value in r.tensors(valid, enabled, activity_threshold=activity_threshold, onset_threshold=onset_threshold).items():
                 getattr(jittered, key)[selected] = value.cpu().numpy()
+        if jitter_confidence is not None:
+            apply_note_decoding(jittered, np.arange(length), jitter_confidence, options,
+                activity_threshold=activity_threshold, onset_threshold=onset_threshold)
         jittered.refresh_coarse().validate()
         report["vae_jitter_at_measured_residual"] = score(reference, jittered, ids)
         report["jitter_caveat"] = "One isotropic draw at measured std-relative RMSE; actual diffusion errors may be structured."
@@ -230,6 +266,9 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--activity-threshold", type=float, help="Override VAE checkpoint calibration")
     parser.add_argument("--onset-threshold", type=float, help="Override VAE checkpoint calibration")
+    parser.add_argument("--note-decoding", choices=("legacy", "held"), help="Override saved MIDI note assembly")
+    parser.add_argument("--continuation-threshold", type=float)
+    parser.add_argument("--max-gap-ms", type=int)
     parser.add_argument("--raw-weights", action="store_true", help="Use raw rather than EMA stage-2 weights")
     args = parser.parse_args(argv)
     if args.output_dir and args.output_dir.exists() and any(args.output_dir.iterdir()):
@@ -253,7 +292,8 @@ def main(argv=None):
     output, baseline, reference, report = generate(model, vae, normalizer, piece, config, genre=genre,
         task=args.task, prompt_bins=args.prompt_bins, max_bins=args.max_bins, steps=args.passes,
         strength=args.noise_strength, mode=args.accompaniment_mode, events=events, seed=args.seed,
-        activity_threshold=args.activity_threshold, onset_threshold=args.onset_threshold)
+        activity_threshold=args.activity_threshold, onset_threshold=args.onset_threshold,
+        note_decoding=note_decoding_options(args))
     if args.output_dir is None:
         root = Path(defaults.EVALUATION_DIR); root.mkdir(parents=True, exist_ok=True)
         directory = Path(tempfile.mkdtemp(prefix="single-", dir=root))

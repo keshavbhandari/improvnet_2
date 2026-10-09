@@ -1,7 +1,7 @@
 # Stage 2: continuous latent diffusion
 
 The existing local VAE is frozen. Stage 2 generates its spatial latents over
-**8 adjacent one-second bins**, with up to **4 preceding clean bins** in the same
+**128 adjacent one-second bins**, with up to **32 preceding clean bins** in the same
 canvas. Each bin has its own noise embedding: history stays at zero noise, target
 bins share a randomly sampled diffusion time. Loss applies only to valid target
 latents, with fractional weights for partially padded columns. The first 5% of
@@ -42,9 +42,9 @@ program, drum flag, pitch, plus velocity and signed start/end positions on the
 shared fine-frame clock. Notes already sounding at a window's start are included.
 No flattened vocabulary or interleaved multi-token grammar is required.
 
-The **256-event budget applies to the entire history + target window**. Pruning
+The **1024-event budget applies to the entire history + target window**. Pruning
 round-robins across part/onset-bin buckets, rather than retaining only the first
-256 notes. Omitted event counts are printed and included in the inference report.
+1024 notes. Omitted event counts are printed and included in the inference report.
 Budgeted events are a lossy condition, not a change to the source accompaniment.
 
 **Rhythm-only mode:** calculate per-track onset count, active-note count and mean
@@ -114,7 +114,7 @@ Training, **only when you choose to start it**:
 torchrun --standalone --nproc_per_node=4 -m improvnet.model.latent_diffusion_train
 ```
 
-The default batch is 8 windows/GPU, accumulation 1; it is not a measured maximum.
+The default batch is 32 windows/GPU, accumulation 1; it is not a measured maximum.
 Training logs v-loss and clean-latent normalized RMSE, including low/mid/high
 noise groups. Low = t<0.25, mid = 0.25–0.75, high = t>=0.75. These are one-pass
 predictions, not full-sampler errors or a VAE robustness verdict. Validation noise
@@ -122,6 +122,23 @@ and dataset choices are repeatable. Checkpoints include optimizer, RNG, data
 position, EMA, normalization, genre IDs, and frozen VAE SHA-256. Resume requires
 matching architecture/data/world/optimizer settings. VAE checkpoints and unrelated
 SAVE_DIR checkpoints are protected from overwrite.
+
+The current frozen checkpoint is `vae/vae176_latent4/best_model.pt` (92k steps,
+four latent channels), with saved start/onset cutoffs of `.95/.985`, held-note
+continuation `.70`, and a 10 ms internal gap allowance selected on validation
+sequences. Stage-2 inference applies the same held-note decoding as VAE inference,
+after assembling all generated blocks and the explicitly preserved prompt.
+Pedal/accompaniment are unaffected, and no reference target informs decoding.
+`--note-decoding legacy` restores the earlier assembly; also set onset `.995`
+when comparing with the original baseline. The metadata-only calibration changes
+the checkpoint file digest but leaves encoder/decoder weights and latents intact.
+The fresh run directory is
+`artifacts/latent_diffusion_vae176_latent4`; older `latent_diffusion_v1` checkpoints
+use a different encoder and remain separate. Latent dimensions are read from the
+VAE checkpoint, so no separate eight-to-four channel edit is needed. The 128
+normalization samples are training **windows**, containing up to 16,384 target
+bins with the current window length; these statistics are recomputed when a new
+stage-2 run starts.
 
 To resume with a different per-GPU batch size, explicitly allow the non-exact
 continuation (same SAVE_DIR):

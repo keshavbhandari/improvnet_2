@@ -17,7 +17,7 @@ gets its own spatial latent grid, retaining pitch/time axes for future diffusion
 | `corrupted_roll` | `[B, 2, 128, 100]` | Optional perturbed encoder input; `roll` remains the clean target |
 | `pedal` | `[B, 1, 100]` | CC64 / 127; not duplicated across pitches |
 | `valid_mask` | `[B, 100]` | True for actual fine frames, false for trailing padding |
-| `latent` | `[B, 8, 32, 25]` | Sampled posterior during training; mean for validation |
+| `latent` | `[B, C, 32, 25]` | C=4 in `vae176_latent4`, C=8 in `vae176`; sampled for training, mean for validation |
 | `events` | `[B, Emax, 11]` | Typed accompaniment rows, padded separately |
 | `event_positions` | `[B, Emax, 2]` | Start/end relative to this bin in fine frames |
 | `event_mask` | `[B, Emax]` | True for actual accompaniment rows |
@@ -74,7 +74,15 @@ The total is `clean + ramp * (0.5 * denoising + 0.5 * jitter) + beta * KL`.
 KL uses the mean of clean/corrupted posterior KLs when both are enabled; its
 weight remains `1e-4`, warmed up over 5,000 steps. There are no genre or instrument
 embeddings, encoder shortcuts, or extra learned noise-scale parameters.
-The 50k-step budget remains a starting point, not a convergence guarantee.
+The configured step budget is a starting point, not a convergence guarantee.
+Increasing `N_STEPS` (or `--steps`) resumes normally without
+`--allow-resume-changes`. Weights, optimizer, RNG, data position and best-score
+tracking are retained. The remaining cosine LR decay extends from the saved
+learning rate to `MIN_LR` at the new endpoint, without restarting warmup or
+jumping back to a higher LR. This extended curve is saved in future checkpoints;
+legacy checkpoints are supported. Extending during warmup preserves its original
+length; extending after LR has reached its floor keeps it there. Reducing a saved
+run's step budget is rejected.
 
 This follows the idea of local piano-roll compression in
 [Huang et al.](https://arxiv.org/html/2402.14285v4#S5), adapted to 100-frame bins
@@ -248,7 +256,7 @@ Architecture, world size, data index and optimization settings must match for an
 exact resume. Logging cadence, worker count and cache budget may change. An
 unrelated checkpoint in the run directory is refused, not overwritten.
 
-The default save directory is `artifacts/vae/vae176`. The
+The default save directory is `artifacts/vae/vae176_latent4`. The
 176-channel model must start fresh, not resume a 96-channel checkpoint. Existing
 checkpoint architecture metadata still lets inference load older models;
 model state keys and default inference behavior have not changed. Once the new
@@ -291,12 +299,13 @@ Reuse the same command/name to resume that experiment. Existing-checkpoint guard
 still prevent replacing a different architecture, even with `--allow-resume-changes`.
 `--save-dir` is an alternative explicit path, mutually exclusive with `--run-name`.
 Reconstruction tools accept `--checkpoint` pointing to either run's `best_model.pt`;
-their default follows `SAVE_DIR`, currently the new `vae176` run. Pass
+their default follows `SAVE_DIR`, currently `vae176_latent4`. Pass
 `--checkpoint /.../artifacts/vae/baseline96/best_model.pt` to evaluate the baseline.
 
 Width 176 yields **62,221,828 parameters** versus 18,548,468 at width 96. This
 matches the approximate parameter budget of Huang et al.'s released VAE, not its
-architecture/compression ratio. Our latent shape remains `[8,32,25]`. For a
+architecture/compression ratio. `vae176` uses `[8,32,25]`; the current
+`vae176_latent4` run uses `[4,32,25]`. For a
 capacity-only comparison keep the data, loss settings and effective batch fixed
 where practical. The new defaults also change onset positive-class share to 20%,
 so this default run compares the combined capacity/loss update, not capacity alone.
@@ -326,6 +335,48 @@ and stage-2 inference CLIs use this pair automatically. Explicit
 `--activity-threshold`/`--onset-threshold` override it; older checkpoints retain
 the previous `.5/.99` fallback. These are score cutoffs, not probability
 calibration. Calibration never changes training targets, loss, or posterior RNG.
+
+The completed 100k-step `vae176_latent4` run's best checkpoint is from step 92k.
+A first post-training validation sequence search selected `.95/.995` activity/onset
+cutoffs for clean and 10%-jitter decoded-note F1, while preserving at least 99%
+recall, using legacy activity-to-note assembly. Its learned weights are unchanged,
+and `best_model.before_threshold_calibration_20261009.pt` retains the original
+checkpoint. The held-note calibration below supersedes these inference settings. The completed run's original
+fixed-threshold TensorBoard tags still reflect `.5/.9`; its training-time
+calibration optimized frame scores. Sequence calibration reports explicitly show
+whether 99% decoded-note **precision** is also met; the recall flag alone does
+not certify it.
+
+With that legacy pair, 200 test files / 1,600 bins give activity F1 99.89%,
+onset F1 99.81% and decoded-note F1 99.15%, with note precision 98.37%
+(141 extra / 5 missed notes out of 8,505). The Pijama jazz subset's note F1 is
+97.80%. A separate test-window noise sweep averages 99.72% note F1 at 10%
+channel-std perturbation and 96.87% at 20%, over three noise draws. These meet
+the aggregate 99% F1 goal at low noise, but not a 99% note-precision requirement
+or a per-genre guarantee.
+
+The subsequent held-note calibration uses the same trained weights and selects
+start activity `.95`, continuation activity `.70`, onset `.985`, and a **10 ms**
+internal gap allowance, on 200 validation windows only. All one-second bins are
+assembled continuously after inference batching. An activity-only return cannot
+start a note except an initial-window carry. New accepted onsets always retrigger;
+short gaps ending in a new onset are preserved. Unbridged/trailing releases stay
+at the first inactive frame rather than being delayed by the lookahead allowance.
+
+On the original 200 test windows / 8,505 reference notes, held-note precision is
+**99.62%**, recall **99.95%**, F1 **99.79%**, and F1 with onset **and offset**
+matching **99.42%** (previously 98.23%). Extras fall from 141 to 32, misses from
+5 to 4, and release MAE from 5.66 to 2.41 ms. Rapid-repeat attack recall remains
+100%; its offset-aware recall is 99.76% (two release mismatches). Pijama note F1
+rises from 97.80% to 99.77%. This is not a per-collection precision guarantee:
+Classical Archives remains at 98.63% note precision. The remaining 32 extras all
+have explicit onset predictions; they are no longer inferred activity restarts.
+
+The checkpoint saves these inference rules in `decoder_calibration.note_decoding`;
+VAE and stage-2 inference both use them automatically. A checkpoint backup retains
+the exact previous metadata/weights. The file digest changes, so start the planned
+fresh stage-2 run with the calibrated checkpoint; existing checkpoints pinned to
+another digest are deliberately rejected.
 
 To continue the same run after changing batch size, accumulation, the GigaMIDI
 drum-only fraction, validation sizes, loss weights, KL warmup, gradient clipping
@@ -391,6 +442,9 @@ selected windows contribute to scores. Set `--save-examples 0` for no MIDI outpu
 | `activity_f1`, `onset_f1` | How well active cells / exact attack frames survive; higher is better. |
 | `notes_f1`, missed/extra notes | Same-pitch, one-to-one attacks matched within 50 ms. |
 | `onset_mae_ms`, `offset_mae_ms` | Average attack/release timing error for matched notes. |
+| `notes_with_offsets_f1` | Attack matching plus release tolerance max(50 ms, 20% of reference duration). |
+| `offset_p95_ms`, `releases_within_20ms` | Tail release error and fraction of matched releases within 20 ms. |
+| `rapid_note_recall`, `rapid_note_with_offset_recall` | Repeated same-pitch starts <=200 ms apart, with/without the release constraint. |
 | `velocity_mae`, `pedal_mae` | Average error in 0–127 MIDI units; lower is better. Missing notes count as zero velocity. |
 | `boundary_f1` | Activity F1 in the first 50 ms of each bin; checks carry-over trouble. |
 | latent `mean`, `std` | Posterior-mean spread per latent channel over valid pitch/time cells. |
@@ -403,9 +457,34 @@ padding and accompaniment. Velocity error includes every reference-active cell;
 false-positive cells are captured by F1. Disabled pedal and undefined metrics
 are `null`, not falsely perfect zeros. Entire pieces are decoded across bins;
 window note scoring clips both reference and prediction at the same boundaries.
-MIDI conversion uses the decoder's documented non-strict activity-to-note rules
-(missing attacks inferred, within-note velocity drift ignored). A playable MIDI
-alone is therefore **not** evidence of faithful reconstruction.
+The lossless tokenizer retains its documented non-strict activity-to-note rules.
+For calibrated model predictions, confidence-aware held-note assembly first
+produces a consistent velocity/onset canvas. Legacy checkpoints remain unchanged.
+Use `--note-decoding legacy` to opt out, or `--note-decoding held`,
+`--continuation-threshold`, and `--max-gap-ms` to override saved rules. To reproduce
+the old baseline, also set `--activity-threshold .95 --onset-threshold .995`.
+A playable MIDI alone is therefore **not** evidence of faithful reconstruction.
+
+Calibrate note assembly before evaluating the test split:
+
+```bash
+python -m improvnet.inference.local_vae_note_calibration \
+  --num-files 200 --bins-per-file 8 --batch-size 8 \
+  --cache-confidence --output-dir /new/validation-directory
+```
+
+This command uses validation only, keeps the clean reference as the scoring target,
+and caches **model** probabilities for complete contiguous windows. Candidate
+selection requires >=99% note recall and frame F1, no lower offset-aware F1 than
+the legacy baseline, <=2 ms mean release-error increase, <=0.1 percentage-point
+rapid-repeat recall loss, and <=0.5 percentage-point loss in releases within 20 ms.
+It selects highest note F1 among passing settings, then offset F1/release error.
+If none passes, no calibration is selected. `--save-calibration` explicitly saves
+selected metadata atomically, verifies unchanged learned weights/training step,
+and preserves an original checkpoint backup. No VAE retraining is performed.
+`--cached-validation /previous/validation-directory` reuses a cache from the exact
+same checkpoint and rechecks validation membership; use `--device cpu` to avoid
+GPU work while trying a different candidate grid.
 
 `readiness` is a deliberately conservative **heuristic**, not proof. Fewer than
 20 files / 128 bins gives `insufficient_evidence`. Otherwise it flags activity
@@ -427,12 +506,13 @@ python -m unittest discover -s tests -p test_local_vae_inference.py
 ```bash
 python -m improvnet.inference.local_vae_robustness \
   --num-files 200 --calibration-files 64 --bins-per-file 8 \
-  --draws 3 --onset-threshold 0.99 --batch-size 8
+  --draws 3 --split test --batch-size 8
 ```
 
 This **does not train or change the VAE**. It estimates per-channel latent spread
-from unaugmented training windows, then evaluates collection-balanced validation
-windows at fixed thresholds. Noise is `mean + alpha * training_channel_std * N(0,1)`.
+from unaugmented training windows, then evaluates collection-balanced held-out
+windows at fixed thresholds. The default split is validation; use `--split test`
+after choosing thresholds on validation. Noise is `mean + alpha * training_channel_std * N(0,1)`.
 Defaults test alpha 0, 0.005, 0.01, 0.02, 0.05, 0.10 and 0.20, plus ordinary
 posterior sampling as a control. These are noise **standard deviations**, not
 percentages of replaced notes or diffusion timesteps. Zero alpha is clean mean

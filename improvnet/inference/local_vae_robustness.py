@@ -1,4 +1,4 @@
-"""Frozen-VAE latent noise sweep; training-only scale, validation-only scores."""
+"""Frozen-VAE latent noise sweep; training-only scale, held-out scores."""
 import argparse
 from collections import Counter
 import csv
@@ -14,9 +14,10 @@ import torch
 
 from improvnet.inference.local_vae_evaluate import candidates
 from improvnet.inference.local_vae_inference import (
-    LatentStats, Scores, common_args, inputs, load_model, output_directory, resolve_thresholds, write_report,
+    LatentStats, Scores, common_args, inputs, load_model, note_decoding_options, output_directory, resolve_thresholds, write_report,
 )
 from improvnet.model.local_vae_model import Posterior
+from improvnet.utils.note_decoding import NoteDecoding, apply_note_decoding, confidence_arrays
 from improvnet.utils.local_vae_data import LocalVAEDataset, seed_for
 
 
@@ -100,6 +101,8 @@ def raw_metrics(score):
     result = {}
     for name in ("activity", "onset", "notes"):
         tp, fp, fn = (c[name + "_" + k] for k in ("tp", "fp", "fn"))
+        result[name + "_precision"] = tp / (tp + fp) if tp + fp else None
+        result[name + "_recall"] = tp / (tp + fn) if tp + fn else None
         result[name + "_f1"] = 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else None
     for name, num, den in (("onset_precision", "onset_tp", None), ("onset_recall", "onset_tp", None),
                            ("velocity_mae", "velocity_error", "active"), ("pedal_mae", "pedal_error", "pedal_cells"),
@@ -124,8 +127,11 @@ def average_scores(scores):
 
 
 @torch.inference_mode()
-def sweep(model, windows, scale, alphas, draws, seed, batch_size, activity_threshold, onset_threshold):
+def sweep(model, windows, scale, alphas, draws, seed, batch_size, activity_threshold, onset_threshold,
+          note_decoding=None):
     device = next(model.parameters()).device
+    options = note_decoding or getattr(model, "note_decoding", NoteDecoding())
+    options = options if isinstance(options, NoteDecoding) else NoteDecoding(**options)
     modes = [*alphas, "posterior"]
     totals = {mode: [Scores() for _ in range(draws)] for mode in modes}
     groups = {kind: {mode: [Scores() for _ in range(draws)] for mode in modes} for kind in {w["kind"] for w in windows}}
@@ -144,6 +150,7 @@ def sweep(model, windows, scale, alphas, draws, seed, batch_size, activity_thres
                 z = ((mean + (.5 * logvar).exp() * epsilon) * (weights > 0) if mode == "posterior"
                      else perturb(mean, scale, epsilon, mode, weights))
                 arrays = {k: [] for k in ("velocity", "onset", "pedal")}
+                confidence = {k: [] for k in ("activity", "onset", "velocity")}
                 for offset in range(0, len(mean), batch_size):
                     sl = slice(offset, offset + batch_size)
                     r = model.decode(z[sl])
@@ -152,12 +159,19 @@ def sweep(model, windows, scale, alphas, draws, seed, batch_size, activity_thres
                     for key, tensor in r.tensors(mask[sl], enabled[sl], activity_threshold=activity_threshold,
                                                  onset_threshold=onset_threshold).items():
                         arrays[key].append(tensor.cpu().numpy())
+                    if options.mode == "held":
+                        for key, value in confidence_arrays(r).items():
+                            confidence[key].append(value)
                 prediction = SimpleNamespace(**{k: np.concatenate(v) for k, v in arrays.items()},
                                              config=reference.config, valid_mask=reference.valid_mask)
+                if options.mode == "held":
+                    apply_note_decoding(prediction, np.arange(len(mean)),
+                        {k: np.concatenate(v) for k, v in confidence.items()}, options,
+                        activity_threshold=activity_threshold, onset_threshold=onset_threshold)
                 score = Scores(); score.arrays(reference, prediction); score.notes(reference, prediction)
                 totals[mode][draw].add(score); groups[window["kind"]][mode][draw].add(score)
         if (index + 1) % 20 == 0 or index + 1 == len(windows):
-            print(f"Noise sweep: {index + 1}/{len(windows)} validation files", flush=True)
+            print(f"Noise sweep: {index + 1}/{len(windows)} held-out files", flush=True)
     return totals, groups
 
 
@@ -194,7 +208,9 @@ def plot_report(report, output):
     for ax in axes.flat:
         ax.set_xlabel("Noise standard deviation (% of training latent channel std)")
         ax.grid(alpha=.2); ax.legend(fontsize=8)
-    fig.suptitle(f"Frozen local VAE · {report['validation_files']} validation files · onset threshold {report['thresholds']['onset']}\n"
+    files = report.get("evaluation_files", report.get("validation_files"))
+    split = report.get("evaluation_split", "validation")
+    fig.suptitle(f"Frozen local VAE · {files} {split} files · onset threshold {report['thresholds']['onset']}\n"
                  "Mean-latent perturbation; shading is noise-draw variability, not a confidence interval", fontsize=12)
     fig.savefig(output / "robustness.png", dpi=160); plt.close(fig)
     fig, ax = plt.subplots(figsize=(8, 4.5), constrained_layout=True)
@@ -223,6 +239,8 @@ def main(argv=None):
     parser.add_argument("--calibration-files", type=int, default=64)
     parser.add_argument("--bins-per-file", type=int, default=8)
     parser.add_argument("--draws", type=int, default=3)
+    parser.add_argument("--split", choices=("validation", "test"), default="validation",
+                        help="Use test after selecting decoding thresholds on validation")
     parser.add_argument("--alphas", nargs="+", type=float, default=[0., .005, .01, .02, .05, .1, .2])
     args = parser.parse_args(argv)
     if min(args.num_files, args.calibration_files, args.bins_per_file, args.draws, args.batch_size) < 1:
@@ -250,24 +268,30 @@ def main(argv=None):
         scale = channel_scale(train_stats)
         calibration_count = len(calibration); calibration_bins = train_stats.bins
         del calibration
-        windows, _, validation_skips = collect(model, tokenizer, config, "validation", args.num_files,
+        windows, _, validation_skips = collect(model, tokenizer, config, args.split, args.num_files,
             args.bins_per_file, args.seed, args.batch_size, writer)
     totals, groups = sweep(model, windows, scale, alphas, args.draws, args.seed, args.batch_size,
-                           args.activity_threshold, args.onset_threshold)
+                          args.activity_threshold, args.onset_threshold, note_decoding_options(args))
     collections = Counter(w["collection"] for w in windows)
     kinds = Counter(w["kind"] for w in windows)
     curve = [dict(alpha=alpha, **average_scores(totals[alpha])) for alpha in alphas]
     report = dict(checkpoint_step=step, checkpoint_sha256=digest, seed=args.seed,
-                  validation_files=len(windows), validation_bins=sum(len(w["reference"].velocity) for w in windows),
+                  evaluation_split=args.split, evaluation_files=len(windows),
+                  evaluation_bins=sum(len(w["reference"].velocity) for w in windows),
                   calibration_files=calibration_count, calibration_bins=calibration_bins, noise_draws=args.draws,
                   thresholds=dict(activity=args.activity_threshold, onset=args.onset_threshold),
+                  note_decoding=vars(note_decoding_options(args)),
                   training_channel_std=scale.tolist(), training_posterior_std=train_stats.report()["posterior_std"],
-                  validation_collections=dict(collections), target_files=dict(kinds),
+                  evaluation_collections=dict(collections), target_files=dict(kinds),
                   curve=curve, posterior_control=average_scores(totals["posterior"]),
                   by_target={kind: [dict(alpha=a, notes_f1=average_scores(values[a])["notes_f1"],
                                         onset_f1=average_scores(values[a])["onset_f1"]) for a in alphas]
                              for kind, values in groups.items()},
-                  skipped=dict(train=sum(train_skips.values()), validation=sum(validation_skips.values())))
+                  skipped={"train": sum(train_skips.values()), args.split: sum(validation_skips.values())})
+    if args.split == "validation":
+        # Retain the original report fields for existing validation analyses.
+        report.update(validation_files=report["evaluation_files"], validation_bins=report["evaluation_bins"],
+                      validation_collections=report["evaluation_collections"])
     write_report(output / "report.json", report)
     print("alpha | activity F1 | onset F1 | note F1 | velocity MAE", flush=True)
     for row in curve:
