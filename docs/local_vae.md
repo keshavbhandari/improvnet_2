@@ -9,7 +9,8 @@ stages; this does not change any AR or discrete-diffusion checkpoint.
 
 One coarse bin contains **all** its fine frames, not only its maximum-velocity
 and onset-count summaries. Defaults are 1 second / 10 ms = 100 frames. Each bin
-gets its own spatial latent grid, retaining pitch/time axes for future diffusion.
+gets one learned **256-value vector**. The internal convolutional features retain
+pitch/time order before a learned projection combines the complete second.
 
 | Batched field | Default shape | Meaning |
 | --- | --- | --- |
@@ -17,7 +18,7 @@ gets its own spatial latent grid, retaining pitch/time axes for future diffusion
 | `corrupted_roll` | `[B, 2, 128, 100]` | Optional perturbed encoder input; `roll` remains the clean target |
 | `pedal` | `[B, 1, 100]` | CC64 / 127; not duplicated across pitches |
 | `valid_mask` | `[B, 100]` | True for actual fine frames, false for trailing padding |
-| `latent` | `[B, C, 32, 25]` | C=4 in `vae176_latent4`, C=8 in `vae176`; sampled for training, mean for validation |
+| `latent` | `[B, 256, 1, 1]` | One vector per second in `vae176_vector256`; singleton axes preserve the diffusion API; sampled for training, mean for validation |
 | `events` | `[B, Emax, 11]` | Typed accompaniment rows, padded separately |
 | `event_positions` | `[B, Emax, 2]` | Start/end relative to this bin in fine frames |
 | `event_mask` | `[B, Emax]` | True for actual accompaniment rows |
@@ -42,11 +43,21 @@ have a sustain channel. Existing same-pitch overlap normalization applies.
 - A convolutional 2-D residual encoder downsamples pitch and time by 4.
 - The backbone starts at **176 channels**, about **62.22M parameters**
   (retained baseline: 96 channels, 18.55M parameters).
-  Latent shape and 1-second / 10-ms clock are unchanged.
+  The 1-second / 10-ms clock is unchanged. Vector256 has 64,632,440 parameters
+  including its learned global compression/expansion projections.
 - A separate 1-D encoder handles pedal; hidden pedal features fuse into the
   posterior. Stored pedal remains one value per frame.
 - The diagonal Gaussian posterior has learned mean/log-variance. Its decoder
   receives **only the latent**: no encoder-to-decoder shortcut can bypass it.
+- With `LATENT_LAYOUT="vector"`, fused encoder features are projected to four
+  internal feature planes and flattened in pitch/time order. A linear layer
+  predicts the vector's Gaussian mean/log-variance. The decoder learns a linear
+  expansion back to those internal planes before convolutional reconstruction.
+  These planes are reconstructed from the vector, never passed around it.
+  No `tanh` bounds the latent; stage 2 learns per-coordinate mean/std normalization.
+  `LATENT_CHANNELS=256` specifies vector width here; spatial mode still interprets
+  it as the number of pitch/time planes. Legacy checkpoint configs default to
+  spatial mode and retain their existing state keys.
 - Separate heads reconstruct activity, onsets, nonzero velocity and pedal.
   The activity head gates velocity; the onset head distinguishes repeated attacks
   with unchanged velocity. No attacks are fabricated at coarse-bin boundaries.
@@ -256,7 +267,7 @@ Architecture, world size, data index and optimization settings must match for an
 exact resume. Logging cadence, worker count and cache budget may change. An
 unrelated checkpoint in the run directory is refused, not overwritten.
 
-The default save directory is `artifacts/vae/vae176_latent4`. The
+The default save directory is `artifacts/vae/vae176_vector256`. The
 176-channel model must start fresh, not resume a 96-channel checkpoint. Existing
 checkpoint architecture metadata still lets inference load older models;
 model state keys and default inference behavior have not changed. Once the new
@@ -299,13 +310,20 @@ Reuse the same command/name to resume that experiment. Existing-checkpoint guard
 still prevent replacing a different architecture, even with `--allow-resume-changes`.
 `--save-dir` is an alternative explicit path, mutually exclusive with `--run-name`.
 Reconstruction tools accept `--checkpoint` pointing to either run's `best_model.pt`;
-their default follows `SAVE_DIR`, currently `vae176_latent4`. Pass
+their default follows `SAVE_DIR`, currently `vae176_vector256`. Pass
 `--checkpoint /.../artifacts/vae/baseline96/best_model.pt` to evaluate the baseline.
 
 Width 176 yields **62,221,828 parameters** versus 18,548,468 at width 96. This
 matches the approximate parameter budget of Huang et al.'s released VAE, not its
 architecture/compression ratio. `vae176` uses `[8,32,25]`; the current
-`vae176_latent4` run uses `[4,32,25]`. For a
+retired `vae176_latent4` run used `[4,32,25]` (3,200 values per second).
+`vae176_vector256` uses `[256,1,1]` (256 values per second, 12.5x fewer).
+The 176-wide convolutional backbone is retained; this experiment reduces the
+information bottleneck, not the backbone width. Smaller vectors do not guarantee
+better diffusion or 99% reconstruction: evaluate clean/robust note scores and
+recalibrate held-note decoding on validation after training. The old VAE and
+diffusion checkpoint folders were removed at the user's request; historical
+evaluation reports and shared VAE TensorBoard logs remain. For a
 capacity-only comparison keep the data, loss settings and effective batch fixed
 where practical. The new defaults also change onset positive-class share to 20%,
 so this default run compares the combined capacity/loss update, not capacity alone.

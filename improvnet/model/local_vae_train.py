@@ -53,7 +53,9 @@ class ResumableBatchSampler(BatchSampler):
 def model_config(config):
     return LocalVAEConfig(frames_per_bin=config.COARSE_MS // config.FINE_MS,
                           base_channels=config.BASE_CHANNELS, channel_multipliers=tuple(config.CHANNEL_MULTIPLIERS),
-                          latent_channels=config.LATENT_CHANNELS, res_blocks=config.RES_BLOCKS)
+                          latent_channels=config.LATENT_CHANNELS, res_blocks=config.RES_BLOCKS,
+                          latent_layout=getattr(config, "LATENT_LAYOUT", "spatial"),
+                          vector_projection_channels=getattr(config, "VECTOR_PROJECTION_CHANNELS", 4))
 
 
 def configure_run_directory(config):

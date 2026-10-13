@@ -9,17 +9,17 @@ GIGAMIDI_METADATA = DATASETS["gigamidi"] + "/Final-Metadata-Extended-GigaMIDI-Da
 GIGAMIDI_GENRE_FIELDS = ("music_styles_curated",)
 INDEX_PATH = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/local_vae_dataset/midi_index_gigamidi_genres.sqlite"
 
-VAE_CHECKPOINT = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/vae/vae176_latent4/best_model.pt"
+VAE_CHECKPOINT = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/vae/vae176_vector256/best_model.pt"
 # Fresh stage-2 run: older diffusion checkpoints use a different frozen encoder.
-SAVE_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/latent_diffusion_vae176_latent4"
-EVALUATION_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/latent_diffusion_vae176_latent4_evaluation"
+SAVE_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/latent_diffusion_vae176_vector256"
+EVALUATION_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/latent_diffusion_vae176_vector256_evaluation"
 
-HISTORY_BINS = 32
-TARGET_BINS = 128
-PATCH_PITCH = 4
-PATCH_TIME = 5
+HISTORY_BINS = 8
+TARGET_BINS = 32
+PATCH_PITCH = 1
+PATCH_TIME = 1
 D_MODEL = 512
-N_LAYERS = 12
+N_LAYERS = 16
 N_HEADS = 8
 FF_MULTIPLIER = 4
 GRADIENT_CHECKPOINTING = True
@@ -43,8 +43,8 @@ PITCH_SHIFT_RANGE = (-5, 6)
 CACHE_MB_PER_WORKER = 128
 MAX_DATA_RETRIES = 16
 LOG_DATA_ERRORS = False
-NUM_WORKERS = 8
-LATENT_CALIBRATION_SAMPLES = 128  # Training windows; up to 16,384 target bins at TARGET_BINS=128.
+NUM_WORKERS = 16
+LATENT_CALIBRATION_SAMPLES = 512  # Training windows;
 VAE_BATCH_SIZE = 16
 
 BATCH_SIZE = 32  # Windows per GPU, not individual VAE bins; not yet benchmarked.
@@ -59,7 +59,7 @@ BETAS = (.9, .95)
 WEIGHT_DECAY = .01
 GRAD_CLIP = 1.
 EMA_DECAY = .999
-LOG_EVERY = 10
+LOG_EVERY = 1
 VALIDATE_EVERY = 1000
 SAVE_EVERY = 1000
 RESUME_TRAINING = True

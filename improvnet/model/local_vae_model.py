@@ -1,7 +1,8 @@
 """Unconditional local VAE for complete fine-frame patches, not coarse summaries.
 
 Velocity/onset use a 2-D encoder; pedal uses a separate 1-D encoder. Fusion is in
-hidden features only. No encoder-to-decoder skip connections can bypass latents.
+hidden features only. A global vector or a spatial grid forms the bottleneck.
+No encoder-to-decoder skip connections can bypass latents.
 The model config class lives here; local_vae_config.py contains only values.
 """
 from dataclasses import dataclass
@@ -21,11 +22,16 @@ class LocalVAEConfig:
     channel_multipliers: tuple = (1, 2, 4)
     latent_channels: int = 8
     res_blocks: int = 2
+    latent_layout: str = "spatial"
+    vector_projection_channels: int = 4
 
     def __post_init__(self):
         if any(isinstance(v, bool) or not isinstance(v, int) or v < 1 for v in
-               (self.frames_per_bin, self.base_channels, self.latent_channels, self.res_blocks)):
+               (self.frames_per_bin, self.base_channels, self.latent_channels, self.res_blocks,
+                self.vector_projection_channels)):
             raise ValueError("VAE dimensions must be positive integers")
+        if self.latent_layout not in ("spatial", "vector"):
+            raise ValueError("Latent layout must be spatial or vector")
         if len(self.channel_multipliers) < 2 or any(isinstance(v, bool) or not isinstance(v, int) or v < 1 for v in self.channel_multipliers):
             raise ValueError("Use at least two positive channel multipliers")
         if 128 % self.factor:
@@ -37,6 +43,9 @@ class LocalVAEConfig:
 
     @property
     def latent_shape(self):
+        if self.latent_layout == "vector":
+            # Singleton spatial axes keep the encoder/decoder/diffusion API shared.
+            return (self.latent_channels, 1, 1)
         return (self.latent_channels, 128 // self.factor, math.ceil(self.frames_per_bin / self.factor))
 
 
@@ -117,9 +126,21 @@ class LocalVAE(nn.Module):
                 roll.append(nn.Conv2d(width, widths[index + 1], 3, stride=2, padding=1))
                 pedal.append(nn.Conv1d(width, widths[index + 1], 3, stride=2, padding=1))
         self.roll_encoder, self.pedal_encoder = nn.Sequential(*roll), nn.Sequential(*pedal)
-        self.posterior_head = nn.Conv2d(2 * widths[-1], 2 * c.latent_channels, 1)
-        decoder = [nn.Conv2d(c.latent_channels, widths[-1], 3, padding=1)]
-        pedal_decoder = [nn.Conv1d(c.latent_channels, widths[-1], 3, padding=1)]
+        if c.latent_layout == "vector":
+            # Learn a global code from the complete ordered pitch/time grid.
+            # Projection before flattening avoids a huge dense feature matrix.
+            projected = c.vector_projection_channels
+            self.grid_shape = (projected, 128 // c.factor, math.ceil(c.frames_per_bin / c.factor))
+            grid_values = math.prod(self.grid_shape)
+            self.posterior_head = nn.Conv2d(2 * widths[-1], projected, 1)
+            self.vector_posterior = nn.Linear(grid_values, 2 * c.latent_channels)
+            self.vector_decoder = nn.Linear(c.latent_channels, grid_values)
+            decoder_channels = projected
+        else:
+            self.posterior_head = nn.Conv2d(2 * widths[-1], 2 * c.latent_channels, 1)
+            decoder_channels = c.latent_channels
+        decoder = [nn.Conv2d(decoder_channels, widths[-1], 3, padding=1)]
+        pedal_decoder = [nn.Conv1d(decoder_channels, widths[-1], 3, padding=1)]
         for index in reversed(range(len(widths))):
             width = widths[index]
             decoder.extend(Residual(width) for _ in range(c.res_blocks))
@@ -150,13 +171,24 @@ class LocalVAE(nn.Module):
         pedal = F.pad(pedal.masked_fill(~valid_mask[:, None], 0), (0, missing))
         h = self.roll_encoder(torch.cat((roll, mask[:, :, None].expand(-1, -1, 128, -1)), dim=1))
         p = self.pedal_encoder(torch.cat((pedal, mask), dim=1))
-        mean, logvar = self.posterior_head(torch.cat((h, p[:, :, None].expand_as(h)), dim=1)).float().chunk(2, dim=1)
-        weights = F.avg_pool1d(mask, c.factor, c.factor)[:, :, None]
+        features = self.posterior_head(torch.cat((h, p[:, :, None].expand_as(h)), dim=1))
+        if c.latent_layout == "vector":
+            # Mask fully padded feature columns before the global projection.
+            grid_valid = F.avg_pool1d(mask, c.factor, c.factor) > 0
+            features = features.masked_fill(~grid_valid[:, :, None], 0)
+            parameters = self.vector_posterior(features.flatten(1))[:, :, None, None]
+            weights = valid_mask.float().mean(-1)[:, None, None, None]
+        else:
+            parameters = features
+            weights = F.avg_pool1d(mask, c.factor, c.factor)[:, :, None]
+        mean, logvar = parameters.float().chunk(2, dim=1)
         return Posterior(mean * (weights > 0), logvar.clamp(-20, 10) * (weights > 0), weights)
 
     def decode(self, latent):
         if latent.ndim != 4 or tuple(latent.shape[1:]) != self.config.latent_shape:
             raise ValueError("Latent shape does not match local VAE config")
+        if self.config.latent_layout == "vector":
+            latent = self.vector_decoder(latent.flatten(1)).reshape(len(latent), *self.grid_shape)
         f = self.config.frames_per_bin
         r = self.roll_head(self.roll_decoder(latent))[:, :, :, :f]
         p = self.pedal_head(self.pedal_decoder(latent.mean(dim=2)))[:, :, :f]

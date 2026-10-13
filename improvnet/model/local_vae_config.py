@@ -17,7 +17,7 @@ INDEX_PATH = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/local_v
 # Checkpoints: vae/<run>/; logs: vae/tensorboard/<run>/.
 RUNS_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/vae"
 TENSORBOARD_ROOT = RUNS_DIR + "/tensorboard"
-RUN_NAME = "vae176_latent4"
+RUN_NAME = "vae176_vector256"
 SAVE_DIR = RUNS_DIR + "/" + RUN_NAME
 DATA_SPLIT_SEED = 42
 DATA_SPLIT_RATIOS = {"train": .97, "validation": .02, "test": .01}
@@ -29,7 +29,9 @@ MAX_FRAMES = 360000
 # No genre/instrument/accompaniment conditioning in the VAE.
 BASE_CHANNELS = 176
 CHANNEL_MULTIPLIERS = (1, 2, 4)
-LATENT_CHANNELS = 4
+LATENT_LAYOUT = "vector"
+LATENT_CHANNELS = 256  # Vector width; stored as [256,1,1], one vector per second.
+VECTOR_PROJECTION_CHANNELS = 4  # Internal grid features, not additional latent codes.
 RES_BLOCKS = 2
 
 SEED = 42
@@ -50,7 +52,7 @@ BATCH_SIZE = 64  # Per GPU; conservative initial setting, not a measured maximum
 VALIDATION_BATCH_SIZE = 16
 MAX_VALIDATION_BATCHES = 100
 ACCUM_STEPS = 1
-N_STEPS = 100000
+N_STEPS = 200000
 LR = 1e-4
 MIN_LR = 1e-5
 WARMUP_STEPS = 1000
@@ -81,10 +83,10 @@ LATENT_JITTER_WEIGHT = .5
 LATENT_JITTER_MAX_STD = .10  # Uniform 0..10% of detached clean-batch channel std.
 LATENT_JITTER_VALIDATION_STD = .10  # Fixed 10% stress test, not diffusion time.
 ROBUSTNESS_WARMUP_STEPS = 5000  # Ramp auxiliary weights and training jitter std.
-ACTIVITY_THRESHOLD = .95  # Calibrated held-note START threshold for the 92k best checkpoint.
+ACTIVITY_THRESHOLD = .95  # Initial metric threshold; recalibrate on the new run.
 ONSET_THRESHOLD = .985
-# Held-note continuation (.70) and gap allowance (10 ms) live in the checkpoint's
-# decoder_calibration.note_decoding; they are inference rules, not training loss.
+# Held-note continuation/gap settings require validation calibration after training;
+# the previous spatial VAE's calibration does not certify this new architecture.
 # Joint validation calibration; fixed-threshold tags above remain comparable.
 # Select on clean + latent-jitter branches, not ambiguous semantic recovery.
 CALIBRATE_THRESHOLDS = True

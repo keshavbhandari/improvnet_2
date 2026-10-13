@@ -1,18 +1,27 @@
 # Stage 2: continuous latent diffusion
 
-The existing local VAE is frozen. Stage 2 generates its spatial latents over
-**128 adjacent one-second bins**, with up to **32 preceding clean bins** in the same
+The trained local VAE is frozen. The new `vae176_vector256` defaults generate
+one 256-value latent vector over each of **32 adjacent one-second bins**, with up
+to **8 preceding clean bins** in the same
 canvas. Each bin has its own noise embedding: history stays at zero noise, target
 bins share a randomly sampled diffusion time. Loss applies only to valid target
-latents, with fractional weights for partially padded columns. The first 5% of
+latents, with fractional weights for partially valid seconds (or partially padded
+columns for legacy spatial VAEs). The first 5% of
 sampled windows start at the beginning of a piece, without history.
 
 Model, training and values-only config are `latent_diffusion_model.py`,
 `latent_diffusion_train.py`, and `latent_diffusion_config.py`. Defaults are a
-512-wide, 12-layer transformer with spatial latent patches, cosine Gaussian
+512-wide, 16-layer transformer, cosine Gaussian
 diffusion, v-prediction, deterministic DDIM sampling, and EMA inference weights.
 This is an adaptation, not a reproduction of Huang's or TD-Paint's architecture.
 It does not reuse or modify the AR/discrete-diffusion models.
+
+The vector VAE exposes shape `[256,1,1]`; 1x1 patches yield **one token per second,
+40 tokens per window**, rather than the old spatial run's 32,000 tokens. Every
+token contains the full second's vector. Musical conditioning tokens are unchanged.
+Train/evaluate the new VAE before starting diffusion; both stages use fresh
+`vae176_vector256` run paths. Normalization is calibrated afresh for all 256
+coordinates. Existing diffusion weights cannot be resumed with this encoder.
 
 ## Musical conditions
 
@@ -195,6 +204,19 @@ excluding a preserved prompt. Transfer/reconstruction stop at source exhaustion;
 continuation can extend it. History uses committed generated latents directly,
 avoiding repeated decode/re-encode degradation. MIDI decoding assembles the entire
 roll continuously, so sustained notes are not split at bin boundaries.
+
+Inference restores window lengths, patch sizes, width, depth, heads and latent
+normalization from the selected diffusion checkpoint, rather than the current
+training config. The retired spatial `[4,32,25]` VAE with 1x1 patches used 800
+tokens per second and 32,000 tokens per window. The vector `[256,1,1]` VAE uses
+one token per second and 40 tokens per window. Generation advances by 32 target
+bins and retains the last 8 generated latent bins as history. Short final windows
+are padded and masked. `--max-bins` controls total generated length independently
+of the trained window size, so longer outputs use multiple windows.
+The report records the restored settings under `diffusion_architecture`.
+Conflicting saved model/window settings are rejected before sampling. Changing
+the live config cannot turn an older checkpoint into a new architecture; choose
+a checkpoint trained with the desired settings using `--checkpoint`.
 
 ## Reading the small report
 

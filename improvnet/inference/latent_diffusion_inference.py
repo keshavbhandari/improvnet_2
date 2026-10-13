@@ -1,6 +1,7 @@
 """Stage-2 transfer/reconstruction/continuation with concise, separated error diagnostics."""
 import argparse
 from copy import deepcopy
+from dataclasses import asdict
 import json
 from pathlib import Path
 import tempfile
@@ -19,17 +20,36 @@ from improvnet.utils.latent_diffusion_data import collate_windows, window_tensor
 from improvnet.utils.note_decoding import NoteDecoding, apply_note_decoding, confidence_arrays
 
 
+def validate_inference_config(model_config, config):
+    """Window construction and attention must describe the same saved architecture."""
+    fields = {
+        "HISTORY_BINS": "history_bins", "TARGET_BINS": "target_bins",
+        "PATCH_PITCH": "patch_pitch", "PATCH_TIME": "patch_time",
+        "D_MODEL": "d_model", "N_LAYERS": "n_layers", "N_HEADS": "n_heads",
+        "FF_MULTIPLIER": "ff_multiplier", "MAX_ACCOMPANIMENT_TRACKS": "max_tracks",
+        "MAX_ACCOMPANIMENT_EVENTS": "max_events",
+        "RHYTHM_FRAMES_PER_TOKEN": "rhythm_frames_per_token",
+    }
+    conflicts = [name for name, field in fields.items()
+                 if getattr(config, name, None) != getattr(model_config, field)]
+    if conflicts:
+        raise ValueError("Inference settings differ from the diffusion checkpoint architecture: "
+                         + ", ".join(conflicts))
+
+
 def load_model(path, device, *, vae_checkpoint=None, use_ema=True):
     state = torch.load(path, map_location="cpu", weights_only=False)
     if state.get("format") != "latent_diffusion_training_v1":
         raise ValueError("Expected a stage-2 latent diffusion checkpoint")
     config = SimpleNamespace(**state["train_config"])
+    architecture = LatentDiffusionConfig(**state["model_config"])
+    validate_inference_config(architecture, config)
     vae_path = Path(vae_checkpoint or config.VAE_CHECKPOINT)
     if checkpoint_digest(vae_path) != state["vae_sha256"]:
         raise ValueError("This stage-2 checkpoint belongs to a different VAE; decoder/latents cannot be mixed")
     vae, tokenizer, vae_step, _ = load_vae(vae_path, device)
     vae.requires_grad_(False)
-    model = LatentDiffusionModel(LatentDiffusionConfig(**state["model_config"]))
+    model = LatentDiffusionModel(architecture)
     c = model.config
     if tuple(vae.config.latent_shape) != (c.latent_channels, c.latent_pitch, c.latent_time) or vae.config.frames_per_bin != c.frames_per_bin:
         raise ValueError("Stage-2 latent shape differs from its frozen VAE")
@@ -105,6 +125,7 @@ def diagnostics(reference, vae_baseline, prediction, ids, latent_squared_sum, la
 def generate(model, vae, normalizer, piece, config, *, genre=0, task="transfer", prompt_bins=0,
              max_bins=32, steps=48, strength=1., mode="full", events=None, seed=42,
              activity_threshold=None, onset_threshold=None, progress=True, note_decoding=None):
+    validate_inference_config(model.config, config)
     calibration = getattr(vae, 'decoder_calibration', None) or {}
     activity_threshold = calibration.get('activity_threshold', .5) if activity_threshold is None else activity_threshold
     onset_threshold = calibration.get('onset_threshold', .99) if onset_threshold is None else onset_threshold
@@ -211,6 +232,9 @@ def generate(model, vae, normalizer, piece, config, *, genre=0, task="transfer",
     output.refresh_coarse().validate(); baseline.refresh_coarse().validate()
     ids = np.arange(prompt_bins, length)
     report = diagnostics(reference, baseline, output, ids, latent_squared_sum, latent_cells, task)
+    report["diffusion_architecture"] = dict(asdict(model.config),
+        tokens_per_bin=int(np.prod(model.config.spatial_grid)),
+        tokens_per_window=int(model.config.bins * np.prod(model.config.spatial_grid)))
     report["note_decoding"] = vars(options)
     report["accompaniment"] = dict(mode=mode, max_tracks=config.MAX_ACCOMPANIMENT_TRACKS,
         event_budget=config.MAX_ACCOMPANIMENT_EVENTS, max_tracks_used=max(b["tracks"] for b in blocks),
@@ -257,7 +281,7 @@ def main(argv=None):
     parser.add_argument("--max-bins", type=int, default=32, help="Generated bins, excluding the preserved prompt")
     parser.add_argument("--passes", type=int, default=48)
     parser.add_argument("--noise-strength", type=float, default=1.)
-    parser.add_argument("--accompaniment-mode", choices=("full", "rhythm", "none"), default="full")
+    parser.add_argument("--accompaniment-mode", choices=("full", "rhythm", "none"), default="rhythm")
     parser.add_argument("--accompaniment-midi", type=Path, help="Optional external conditioning MIDI; not mixed into output")
     parser.add_argument("--reference-time-scale", type=float, default=1., help="Explicit external rhythm/tempo alignment")
     parser.add_argument("--reference-offset-seconds", type=float, default=0.)

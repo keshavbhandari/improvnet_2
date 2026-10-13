@@ -51,6 +51,7 @@ def midi(notes, programs=None, pedal=()):
 def config(**values):
     c = {k: v for k, v in vars(defaults).items() if k.isupper()}
     c.update(BASE_CHANNELS=4, CHANNEL_MULTIPLIERS=(1, 2), LATENT_CHANNELS=2, RES_BLOCKS=1,
+             LATENT_LAYOUT="spatial",
              NUM_WORKERS=0, SAMPLES_PER_EPOCH=4, VALIDATION_SAMPLES=4, BATCH_SIZE=2,
              VALIDATION_BATCH_SIZE=2, ACCUM_STEPS=2, N_STEPS=4, LR=1e-3, MIN_LR=1e-4,
              WARMUP_STEPS=1, KL_WARMUP_STEPS=2, LOG_EVERY=1, VALIDATE_EVERY=2,
@@ -138,6 +139,39 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(output.reconstruction.velocity.shape[-1], 101)
         self.assertAlmostEqual(output.posterior.weights[0, 0, 0, 24].item(), .75)
         self.assertFalse(output.latent[..., 25].any())
+
+    def test_vector_bottleneck_reconstruction_padding_and_gradients(self):
+        _, batch = sample_batch()
+        model = LocalVAE(LocalVAEConfig(base_channels=4, res_blocks=1,
+                                       latent_layout="vector", latent_channels=256))
+        output = model(batch["roll"], batch["pedal"], batch["valid_mask"],
+                       corrupted_roll=batch["roll"].clone(), latent_jitter_std=.1)
+        self.assertEqual(output.latent.shape, (2, 256, 1, 1))
+        self.assertEqual(output.posterior.weights.shape, (2, 1, 1, 1))
+        torch.testing.assert_close(output.posterior.weights.flatten(), batch["valid_mask"].float().mean(-1))
+        loss = sum(v.mean() for branch in (output, output.denoising, output.jittered)
+                   for v in reconstruction_losses(branch, batch).values())
+        loss.backward()
+        self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters()))
+        model.eval()
+        clean = model.encode(batch["roll"], batch["pedal"], batch["valid_mask"])
+        broken = deepcopy(batch)
+        broken["roll"].masked_fill_(~broken["valid_mask"][:, None, None], float("nan"))
+        broken["pedal"].masked_fill_(~broken["valid_mask"][:, None], float("nan"))
+        other = model.encode(broken["roll"], broken["pedal"], broken["valid_mask"])
+        torch.testing.assert_close(clean.mean, other.mean)
+        self.assertEqual(model.decode(clean.mean).velocity.shape, (2, 128, 100))
+
+    def test_vector_config_has_one_global_code_and_unbounded_posterior(self):
+        c = model_config(config(LATENT_LAYOUT="vector", LATENT_CHANNELS=256))
+        self.assertEqual(c.latent_shape, (256, 1, 1))
+        model = LocalVAE(c)
+        with torch.no_grad():
+            model.vector_posterior.weight.zero_()
+            model.vector_posterior.bias[:256].fill_(2.)
+        _, batch = sample_batch()
+        p = model.encode(batch["roll"], batch["pedal"], batch["valid_mask"])
+        self.assertTrue((p.mean == 2).all())
 
     def test_deterministic_mode_and_seeded_posterior(self):
         _, batch = sample_batch()
@@ -438,6 +472,28 @@ class DataTests(unittest.TestCase):
 
 
 class TrainingTests(unittest.TestCase):
+    def test_vector_training_checkpoint_resume_and_inference_reload(self):
+        from improvnet.inference.local_vae_inference import load_model
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            c = fixture(root)
+            c.LATENT_LAYOUT, c.LATENT_CHANNELS = "vector", 256
+            request = root / "checkpoint_request"
+            request.touch()
+            with patch.dict(os.environ, CHECKPOINT_REQUEST_FILE=str(request)), redirect_stdout(io.StringIO()):
+                train(c, force_cpu=True)
+            request.unlink()
+            with redirect_stdout(io.StringIO()):
+                train(c, force_cpu=True)
+            path = Path(c.SAVE_DIR) / "latest_checkpoint.pt"
+            loaded, _, step, _ = load_model(path, "cpu")
+            self.assertEqual(step, c.N_STEPS)
+            self.assertEqual(loaded.config.latent_shape, (256, 1, 1))
+            _, batch = sample_batch()
+            with torch.no_grad():
+                result = loaded(batch["roll"], batch["pedal"], batch["valid_mask"], sample=False)
+            self.assertTrue(torch.isfinite(result.reconstruction.velocity).all())
+
     def test_extended_cosine_schedule_preserves_lr_and_round_trips(self):
         c = config(N_STEPS=50000, WARMUP_STEPS=1000, LR=1e-4, MIN_LR=1e-5)
         curve = CosineLRSchedule(c)

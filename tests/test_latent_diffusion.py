@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import mido
 import numpy as np
@@ -55,15 +56,16 @@ def config(**kwargs):
     return SimpleNamespace(**values)
 
 
-def fixture(mode="full", start=1):
-    c = config()
-    vae = LocalVAE(LocalVAEConfig(base_channels=4, res_blocks=1)).eval().requires_grad_(False)
+def fixture(mode="full", start=1, *, latent_channels=8, **overrides):
+    c = config(**overrides)
+    vae = LocalVAE(LocalVAEConfig(base_channels=4, res_blocks=1,
+                                latent_channels=latent_channels)).eval().requires_grad_(False)
     piece = HierarchicalTokenizer().encode(midi())
     item = window_tensors(piece, start, c, mode=mode)
     item["retries"] = torch.tensor(0)
     batch = collate_windows([item])
     model = LatentDiffusionModel(model_config(c, vae, ("<unconditioned>", "classical", "jazz")))
-    normalizer = LatentNormalizer(torch.zeros(8), torch.ones(8))
+    normalizer = LatentNormalizer(torch.zeros(latent_channels), torch.ones(latent_channels))
     return c, vae, piece, batch, model, normalizer
 
 
@@ -163,6 +165,31 @@ class Stage2Tests(unittest.TestCase):
             self.assertTrue(torch.isfinite(stats).all())
             self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters()))
             self.assertTrue(all(p.grad is None for p in vae.parameters()))
+
+    def test_vector_vae_one_token_per_bin_diffusion_and_sampling(self):
+        c, _, piece, batch, _, _ = fixture("rhythm", PATCH_PITCH=1, PATCH_TIME=1)
+        vae = LocalVAE(LocalVAEConfig(base_channels=4, res_blocks=1,
+                       latent_layout="vector", latent_channels=256)).eval().requires_grad_(False)
+        model = LatentDiffusionModel(model_config(c, vae, ("unconditioned", "jazz")))
+        norm = LatentNormalizer(torch.zeros(256), torch.ones(256))
+        z, w = encode_windows(vae, batch, 1)
+        self.assertEqual(z.shape, (1, 3, 256, 1, 1))
+        self.assertEqual(model.patchify(z).flatten(1, 3).shape, (1, 3, 256))
+        loss, stats = batch_objective(model, vae, norm, batch, c)
+        loss.backward()
+        self.assertTrue(torch.isfinite(stats).all())
+        self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters()))
+        self.assertTrue(all(p.grad is None for p in vae.parameters()))
+        model.eval()
+        generated = sample(model, z, batch["known"], w, batch, steps=2)
+        torch.testing.assert_close(generated[batch["known"]], z[batch["known"]])
+        self.assertEqual(vae.decode(generated.flatten(0, 1)).velocity.shape, (3, 128, 100))
+        output, baseline, reference, report = generate(model, vae, norm, piece, c,
+            task="reconstruct", prompt_bins=1, max_bins=3, steps=2, strength=.2,
+            progress=False, note_decoding=NoteDecoding('held', .5, 20))
+        self.assertEqual(report["diffusion_architecture"]["tokens_per_bin"], 1)
+        self.assertEqual(report["diffusion_architecture"]["tokens_per_window"], 3)
+        torch.testing.assert_close(torch.from_numpy(output.velocity[:1]), torch.from_numpy(reference.velocity[:1]))
 
     def test_padding_and_inactive_modalities_are_invariant(self):
         c, vae, _, batch, model, _ = fixture("rhythm", start=0)
@@ -266,6 +293,72 @@ class Stage2Tests(unittest.TestCase):
             path = Path(tmp) / "generated.mid"
             HierarchicalTokenizer().decode(output).save(path)
             self.assertTrue(len(mido.MidiFile(path).tracks) > 0)
+
+    def test_unit_patch_generation_reuses_latent_history_and_partial_window(self):
+        c, vae, piece, _, model, norm = fixture("none", latent_channels=4,
+                                               PATCH_PITCH=1, PATCH_TIME=1)
+        calls = []
+
+        def checked_sample(model, source, known, weights, conditioning, **kwargs):
+            if calls:
+                torch.testing.assert_close(source[:, :1], calls[-1][1][:, -1:], rtol=0, atol=0)
+            result = sample(model, source, known, weights, conditioning, **kwargs)
+            calls.append((source.clone(), result.clone(), weights.clone()))
+            return result
+
+        with patch("improvnet.inference.latent_diffusion_inference.sample", side_effect=checked_sample):
+            output, _, _, report = generate(model.eval(), vae, norm, piece, c, task="reconstruct",
+                prompt_bins=1, max_bins=3, steps=2, strength=.2, mode="none", progress=False,
+                note_decoding=NoteDecoding("held", .5, 20))
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(calls[-1][2][:, -1].any())
+        np.testing.assert_array_equal(output.velocity[0], piece.velocity[0])
+        self.assertEqual(report["diffusion_architecture"]["tokens_per_bin"], 800)
+        self.assertEqual(report["diffusion_architecture"]["latent_channels"], 4)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "unit-patch.mid"
+            HierarchicalTokenizer().decode(output).save(path)
+            self.assertTrue(mido.MidiFile(path).tracks)
+
+    def test_generation_rejects_mismatched_window_settings_before_sampling(self):
+        c, vae, piece, _, model, norm = fixture()
+        for name, value in (("HISTORY_BINS", 8), ("TARGET_BINS", 32), ("PATCH_TIME", 1)):
+            other = deepcopy(c)
+            setattr(other, name, value)
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, name):
+                generate(model, vae, norm, piece, other, progress=False)
+
+    def test_current_unit_patch_checkpoint_ignores_live_architecture_defaults(self):
+        c, vae, _, _, model, norm = fixture(latent_channels=4, HISTORY_BINS=8, TARGET_BINS=32,
+            PATCH_PITCH=1, PATCH_TIME=1, N_LAYERS=16)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vae_path, checkpoint = root / "vae.pt", root / "diffusion.pt"
+            torch.save(dict(format="local_vae_training_v1", model_config=asdict(vae.config),
+                model_state_dict=vae.state_dict(), step=35, train_config=dict(COARSE_MS=1000, FINE_MS=10,
+                PIANO_PROGRAMS=tuple(range(8)), MAX_FRAMES=360000)), vae_path)
+            c.VAE_CHECKPOINT = str(vae_path)
+            state = dict(format="latent_diffusion_training_v1", model_config=asdict(model.config),
+                train_config=vars(c), genres=["<unconditioned>", "classical", "jazz"],
+                model_state_dict=model.state_dict(), ema_state_dict=model.state_dict(),
+                normalizer=norm.state_dict(), vae_sha256=checkpoint_digest(vae_path), step=7)
+            torch.save(state, checkpoint)
+            with patch.multiple(defaults, HISTORY_BINS=32, TARGET_BINS=128,
+                                PATCH_PITCH=4, PATCH_TIME=5, N_LAYERS=12):
+                for use_ema in (True, False):
+                    loaded, _, _, normalizer, saved, info = load_model(checkpoint, torch.device("cpu"), use_ema=use_ema)
+                    self.assertEqual(loaded.config, model.config)
+                    self.assertEqual((saved.HISTORY_BINS, saved.TARGET_BINS), (8, 32))
+                    self.assertEqual(info["weights"], "ema" if use_ema else "raw")
+                    torch.testing.assert_close(normalizer.std, norm.std)
+                    z = torch.randn(1, 40, 4, 32, 25)
+                    tokens = loaded.patchify(z)
+                    self.assertEqual(tokens.shape, (1, 40, 32, 25, 4))
+                    torch.testing.assert_close(loaded.unpatchify(tokens), z, rtol=0, atol=0)
+            state["train_config"] = dict(vars(c), HISTORY_BINS=32)
+            torch.save(state, checkpoint)
+            with self.assertRaisesRegex(ValueError, "HISTORY_BINS"):
+                load_model(checkpoint, torch.device("cpu"))
 
     def test_continuation_can_extend_an_entire_source_prompt(self):
         c, vae, piece, _, model, norm = fixture("none")
