@@ -118,9 +118,14 @@ torchrun --standalone --nproc_per_node=4 -m improvnet.model.masked_diffusion_tra
 The sibling `run_scripts/improvnet/masked_multi_node_launch.sh` replaces the
 uniform launcher, including its coordinated checkpoint request. The model starts
 fresh in `artifacts/masked_diffusion_v1`; AR weights and runs are not overwritten.
-Resume restores optimizer, scheduler, scaler, per-rank RNG and weighted data
-position. Architecture, sampling/optimization settings, world size and data
-identity must match. Validation reports the fixed-noise objective and masked
+Resume restores optimizer, scheduler, scaler, existing per-rank RNG and weighted
+data position. GPU count, batch size and accumulation may change in the same
+folder: the saved global sample position is rounded down to a complete new
+batch, potentially replaying fewer than one global batch. New ranks receive
+independent deterministic seeds. The trainer prints the effective-batch change;
+learning rate is not automatically rescaled. Such continuation is approximate,
+not an exact replay. Architecture, other sampling/optimization settings and data
+identity must match; errors list the incompatible fields. Validation reports the fixed-noise objective and masked
 accuracy; neither metric proves successful classical-to-jazz transfer.
 
 ## Inference
