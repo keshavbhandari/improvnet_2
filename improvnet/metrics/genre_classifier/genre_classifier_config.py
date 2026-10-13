@@ -8,7 +8,7 @@ JSONL_FILES = (
 )
 ARTIFACT_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/genre_classifier"
 
-# Independent encoder architecture, matching the uniform-diffusion backbone.
+# Independent encoder architecture, matching the AR backbone size.
 # Vocabulary, padding ID and genre count are derived by the trainer.
 EMBED_DIM = 2048
 N_HEADS = 16

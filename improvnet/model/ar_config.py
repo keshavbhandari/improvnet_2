@@ -55,8 +55,9 @@ VAL_EVERY = 10000
 # Save independently of validation so long Slurm jobs can always resume.
 CHECKPOINT_EVERY = 2000
 
-MISC_JSONL = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/misc_data_tokenized.jsonl"
-GIGAMIDI_JSONL = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/gigamidi_data_tokenized.jsonl"
+# Existing AR-tokenized JSONLs were retained here during the raw-MIDI reorganization.
+MISC_JSONL = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data_old/misc_data_tokenized.jsonl"
+GIGAMIDI_JSONL = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data_old/gigamidi_data_tokenized.jsonl"
 
 JSONL_FILES = [
     MISC_JSONL,
