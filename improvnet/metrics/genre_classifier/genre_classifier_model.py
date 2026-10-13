@@ -1,4 +1,4 @@
-"""Bidirectional genre encoder with the uniform-diffusion backbone architecture.
+"""Bidirectional genre encoder with an AR-sized transformer backbone.
 
 Independent parameters and local primitives: importing this module does not
 import/change AR or diffusion training configs. No conditioning or LM head.
