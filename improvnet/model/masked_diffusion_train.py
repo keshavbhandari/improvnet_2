@@ -53,6 +53,63 @@ def summarize(stats):
                 masked_accuracy=float(stats[2]) / max(1, float(stats[3])))
 
 
+def data_identity(c):
+    return {path: (os.stat(path).st_size, os.stat(path).st_mtime_ns,
+        os.stat(path.replace('.jsonl', '_index.pkl')).st_mtime_ns) for path in c.JSONL_FILES}
+
+
+def resume_plan(state, c, current_model_config, world, batches_per_epoch=None):
+    """Keep optimizer progress when GPU/batch layout changes, as in the AR trainer.
+
+    Match the saved global data position to a complete batch in the new layout.
+    This can repeat fewer than one new global batch and is not an exact replay.
+    """
+    ignored = {"NUM_WORKERS", "LOG_EVERY", "VAL_EVERY", "CHECKPOINT_EVERY",
+               "RESUME_TRAINING", "SAVE_DIR", "BATCH_SIZE", "ACCUM_STEPS"}
+    settings = {k: v for k, v in vars(c).items() if k.isupper() and k not in ignored}
+    saved = {k: v for k, v in state.get("train_config", {}).items() if k not in ignored}
+    problems = []
+    if state.get("format") != FORMAT:
+        problems.append("checkpoint format")
+    if state.get("model_config") != current_model_config:
+        problems.append("model architecture")
+    problems.extend(k for k in sorted(settings.keys() | saved.keys()) if settings.get(k) != saved.get(k))
+    if state.get("data_identity") != data_identity(c):
+        problems.append("data files/index identity")
+    if problems:
+        raise ValueError("Incompatible masked-diffusion checkpoint/settings/data: " +
+                         ", ".join(problems) + ". Use a fresh SAVE_DIR for these changes.")
+    old_world = state["world_size"]
+    old_batch = state["train_config"]["BATCH_SIZE"]
+    old_accum = state["train_config"]["ACCUM_STEPS"]
+    changed = (old_world, old_batch, old_accum) != (world, c.BATCH_SIZE, c.ACCUM_STEPS)
+    epoch, next_batch = state["epoch"], state["next_batch"]
+    repeated = 0
+    if changed:
+        consumed = next_batch * old_batch * old_world
+        next_batch = consumed // (c.BATCH_SIZE * world)
+        repeated = consumed - next_batch * c.BATCH_SIZE * world
+        if batches_per_epoch is not None and next_batch >= batches_per_epoch:
+            epoch, next_batch = epoch + 1, 0
+    return dict(changed=changed, epoch=epoch, next_batch=next_batch,
+        repeated_examples=repeated, old_world=old_world, new_world=world,
+        old_effective_batch=old_world * old_batch * old_accum,
+        new_effective_batch=world * c.BATCH_SIZE * c.ACCUM_STEPS)
+
+
+def restore_checkpoint_rng(state, c, rank, device):
+    rank_states = state.get("rng", [])
+    if rank < len(rank_states):
+        rng = rank_states[rank]
+        random.setstate(rng["python"]); torch.set_rng_state(rng["torch"].cpu())
+        if device.type == "cuda" and rng.get("cuda") is not None:
+            torch.cuda.set_rng_state(rng["cuda"], device)
+    else:
+        # Additional ranks must not clone rank zero's random corruption stream.
+        seed = c.SEED + 1000003 * state["step"] + rank
+        random.seed(seed); torch.manual_seed(seed)
+
+
 @torch.inference_mode()
 def evaluate(model, loader, device, seed):
     training = model.training
@@ -96,8 +153,7 @@ def save_state(model, optimizer, scheduler, scaler, c, *, step, epoch, next_batc
         model_state_dict=raw.state_dict(), optimizer_state_dict=optimizer.state_dict(),
         scheduler_state_dict=scheduler.state_dict(), scaler_state_dict=scaler.state_dict(),
         step=step, epoch=epoch, next_batch=next_batch, best_val=best_val, world_size=world, rng=rng,
-        data_identity={path: (os.stat(path).st_size, os.stat(path).st_mtime_ns,
-            os.stat(path.replace('.jsonl', '_index.pkl')).st_mtime_ns) for path in c.JSONL_FILES})
+        data_identity=data_identity(c))
     directory = Path(c.SAVE_DIR); directory.mkdir(parents=True, exist_ok=True)
     for name in (["latest_checkpoint.pt", "best_model.pt"] if best else ["latest_checkpoint.pt"]):
         pending = directory / (name + f".tmp.{os.getpid()}")
@@ -136,21 +192,19 @@ def train(c, *, force_cpu=False):
             if not c.RESUME_TRAINING:
                 raise FileExistsError("Use a fresh SAVE_DIR or enable resume")
             state = torch.load(latest, map_location="cpu", weights_only=False)
-            ignored = {"NUM_WORKERS", "LOG_EVERY", "VAL_EVERY", "CHECKPOINT_EVERY", "RESUME_TRAINING", "SAVE_DIR"}
-            settings = {k: v for k, v in vars(c).items() if k.isupper() and k not in ignored}
-            saved = {k: v for k, v in state.get("train_config", {}).items() if k not in ignored}
-            identity = {path: (os.stat(path).st_size, os.stat(path).st_mtime_ns,
-                os.stat(path.replace('.jsonl', '_index.pkl')).st_mtime_ns) for path in c.JSONL_FILES}
-            if state.get("format") != FORMAT or state["model_config"] != asdict(model.config) or settings != saved or state["world_size"] != world or state["data_identity"] != identity:
-                raise ValueError("Incompatible masked-diffusion checkpoint/settings/data; use a fresh SAVE_DIR")
+            plan = resume_plan(state, c, asdict(model.config), world, sampler.size // c.BATCH_SIZE)
             model.load_state_dict(state["model_state_dict"])
             optimizer.load_state_dict(state["optimizer_state_dict"])
             scheduler.load_state_dict(state["scheduler_state_dict"]); scaler.load_state_dict(state["scaler_state_dict"])
-            step, epoch, next_batch, best_val = (state[k] for k in ("step", "epoch", "next_batch", "best_val"))
-            rng = state["rng"][rank]
-            random.setstate(rng["python"]); torch.set_rng_state(rng["torch"].cpu())
-            if device.type == "cuda":
-                torch.cuda.set_rng_state(rng["cuda"], device)
+            step, best_val = state["step"], state["best_val"]
+            epoch, next_batch = plan["epoch"], plan["next_batch"]
+            restore_checkpoint_rng(state, c, rank, device)
+            if rank == 0 and plan["changed"]:
+                print(f"Continuing checkpoint step {step}: GPUs {plan['old_world']} -> {world}; "
+                      f"effective batch {plan['old_effective_batch']} -> {plan['new_effective_batch']}. "
+                      "Model, optimizer and scheduler restored; learning rate unchanged. "
+                      f"Data continuation is approximate; up to {plan['repeated_examples']} examples "
+                      "are replayed at the new batch boundary. New ranks use separate random seeds.", flush=True)
             del state
         elif (directory / "best_model.pt").exists():
             raise FileExistsError("Best checkpoint exists without latest checkpoint; use a fresh directory")

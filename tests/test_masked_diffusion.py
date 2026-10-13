@@ -18,7 +18,7 @@ import torch.multiprocessing as mp
 
 from improvnet.model import masked_diffusion_config as defaults
 from improvnet.model.masked_diffusion_model import MaskedDiffusionConfig, MaskedDiffusionModel
-from improvnet.model.masked_diffusion_train import train
+from improvnet.model.masked_diffusion_train import train, resume_plan
 from improvnet.inference.masked_diffusion_inference import load_model, transfer, main as inference_main
 from improvnet.utils.ar_utils import ProcessData
 from improvnet.utils.masked_diffusion import corrupt, masked_loss, prepare_canvas, denoise, batch_objective
@@ -284,6 +284,38 @@ class MaskedDiffusionTests(unittest.TestCase):
             self.assertEqual(state["world_size"], 2)
             self.assertEqual(len(state["rng"]), 2)
             self.assertEqual(state["step"], 2)
+
+    def test_resume_same_folder_from_one_rank_to_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); c = tiny_config(root)
+            request = root / "request"; request.touch()
+            with patch.dict(os.environ, CHECKPOINT_REQUEST_FILE=str(request)), redirect_stdout(io.StringIO()):
+                train(c, force_cpu=True)
+            request.unlink()
+            path = Path(c.SAVE_DIR) / "latest_checkpoint.pt"
+            before = torch.load(path, weights_only=False)
+            self.assertEqual(before["step"], 1)
+            self.assertEqual(before["world_size"], 1)
+            plan = resume_plan(before, c, before["model_config"], 2)
+            self.assertTrue(plan["changed"])
+            self.assertEqual(plan["next_batch"] * c.BATCH_SIZE * 2,
+                             before["next_batch"] * c.BATCH_SIZE)
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0)); port = sock.getsockname()[1]
+            mp.spawn(distributed_worker, args=(c, port), nprocs=2, join=True)
+            after = torch.load(path, weights_only=False)
+            self.assertEqual(after["step"], c.N_STEPS)
+            self.assertEqual(after["world_size"], 2)
+            self.assertEqual(len(after["rng"]), 2)
+            for values in after["optimizer_state_dict"]["state"].values():
+                self.assertEqual(int(values["step"]), c.N_STEPS)
+            changed = deepcopy(c); changed.BATCH_SIZE = 3; changed.ACCUM_STEPS = 1
+            batch_plan = resume_plan(before, changed, before["model_config"], 2)
+            self.assertTrue(batch_plan["changed"])
+            self.assertLess(batch_plan["repeated_examples"], 6)
+            changed.ELASTICITY_MAX = .25
+            with self.assertRaisesRegex(ValueError, "ELASTICITY_MAX"):
+                resume_plan(before, changed, before["model_config"], 2)
 
 
 def math_log2():
