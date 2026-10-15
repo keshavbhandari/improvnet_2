@@ -18,8 +18,10 @@ SEQ_LEN = 8192  # Includes prompt + response; two conditioning positions are res
 PAD_ID = 2
 IGNORE_INDEX = -100
 
-WINDOW_MS = 5000
-CONTEXT_WINDOWS = 1  # Left and right performance context, each this many windows.
+CHUNK_TOKENS = 3000  # Corrupted input cap; also the clean melody/rhythm response cap.
+HISTORY_TOKENS = 2048
+HISTORY_PROB = 0.5  # Clean left history during training; never provide right context.
+HARMONY_EXPANSION = 3.0  # Inference reserves arrangement space per melody token.
 SKYLINE_TOLERANCE_MS = 50
 MAX_CORRUPTIONS = 3
 TASK_WEIGHTS = (0.35, 0.30, 0.35)  # refine, rhythm, harmonize

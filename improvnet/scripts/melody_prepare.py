@@ -132,13 +132,7 @@ def prepare(root=cfg.DATA_ROOT, output=cfg.DATA_FILE, max_files=0, workers=0):
                 melody, harmony = (notes, []) if mono else skyline(notes, cfg.SKYLINE_TOLERANCE_MS)
                 selected = {id(n) for n in melody}
                 melody_indices = [i for i, n in enumerate(notes) if id(n) in selected]
-                total_counts = Counter(n.onset // cfg.WINDOW_MS for n in notes)
-                melody_counts = Counter(n.onset // cfg.WINDOW_MS for n in melody)
-                windows = [w for w in sorted(melody_counts)
-                           if total_counts[w] * 12 + 32 < cfg.SEQ_LEN]
-                harmony_windows = [w for w in windows if total_counts[w] > melody_counts[w]] if not mono else []
-                if not windows:
-                    raise ValueError('No nonempty window fits the token budget')
+                has_harmony = not mono and bool(harmony)
                 # Group transposed copies too. Full tune fingerprint avoids
                 # grouping unrelated songs solely by a shared short lick.
                 fingerprint = hashlib.sha256(json.dumps([
@@ -151,9 +145,9 @@ def prepare(root=cfg.DATA_ROOT, output=cfg.DATA_FILE, max_files=0, workers=0):
                 connect(idx, 'title:' + normalized_title if normalized_title else '')
                 record = dict(path=str(path), source=source, genre=genre, title=title,
                               notes=[astuple(n) for n in notes], melody_indices=melody_indices,
-                              windows=windows, harmony_windows=harmony_windows)
+                              has_harmony=has_harmony)
                 rows.append(dict(offset=handle.tell(), source=source, genre=genre,
-                                 has_harmony=bool(harmony_windows), sha256=digest))
+                                 has_harmony=has_harmony, sha256=digest))
                 handle.write((json.dumps(record, separators=(',', ':')) + '\n').encode())
                 seen_hashes.add(digest)
                 counts[source] += 1
@@ -170,7 +164,7 @@ def prepare(root=cfg.DATA_ROOT, output=cfg.DATA_FILE, max_files=0, workers=0):
         row['group'] = group
         row['split'] = ('train' if number < cfg.DATA_SPLIT_RATIOS['train'] else
                         'validation' if number < cfg.DATA_SPLIT_RATIOS['train'] + cfg.DATA_SPLIT_RATIOS['validation'] else 'test')
-    index = dict(version=1, tokenizer=tok.signature(), window_ms=cfg.WINDOW_MS,
+    index = dict(version=2, tokenizer=tok.signature(),
                  skyline_tolerance_ms=cfg.SKYLINE_TOLERANCE_MS, rows=rows)
     report = dict(prepared=len(rows), sources=dict(counts),
                   splits=dict(Counter(r['split'] for r in rows)), errors=errors,

@@ -31,7 +31,8 @@ python -m improvnet.scripts.melody_prepare
 This writes `prepared/performances.jsonl`, its byte-offset index and a report.
 It refuses to overwrite an existing prepared dataset. For an independent smoke
 test, use `--max-files 20 --output /tmp/melody_pilot.jsonl`.
-Conversion uses four CPU workers by default; `--workers 0` runs serially.
+Conversion uses `NUM_WORKERS` from the config; `--workers 0` runs serially.
+Existing prepared full-performance records can be reused for the longer chunks.
 
 The preparer reads ARIA's copied jazz/blues selection, Weimar, PiJAMA, Doug
 McKenzie and the 213 labelled WikiMT Jazz scores. Other lead sheets can be added
@@ -50,7 +51,15 @@ run. Overlap with the original AR pretraining corpus is not yet audited.
 
 Settings are in `improvnet/model/melody_config.py`, using the AR architecture and
 optimizer conventions. Start with a short pilot and adjust the **per-GPU** batch
-size for the available hardware. The default is batch 2, accumulation 8.
+size for the available hardware. Your current batch 48, accumulation 1 and run
+directory are retained.
+Training uses up to 3,000 corrupted-source tokens, up to 3,000 serialized clean
+melody/rhythm tokens, and clean left history 50% of the time (up to 2,048 tokens).
+There is no right context. Source, complete target, history and all structural/
+conditioning positions must fit within 8,192. Harmonization budgets its denser
+arrangement response jointly with its input. Note-adding corruptions are measured
+after application; oversized examples are shortened at whole onset groups and
+corrupted again, without truncating targets or note attributes.
 The config sets `N_STEPS = 20000` optimizer updates, with 500 warmup updates and
 learning-rate decay over the final 5,000 updates. No step argument is required.
 Treat 20,000 as an initial ceiling and select checkpoints using validation and
@@ -70,6 +79,8 @@ a fresh optimizer/schedule. Later launches resume this run's checkpoint,
 including its optimizer, schedule, data position and RNG state. Resume requires
 unchanged batch size, accumulation, world size and checkpointed task/data settings.
 The AR checkpoint itself is never overwritten.
+The new left-only prompt protocol rejects old short-window fine-tuning
+checkpoints; it requires training with the new format.
 
 The trainer follows the existing AR loop: DDP, AMP, accumulation, gradient
 clipping, TensorBoard, validation and atomic resumable checkpoints. Only response
@@ -98,6 +109,13 @@ Use `--melody-strength 0` to preserve melody pitches before testing timing and
 harmony. Timing responses keep the note count, instrument and pitch/velocity
 unless `--free-timing-pitches` is set. `--temperature 0` selects greedy decoding;
 `--seed` makes sampling repeatable on the same hardware/software.
+
+Each pass starts without history. Later chunks receive only generated output
+from earlier chunks of that pass, capped at 2,048 tokens. Chunks advance through
+the original input independently of generated note counts. The checkpoint stores
+chunk/history limits and the harmony output-space ratio (`HARMONY_EXPANSION`).
+Generation enforces the remaining 8K budget while reserving complete notes and
+an end token; the JSON report records each chunk's token budget and history size.
 
 The output is accompanied by `.melody.mid`, `.refine.mid`, `.rhythm.mid` files for
 applicable stages and a JSON report. Harmonization generates a complete arrangement

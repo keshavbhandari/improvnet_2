@@ -228,6 +228,6 @@ def mask_timing(notes, fraction, rng, tokenizer=None):
     return tokens
 
 
-def make_prompt(task, source_tokens, left=(), right=()):
+def make_prompt(task, source_tokens, left=()):
     return ([TASK_TOKENS[task], *left, "<SEP>", *source_tokens,
-             "<SEP>", *right, "<SEP>", "<S>"])
+             "<SEP>", "<S>"])

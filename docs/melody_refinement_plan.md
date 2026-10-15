@@ -8,7 +8,7 @@ full fine-tuning run and listening evaluation remain future work.
 
 Use the existing AR tokenizer unchanged for musical events: each note is
 `instrument, (pitch, velocity), onset_ms, duration_ms`. Timing resolution is 10 ms;
-`<T>` advances the clock by 5,000 ms. Notes are assigned to windows by onset, and
+`<T>` advances the clock by 5,000 ms. Notes are assigned to chunks by onset, and
 held-note durations can extend through the boundary without creating an attack.
 
 Three task tokens are appended to the original 2,778 IDs, giving 2,781 tokens:
@@ -27,22 +27,38 @@ their original default behavior.
 
 ```text
 continuous genre/instrument/strength conditions
-<TASK> left_context <SEP> corrupted_center <SEP> right_context <SEP>
+<TASK> optional_clean_left_history <SEP> corrupted_chunk <SEP>
 <S> complete_target_response <E>
 ```
 
-Each nonempty context/source stream has its own `<S>`/`<E>` wrapper and local
-millisecond clock. With default settings the center and each context side span
-5 seconds. The two continuous conditioning positions, prompt and response all
-fit within the configured 8,192-position budget; context is dropped first when
-necessary. Dense examples that cannot fit are excluded during preparation.
+Each nonempty history/source stream has its own `<S>`/`<E>` wrapper and local
+millisecond clock. There is no right context. Chunks use token budgets rather
+than fixed durations: `CHUNK_TOKENS=3000` caps the corrupted source and the
+serialized clean melody/rhythm response. `HISTORY_PROB=0.5` provides a clean
+left prefix on half the training examples, capped at `HISTORY_TOKENS=2048`.
+For a short piece fitting one chunk, history examples start at a later attack
+when possible. A one-attack piece cannot supply a nonempty earlier history.
+
+Full-length melody/rhythm examples with history use about 8,053 positions.
+`SEQ_LEN=8192` includes history, source, response, wrappers, separators, task
+token and both continuous conditioning positions. Harmonization fits the actual
+melody-plus-retained-harmony source and full arrangement response jointly;
+its denser response may exceed 3,000 tokens, so its source may be shorter.
+No example exceeds the full 8K budget.
+
+Budget checks happen **after corruption and serialization**, so note additions,
+removals and all `<T>` tokens count. If the source or combined stream is too long,
+shorten the clean chunk by whole onset groups and reapply corruption with the
+same RNG state. Never truncate a target, split note attributes, or split a
+simultaneous chord. Shrinking must make progress; an individual onset group that
+cannot fit raises an explicit error rather than looping. History keeps complete
+notes from the tail and resets its clock at the first retained attack.
 
 Teacher forcing predicts every response attribute, including copied attributes,
 note count and required structural tokens. Prompt and padding labels are ignored.
 The initial response `<S>` is supplied like a decoder start symbol. `<T>` is
-needed in streams spanning multiple 5-second segments; a single center window
-does not need one. `<D>` remains reserved in the base vocabulary and is not
-introduced into these short task examples. Only valid musical tokens can be
+needed in streams spanning multiple 5-second segments. `<D>` remains reserved
+in the base vocabulary and is not introduced into these task examples. Only valid musical tokens can be
 sampled by inference's note grammar.
 
 ## Corruptions and strength
@@ -111,12 +127,15 @@ The preparer writes one record per performance plus a byte-offset index. It
 hash-deduplicates files and groups title/full-melody-fingerprint matches before
 a deterministic 90/5/5 split. Full melody fingerprints are transposition invariant;
 they do not guarantee detection of every arrangement or alternate performance.
+Full-performance prepared records from the earlier fixed-window implementation
+are reusable; old window lists are ignored. New preparation stores full notes
+without excluding dense five-second spans.
 Original AR pretraining overlap is explicitly not audited yet, so held-out
 fine-tuning results must not be described as proof of unseen-composition ability.
 
 Sampling balances task, genre and source rather than letting raw ARIA file count
 dominate. Defaults are 35% melody refinement, 30% timing and 35% harmonization.
-Each example gets a new window, strength and edits each epoch. Validation examples
+Each example gets a new chunk, strength and edits each epoch. Validation examples
 remain fixed. Paired pitch augmentation is applied to context, source and target.
 
 ## Harmonization supervision
@@ -125,8 +144,8 @@ For each polyphonic performance, let `P` be all notes, `M` the skyline selection
 and `H` the remaining original notes. The source is `M` plus a randomly retained
 fraction of `H`; strength controls the fraction of harmony removed. The response
 is the complete original `P`. At strength one, source is melody only, matching
-harmonization inference. Context sides randomly use full performance or melody,
-so melody-only future context is represented during training.
+harmonization inference. Optional clean left history is the preceding arrangement;
+melody/rhythm tasks use the preceding clean melody. Neither task sees future context.
 
 Melody and harmony must come from the same aligned performance. Unrelated
 monophonic and polyphonic datasets cannot be paired as supervised harmonization
@@ -148,9 +167,12 @@ AdamW, scheduler, gradient clipping, TensorBoard and resumable atomic checkpoint
 structure. The first launch migrates AR weights only, appends task rows and starts
 a new optimizer/schedule. Subsequent launches restore the fine-tuning run state.
 Checkpoint metadata records exact vocabulary, model settings, genre ordering,
-windowing and data-index hash. Resume rejects incompatible settings.
+chunk/history budgets and data-index hash. The left-only protocol has metadata
+version 2; old short-window fine-tuning checkpoints cannot resume into it. Resume
+rejects incompatible settings. The configured batch size, accumulation and run
+directory remain user-controlled.
 
-Default settings: batch 2 per GPU, accumulation 8, learning rate 2e-5, warmup 500,
+Current settings: batch 48 per GPU, accumulation 1, learning rate 2e-5, warmup 500,
 and 20,000 optimizer updates, with learning-rate decay over the final 5,000
 updates. The step count is set by `N_STEPS` in `melody_config.py`; the standard
 training command needs no step argument. Treat this as an initial fine-tuning
@@ -158,11 +180,26 @@ ceiling, not a benchmarked optimum, and select checkpoints using per-task
 validation curves and listening results.
 
 `melody_inference.py` extracts a classical melody, optionally refines it, restores
-new timing and harmonizes. It can process a full piece window by window and run
-multiple melody/timing passes. Timing decoding preserves note count and
+new timing and harmonizes. It processes a full piece chunk by chunk and can run
+multiple melody/timing passes. Each pass starts with **no history**, then uses
+only that pass's generated output as left history for subsequent chunks (up to
+2,048 tokens). Original classical left history and right context are never
+provided. Input ownership advances through all source notes even if corruption
+removes notes or generation changes their count. Timing decoding preserves note count and
 pitch/velocity/instrument by default while generating onsets and durations;
 free attribute generation is also available. Use melody strength zero for the
 first timing-plus-harmony experiment, then gradually permit melodic changes.
+
+Inference uses checkpointed budgets. Melody/rhythm sources are capped at 3,000
+tokens and reserve a complete response of up to 2,999 new tokens (the initial
+`<S>` is already in the prompt). Harmony reserves more output space using
+`HARMONY_EXPANSION=3.0`, an adjustable estimate of arrangement tokens per source
+melody token; the hard bound is still the actual remaining 8K context. At every
+note start the grammar reserves four attributes plus `<E>`; a `<T>` also reserves
+room for a subsequent complete note. This permits added notes without cutting
+off a response mid-note. Fixed-pitch timing additionally checks room for every
+anchored note and required clock marker. Per-chunk budgets/history lengths are
+written to the inference JSON report.
 
 Saved stage MIDIs and JSON counts allow comparison of input melody, refinement,
 timing and final arrangement. Check recognizability, motif/contour retention,

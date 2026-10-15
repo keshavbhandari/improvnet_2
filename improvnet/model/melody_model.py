@@ -59,9 +59,10 @@ def initialize_from_ar(model, checkpoint):
 
 def checkpoint_metadata(model, config):
     index = Path(config.DATA_FILE).with_suffix('.index.json')
-    return dict(version=1, model_kwargs=model.model_kwargs,
+    return dict(version=2, model_kwargs=model.model_kwargs,
                 tokenizer=MelodyTokenizer().signature(), genres=list(config.GENRES),
-                window_ms=config.WINDOW_MS, context_windows=config.CONTEXT_WINDOWS,
+                chunk_tokens=config.CHUNK_TOKENS, history_tokens=config.HISTORY_TOKENS,
+                history_prob=config.HISTORY_PROB, harmony_expansion=config.HARMONY_EXPANSION,
                 skyline_tolerance_ms=config.SKYLINE_TOLERANCE_MS,
                 seq_len=config.SEQ_LEN, max_corruptions=config.MAX_CORRUPTIONS,
                 task_weights=list(config.TASK_WEIGHTS), data_seed=config.DATA_SPLIT_SEED,
@@ -71,7 +72,9 @@ def checkpoint_metadata(model, config):
 
 def validate_checkpoint(checkpoint, expected=None):
     meta = checkpoint.get('refinement')
-    if not meta or meta.get('version') != 1:
+    if meta and meta.get('version') == 1:
+        raise ValueError('Old short-window checkpoint: use a new long-chunk run with the left-only prompt format')
+    if not meta or meta.get('version') != 2:
         raise ValueError('Expected a melody-refinement checkpoint, not the original AR checkpoint')
     if meta['tokenizer'] != MelodyTokenizer().signature():
         raise ValueError('Tokenizer differs from the checkpoint')
