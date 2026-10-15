@@ -162,23 +162,26 @@ class ARTransformerBlock(nn.Module):
 
 
 class ARContextModel(nn.Module):
-    def __init__(self):
+    def __init__(self, vocab_size=VOCAB_SIZE, embed_dim=EMBED_DIM,
+                 n_heads=N_HEADS, n_kv_heads=N_KV_HEADS, n_layers=N_LAYERS,
+                 num_genres=NUM_GENRES, num_instruments=NUM_INSTRUMENTS,
+                 dropout=0.1):
         super().__init__()
         
-        self.token_emb = nn.Embedding(VOCAB_SIZE, EMBED_DIM)
+        self.token_emb = nn.Embedding(vocab_size, embed_dim)
         
         # Conditioning Embeddings
-        self.genre_emb = nn.Embedding(NUM_GENRES, EMBED_DIM)
-        self.multihot_proj = nn.Linear(NUM_INSTRUMENTS, EMBED_DIM, bias=False)
+        self.genre_emb = nn.Embedding(num_genres, embed_dim)
+        self.multihot_proj = nn.Linear(num_instruments, embed_dim, bias=False)
         
         self.layers = nn.ModuleList([
             ARTransformerBlock(
-                EMBED_DIM, N_HEADS, N_KV_HEADS, ffn_mult=8/3, dropout=0.1
-            ) for _ in range(N_LAYERS)
+                embed_dim, n_heads, n_kv_heads, ffn_mult=8/3, dropout=dropout
+            ) for _ in range(n_layers)
         ])
         
-        self.out_norm = RMSNorm(EMBED_DIM)
-        self.lm_head = nn.Linear(EMBED_DIM, VOCAB_SIZE, bias=False)
+        self.out_norm = RMSNorm(embed_dim)
+        self.lm_head = nn.Linear(embed_dim, vocab_size, bias=False)
         self._init_weights()
 
     def _init_weights(self):
@@ -195,7 +198,8 @@ class ARContextModel(nn.Module):
 
     def forward(
         self, target, genre=None, multi_hot=None, 
-        seq_offset=0, use_cache=False, past_key_values=None, return_hidden=False
+        seq_offset=0, use_cache=False, past_key_values=None, return_hidden=False,
+        extra_condition=None,
     ):
         B, T = target.shape
         device = target.device
@@ -208,10 +212,12 @@ class ARContextModel(nn.Module):
         
         if is_first_step:
             if genre is None: genre = torch.zeros(B, dtype=torch.long, device=device)
-            if multi_hot is None: multi_hot = torch.zeros((B, NUM_INSTRUMENTS), dtype=torch.float32, device=device)
+            if multi_hot is None: multi_hot = torch.zeros((B, self.multihot_proj.in_features), dtype=torch.float32, device=device)
             
             # Prepend the 2 stylistic control vectors to the very start of the sequence
             e_genre = self.genre_emb(genre).unsqueeze(1)
+            if extra_condition is not None:
+                e_genre = e_genre + extra_condition.unsqueeze(1)
             e_mh = self.multihot_proj(multi_hot).unsqueeze(1)
             
             x = torch.cat([e_genre, e_mh, x], dim=1) 
