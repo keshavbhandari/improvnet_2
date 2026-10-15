@@ -58,7 +58,8 @@ def data_identity(c):
         os.stat(path.replace('.jsonl', '_index.pkl')).st_mtime_ns) for path in c.JSONL_FILES}
 
 
-def resume_plan(state, c, current_model_config, world, batches_per_epoch=None):
+def resume_plan(state, c, current_model_config, world, batches_per_epoch=None, *,
+                allow_rhythm_dropout_change=False):
     """Keep optimizer progress when GPU/batch layout changes, as in the AR trainer.
 
     Match the saved global data position to a complete batch in the new layout.
@@ -66,6 +67,8 @@ def resume_plan(state, c, current_model_config, world, batches_per_epoch=None):
     """
     ignored = {"NUM_WORKERS", "LOG_EVERY", "VAL_EVERY", "CHECKPOINT_EVERY",
                "RESUME_TRAINING", "SAVE_DIR", "BATCH_SIZE", "ACCUM_STEPS"}
+    if allow_rhythm_dropout_change:
+        ignored.add("RHYTHM_DROP_PROB")
     settings = {k: v for k, v in vars(c).items() if k.isupper() and k not in ignored}
     saved = {k: v for k, v in state.get("train_config", {}).items() if k not in ignored}
     problems = []
@@ -82,6 +85,7 @@ def resume_plan(state, c, current_model_config, world, batches_per_epoch=None):
     old_world = state["world_size"]
     old_batch = state["train_config"]["BATCH_SIZE"]
     old_accum = state["train_config"]["ACCUM_STEPS"]
+    old_dropout = state["train_config"]["RHYTHM_DROP_PROB"]
     changed = (old_world, old_batch, old_accum) != (world, c.BATCH_SIZE, c.ACCUM_STEPS)
     epoch, next_batch = state["epoch"], state["next_batch"]
     repeated = 0
@@ -92,6 +96,8 @@ def resume_plan(state, c, current_model_config, world, batches_per_epoch=None):
         if batches_per_epoch is not None and next_batch >= batches_per_epoch:
             epoch, next_batch = epoch + 1, 0
     return dict(changed=changed, epoch=epoch, next_batch=next_batch,
+        rhythm_dropout_changed=old_dropout != c.RHYTHM_DROP_PROB,
+        old_rhythm_dropout=old_dropout, new_rhythm_dropout=c.RHYTHM_DROP_PROB,
         repeated_examples=repeated, old_world=old_world, new_world=world,
         old_effective_batch=old_world * old_batch * old_accum,
         new_effective_batch=world * c.BATCH_SIZE * c.ACCUM_STEPS)
@@ -163,7 +169,7 @@ def save_state(model, optimizer, scheduler, scaler, c, *, step, epoch, next_batc
             pending.unlink(missing_ok=True)
 
 
-def train(c, *, force_cpu=False):
+def train(c, *, force_cpu=False, allow_rhythm_dropout_change=False):
     validate_config(c)
     rank, world, local_rank = (int(os.environ.get(k, default)) for k, default in
                              (("RANK", 0), ("WORLD_SIZE", 1), ("LOCAL_RANK", 0)))
@@ -192,13 +198,19 @@ def train(c, *, force_cpu=False):
             if not c.RESUME_TRAINING:
                 raise FileExistsError("Use a fresh SAVE_DIR or enable resume")
             state = torch.load(latest, map_location="cpu", weights_only=False)
-            plan = resume_plan(state, c, asdict(model.config), world, sampler.size // c.BATCH_SIZE)
+            plan = resume_plan(state, c, asdict(model.config), world, sampler.size // c.BATCH_SIZE,
+                               allow_rhythm_dropout_change=allow_rhythm_dropout_change)
             model.load_state_dict(state["model_state_dict"])
             optimizer.load_state_dict(state["optimizer_state_dict"])
             scheduler.load_state_dict(state["scheduler_state_dict"]); scaler.load_state_dict(state["scaler_state_dict"])
             step, best_val = state["step"], state["best_val"]
             epoch, next_batch = plan["epoch"], plan["next_batch"]
             restore_checkpoint_rng(state, c, rank, device)
+            if rank == 0 and plan["rhythm_dropout_changed"]:
+                print(f"Continuing checkpoint step {step}: rhythm dropout "
+                      f"{plan['old_rhythm_dropout']:.2f} -> {plan['new_rhythm_dropout']:.2f}. "
+                      "Model, optimizer, scheduler and data position restored; "
+                      "rhythm conditioning changes for new training examples.", flush=True)
             if rank == 0 and plan["changed"]:
                 print(f"Continuing checkpoint step {step}: GPUs {plan['old_world']} -> {world}; "
                       f"effective batch {plan['old_effective_batch']} -> {plan['new_effective_batch']}. "
@@ -292,6 +304,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="improvnet.model.masked_diffusion_config")
     parser.add_argument("--check", action="store_true", help="Check config/data paths without creating a model or starting training")
+    parser.add_argument("--allow-rhythm-dropout-change", action="store_true",
+                        help="Resume while changing only rhythm dropout; other compatibility checks still apply")
     args = parser.parse_args(argv)
     c = importlib.import_module(args.config)
     validate_config(c)
@@ -301,7 +315,7 @@ def main(argv=None):
                 raise FileNotFoundError(f"Missing tokenized AR data or byte index: {path}")
         print("Masked diffusion config and data paths checked; training was not started.")
         return
-    train(c)
+    train(c, allow_rhythm_dropout_change=args.allow_rhythm_dropout_change)
 
 
 if __name__ == "__main__":

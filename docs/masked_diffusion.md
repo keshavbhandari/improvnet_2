@@ -84,16 +84,21 @@ no pitch, velocity, instrument identity, note count, absolute tempo, onset order
 beat-phase template or individual timing values. It is invariant to global tempo
 scaling and intentionally cannot prescribe an exact swing pattern. Global
 statistics can still correlate with musical content; this limits detail rather
-than proving zero information leakage. Rhythm conditioning drops out on 10% of
+than proving zero information leakage. Rhythm conditioning drops out on 25% of
 training examples. At inference the same extractor accepts any donor MIDI through
 `--rhythm-reference`; absent a donor, it uses the source piece's statistics.
+Use `--no-rhythm-guidance` to omit rhythm conditioning entirely. This supplies
+the same all-zero 14-value vector seen during training dropout; the model can
+still use genre, instruments and the visible source notes. This flag cannot be
+combined with `--rhythm-reference`. The inference report records
+`rhythm_source="none"` and zero-valued features.
 The donor is not aligned, copied or mixed into the generated MIDI.
 
 ## Data and training
 
 `masked_diffusion_config.py` reuses AR data paths, split seed/ratios, drum-only
 exclusion, architecture and optimizer schedule. Its extra controls are
-`ELASTICITY_MAX`, `JAZZ_BLUES_WEIGHT=4` and `RHYTHM_DROP_PROB=.1`, plus run path,
+`ELASTICITY_MAX`, `JAZZ_BLUES_WEIGHT=4` and `RHYTHM_DROP_PROB=.25`, plus run path,
 seed and worker count. Each jazz/blues-labelled training piece has four times
 the sampling weight of another piece. A deterministic shared weighted draw is
 sharded over GPUs. Validation is held out and is not oversampled. The first
@@ -127,6 +132,13 @@ learning rate is not automatically rescaled. Such continuation is approximate,
 not an exact replay. Architecture, other sampling/optimization settings and data
 identity must match; errors list the incompatible fields. Validation reports the fixed-noise objective and masked
 accuracy; neither metric proves successful classical-to-jazz transfer.
+
+Use `--allow-rhythm-dropout-change` to continue an existing checkpoint with a
+different rhythm dropout rate while keeping model, optimizer, scheduler and
+data position. Other compatibility checks remain enforced. The launcher passes
+this flag for the approved change from 10% to 25%. A running process keeps its
+already loaded rate; the change takes effect in the next continuation process,
+and its checkpoints record the new rate.
 
 ## Inference
 

@@ -1,5 +1,5 @@
 """Focused CPU checks for the new tokenizer-based diffusion path."""
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 from copy import deepcopy
 import io
 import json
@@ -156,6 +156,39 @@ class MaskedDiffusionTests(unittest.TestCase):
         torch.testing.assert_close(rhythm_features(original, self.processor.tokenizer), rhythm_features(reordered, self.processor.tokenizer))
         different = [t if not isinstance(t, tuple) or t[0] != "dur" else ("dur", 400) for t in original]
         self.assertFalse(torch.equal(rhythm_features(original, self.processor.tokenizer), rhythm_features(different, self.processor.tokenizer)))
+
+    def test_rhythm_dropout_matches_guidance_free_inference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            c = tiny_config(Path(tmp)); c.RHYTHM_DROP_PROB = 0.
+            guided = MaskedDiffusionDataset(c, "train")
+            c.RHYTHM_DROP_PROB = 1.
+            dropped = MaskedDiffusionDataset(c, "train")
+            try:
+                a, b = guided[0], dropped[0]
+                self.assertTrue(a["rhythm"].any())
+                self.assertFalse(b["rhythm"].any())
+                for field in ("target", "roles", "genre", "multi_hot", "elasticity"):
+                    torch.testing.assert_close(a[field], b[field])
+            finally:
+                guided.close(); dropped.close()
+        model = ScriptedModel(self.processor)
+        with patch.object(model, "forward", wraps=model.forward) as forward:
+            _, report = transfer(model, self.processor, source(), rhythm_enabled=False,
+                                 strategy="timing", percentage=1., temperature=0., steps=2)
+        self.assertEqual(report["rhythm_source"], "none")
+        self.assertEqual(report["rhythm_features"], [0.] * 14)
+        self.assertTrue(forward.called)
+        for call in forward.call_args_list:
+            torch.testing.assert_close(call.args[5], torch.zeros(1, 14))
+
+    def test_disabled_rhythm_rejects_a_reference(self):
+        with self.assertRaisesRegex(ValueError, "rhythm reference"):
+            transfer(ScriptedModel(self.processor), self.processor, source(),
+                     rhythm_tokens=source(), rhythm_enabled=False)
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            inference_main(["--input", "source.mid", "--output", "output.mid",
+                            "--rhythm-reference", "donor.mid", "--no-rhythm-guidance"])
+        self.assertEqual(error.exception.code, 2)
 
     def test_timing_and_pitch_velocity_edits_preserve_other_attributes(self):
         model = ScriptedModel(self.processor)
@@ -316,6 +349,42 @@ class MaskedDiffusionTests(unittest.TestCase):
             changed.ELASTICITY_MAX = .25
             with self.assertRaisesRegex(ValueError, "ELASTICITY_MAX"):
                 resume_plan(before, changed, before["model_config"], 2)
+
+    def test_opt_in_rhythm_dropout_change_keeps_training_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); c = tiny_config(root)
+            c.RHYTHM_DROP_PROB = .1
+            request = root / "request"; request.touch()
+            with patch.dict(os.environ, CHECKPOINT_REQUEST_FILE=str(request)), redirect_stdout(io.StringIO()):
+                train(c, force_cpu=True)
+            request.unlink()
+            path = Path(c.SAVE_DIR) / "latest_checkpoint.pt"
+            before = torch.load(path, weights_only=False)
+            self.assertEqual(before["step"], 1)
+            c.RHYTHM_DROP_PROB = .25
+            with self.assertRaisesRegex(ValueError, "RHYTHM_DROP_PROB"):
+                resume_plan(before, c, before["model_config"], 1)
+            plan = resume_plan(before, c, before["model_config"], 1, allow_rhythm_dropout_change=True)
+            self.assertTrue(plan["rhythm_dropout_changed"])
+            self.assertEqual(plan["old_rhythm_dropout"], .1)
+            self.assertEqual(plan["new_rhythm_dropout"], .25)
+            self.assertEqual(plan["epoch"], before["epoch"])
+            self.assertEqual(plan["next_batch"], before["next_batch"])
+            incompatible = deepcopy(c); incompatible.LR *= 2
+            with self.assertRaisesRegex(ValueError, "LR"):
+                resume_plan(before, incompatible, before["model_config"], 1, allow_rhythm_dropout_change=True)
+            log = io.StringIO()
+            with redirect_stdout(log):
+                train(c, force_cpu=True, allow_rhythm_dropout_change=True)
+            self.assertIn("rhythm dropout 0.10 -> 0.25", log.getvalue())
+            after = torch.load(path, weights_only=False)
+            self.assertEqual(after["step"], c.N_STEPS)
+            self.assertEqual(after["train_config"]["RHYTHM_DROP_PROB"], .25)
+            self.assertEqual(after["model_config"], before["model_config"])
+            for values in after["optimizer_state_dict"]["state"].values():
+                self.assertEqual(int(values["step"]), c.N_STEPS)
+            self.assertEqual(after["scheduler_state_dict"]["last_epoch"], c.N_STEPS)
+            self.assertFalse(resume_plan(after, c, after["model_config"], 1)["rhythm_dropout_changed"])
 
 
 def math_log2():

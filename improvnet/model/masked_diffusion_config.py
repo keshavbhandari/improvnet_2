@@ -13,7 +13,7 @@ NUM_WORKERS = 4
 # Draw elasticity uniformly from [0, ELASTICITY_MAX] during training.
 ELASTICITY_MAX = 1.0
 JAZZ_BLUES_WEIGHT = 4.0
-RHYTHM_DROP_PROB = .1
+RHYTHM_DROP_PROB = .25  # Applied when the next training process starts.
 
 BATCH_SIZE = 25
 ACCUM_STEPS = 1 # Optimized run, 2 for old run
