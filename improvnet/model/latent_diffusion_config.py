@@ -9,13 +9,14 @@ GIGAMIDI_METADATA = DATASETS["gigamidi"] + "/Final-Metadata-Extended-GigaMIDI-Da
 GIGAMIDI_GENRE_FIELDS = ("music_styles_curated",)
 INDEX_PATH = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/local_vae_dataset/midi_index_gigamidi_genres.sqlite"
 
-VAE_CHECKPOINT = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/vae/vae176_vector256/best_model.pt"
+VAE_CHECKPOINT = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/vae/vae176_vector512/best_model.pt"
+# Pinned best-checkpoint snapshot: ongoing VAE training cannot replace this file.
 # Fresh stage-2 run: older diffusion checkpoints use a different frozen encoder.
-SAVE_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/latent_diffusion_vae176_vector256"
-EVALUATION_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/latent_diffusion_vae176_vector256_evaluation"
+SAVE_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/latent_diffusion"
+EVALUATION_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/latent_diffusion_evaluation"
 
-HISTORY_BINS = 8
-TARGET_BINS = 32
+HISTORY_BINS = 8  # Up to 8 seconds of clean context, separate from the target.
+TARGET_BINS = 30  # 30 seconds generated; 38 tokens total for vector [512,1,1].
 PATCH_PITCH = 1
 PATCH_TIME = 1
 D_MODEL = 512
@@ -51,7 +52,7 @@ BATCH_SIZE = 32  # Windows per GPU, not individual VAE bins; not yet benchmarked
 VALIDATION_BATCH_SIZE = 4
 MAX_VALIDATION_BATCHES = 100
 ACCUM_STEPS = 1
-N_STEPS = 100000
+N_STEPS = 100000  # Optimizer updates; independent of the 30-second audio window.
 LR = 1e-4
 MIN_LR = 1e-5
 WARMUP_STEPS = 1000

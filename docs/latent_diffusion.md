@@ -1,7 +1,7 @@
 # Stage 2: continuous latent diffusion
 
-The trained local VAE is frozen. The new `vae176_vector256` defaults generate
-one 256-value latent vector over each of **32 adjacent one-second bins**, with up
+The trained local VAE is frozen. The `vae176_vector512` pilot defaults generate
+one 512-value latent vector over each of **30 adjacent one-second bins**, with up
 to **8 preceding clean bins** in the same
 canvas. Each bin has its own noise embedding: history stays at zero noise, target
 bins share a randomly sampled diffusion time. Loss applies only to valid target
@@ -16,12 +16,22 @@ diffusion, v-prediction, deterministic DDIM sampling, and EMA inference weights.
 This is an adaptation, not a reproduction of Huang's or TD-Paint's architecture.
 It does not reuse or modify the AR/discrete-diffusion models.
 
-The vector VAE exposes shape `[256,1,1]`; 1x1 patches yield **one token per second,
-40 tokens per window**, rather than the old spatial run's 32,000 tokens. Every
+The vector VAE exposes shape `[512,1,1]`; 1x1 patches yield **one token per second,
+38 tokens per window**, rather than the old spatial run's 32,000 tokens. Every
 token contains the full second's vector. Musical conditioning tokens are unchanged.
 Train/evaluate the new VAE before starting diffusion; both stages use fresh
-`vae176_vector256` run paths. Normalization is calibrated afresh for all 256
+`latent_diffusion_vae176_vector512_30s_pilot` run paths. Normalization is calibrated afresh for all 512
 coordinates. Existing diffusion weights cannot be resumed with this encoder.
+
+The pilot uses `vae176_vector512/best_model.stage2_pilot_30s.pt`, a pinned
+snapshot of the current best VAE, so ongoing VAE training cannot replace the
+encoder used by diffusion. The snapshot selected for this pilot is step 180,000.
+The 30-second target is separate from its up-to-eight-second history: each
+training window therefore covers up to 38 seconds. `N_STEPS=100000` remains the
+optimizer-update budget; it does not mean audio duration. A shorter pilot budget
+can be chosen with `--steps` before starting a fresh run, but the saved schedule
+and update budget must match on exact resume. No diffusion training was started
+while checking this configuration.
 
 ## Musical conditions
 
@@ -208,8 +218,8 @@ roll continuously, so sustained notes are not split at bin boundaries.
 Inference restores window lengths, patch sizes, width, depth, heads and latent
 normalization from the selected diffusion checkpoint, rather than the current
 training config. The retired spatial `[4,32,25]` VAE with 1x1 patches used 800
-tokens per second and 32,000 tokens per window. The vector `[256,1,1]` VAE uses
-one token per second and 40 tokens per window. Generation advances by 32 target
+tokens per second and 32,000 tokens per window. The vector `[512,1,1]` pilot uses
+one token per second and 38 tokens per window. Generation advances by 30 target
 bins and retains the last 8 generated latent bins as history. Short final windows
 are padded and masked. `--max-bins` controls total generated length independently
 of the trained window size, so longer outputs use multiple windows.
