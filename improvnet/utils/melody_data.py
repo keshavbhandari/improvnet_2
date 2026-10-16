@@ -13,9 +13,11 @@ from improvnet.model import melody_config as cfg
 from improvnet.utils.ar_utils import ProcessData
 from improvnet.utils.melody import (Note, MelodyTokenizer, TASKS, corrupt_melody,
                                    make_prompt, mask_timing, melody_voice, notes_to_tokens,
-                                   sample_strength, window)
+                                   sample_strength, window, ordered)
 from improvnet.utils.melody_chunks import (chunk_bounds, chunk_end, chunk_starts,
                                           history_tokens, shorten_chunk, validate_lengths)
+
+from improvnet.utils.melody_style import performance_statistics, style_tensors
 
 
 def prepare_example(record, rng, config=cfg, task=None, strength=None):
@@ -38,11 +40,19 @@ def prepare_example(record, rng, config=cfg, task=None, strength=None):
         by_id = {id(n): replace(n, pitch=n.pitch + shift) for n in notes}
         melody = [by_id[id(n)] for n in melody]
         notes = [by_id[id(n)] for n in notes]
+    drums = [Note(*n) for n in record.get('drums', [])]
+    accompaniment = [n for i, n in enumerate(notes) if i not in melody_indices]
+    if task == 'drums' and not drums:
+        raise ValueError('No aligned drum performance is available for this record')
+    input_mono = rng.random() < config.INPUT_MONO_PROB
+    # This describes the pitched view; drum history also contains preceding drums.
+    history_mono = input_mono and task != 'harmonize'
     strength = sample_strength(rng) if strength is None else strength
-    domain = notes if task == 'harmonize' else melody
+    if task == 'drums' or task == 'harmonize' and input_mono:
+        strength = 1.0  # Drums are absent; mono harmony sources have no accompaniment.
+    domain = notes if task == 'harmonize' or not input_mono else melody
     starts = chunk_starts(domain, config.CHUNK_TOKENS)
     if task == 'harmonize':
-        # Start at a melody attack, including the full chord at that instant.
         onsets = [n.onset for n in notes]
         melody_onsets = [n.onset for n in melody]
         starts = sorted({bisect_left(onsets, melody_onsets[min(
@@ -51,46 +61,61 @@ def prepare_example(record, rng, config=cfg, task=None, strength=None):
     if use_history:
         noninitial = [i for i in starts if i > 0]
         if not noninitial:
-            # A short piece may fit one chunk. Still teach history conditioning
-            # by choosing a later attack when a clean prefix exists.
-            onsets = [n.onset for n in domain]
-            noninitial = [bisect_left(onsets, n.onset) for n in melody if n.onset > domain[0].onset]
+            # A short piece can still supply a prefix by starting at a later attack.
+            noninitial = [i for i in range(1, len(domain)) if domain[i].onset > domain[i - 1].onset]
         starts = noninitial or starts
     begin = rng.choice(starts)
     start = domain[begin].onset
-    left = history_tokens(domain[:begin], config.HISTORY_TOKENS, tok) if use_history else []
-    clean_cap = (config.SEQ_LEN - len(left) - 6 if task == 'harmonize' else config.CHUNK_TOKENS)
-    stop = chunk_end(domain, begin, clean_cap)
+    # The preceding clean target uses the same view as this target, never a
+    # separately sampled view or one inferred from the corrupted note count.
+    history_notes = ordered(domain + (drums if task == 'drums' else []))
+    left = history_tokens([n for n in history_notes if n.onset < start], config.HISTORY_TOKENS, tok) if use_history else []
+    stop = chunk_end(domain, begin, config.CHUNK_TOKENS)
     corruption_rng = rng.getstate()
     while True:
         rng.setstate(corruption_rng)
         start, end = chunk_bounds(domain, begin, stop)
-        core = window(melody, start, end)
-        target_notes = window(domain, start, end)
+        core = window(domain, start, end)
+        core_melody = window(melody, start, end)
+        target_notes = core
         if task == 'refine':
             source = corrupt_melody(core, strength, rng, tok, config.MAX_CORRUPTIONS)
         elif task == 'rhythm':
             source = mask_timing(core, strength, rng, tok)
         elif task == 'harmonize':
-            harmony = window([n for i, n in enumerate(notes) if i not in melody_indices], start, end)
-            retained = rng.sample(harmony, len(harmony) - round(strength * len(harmony)))
-            source = notes_to_tokens(core + retained, tok)
+            harmony = window(accompaniment, start, end)
+            retained = [] if input_mono else rng.sample(harmony, len(harmony) - round(strength * len(harmony)))
+            source = notes_to_tokens(core_melody + retained, tok)
+        elif task == 'drums':
+            source = notes_to_tokens(core, tok)
+            target_notes = ordered(core + window(drums, start, end))
         else:
             raise ValueError(f'Unknown task {task}')
         target = notes_to_tokens(target_notes, tok)[1:]
         prompt = make_prompt(task, source, left)
-        if len(source) <= config.CHUNK_TOKENS and len(prompt) + len(target) + 2 <= config.SEQ_LEN:
+        if len(source) <= config.CHUNK_TOKENS and (task == 'drums' or len(target) + 1 <= config.CHUNK_TOKENS) and len(prompt) + len(target) + 2 <= config.SEQ_LEN:
             break
         available = config.SEQ_LEN - len(left) - 6
         fraction = min(config.CHUNK_TOKENS / len(source), available / (len(source) + len(target)))
+        if task != 'drums':
+            fraction = min(fraction, config.CHUNK_TOKENS / (len(target) + 1))
         stop = shorten_chunk(domain, begin, stop, fraction * .98)
+    probability = config.HARMONY_STYLE_PROB if task == 'harmonize' else config.RHYTHM_STYLE_PROB if task == 'rhythm' else 0
+    visible = rng.random() < probability
+    held_harmony = ([replace(n, onset=n.onset - start) for n in accompaniment
+                     if n.onset < start < n.onset + n.duration] if task == 'harmonize' and visible else [])
+    statistics = performance_statistics(target_notes, core_melody, end - start,
+                                       config.SKYLINE_TOLERANCE_MS, held_harmony) if visible else {}
+    style_values, style_mask = style_tensors(statistics, task, visible)
     ids = [tok.tok_to_id[t] for t in prompt + target]
     labels = [config.IGNORE_INDEX] * len(prompt) + [tok.tok_to_id[t] for t in target]
     return {'input': torch.tensor(ids[:-1]), 'target': torch.tensor(labels[1:]),
             'genre': torch.tensor(config.GENRES.index(record['genre'])),
             'multi_hot': ProcessData().get_instrument_multihot(notes_to_tokens(target_notes, tok)),
             'strength': torch.tensor(strength, dtype=torch.float32), 'task': TASKS.index(task),
+            'style_values': style_values, 'style_mask': style_mask,
             'history_length': len(left), 'source_length': len(source), 'response_length': len(target),
+            'input_mono': input_mono, 'history_mono': history_mono,
             'start_ms': start, 'end_ms': end}
 
 
@@ -112,8 +137,12 @@ class MelodyDataset(Dataset):
             for task in TASKS:
                 if task == 'rhythm' and row['source'] in ('wikifonia', 'curated'):
                     continue  # Notated timing is not performed swing supervision.
-                if task != 'harmonize' or row['has_harmony']:
+                if (task != 'harmonize' or row['has_harmony']) and (task != 'drums' or row.get('has_drums', False)):
                     self.groups[task][row['genre']][row['source']].append(row['offset'])
+
+        missing = [t for i, t in enumerate(TASKS) if config.TASK_WEIGHTS[i] > 0 and not self.groups[t]]
+        if missing:
+            raise ValueError(f'No {split} supervision for tasks {missing}; prepare drum-preserving v3 data or explicitly set their task weights to zero')
 
     def __len__(self):
         return len(self.rows)
@@ -145,7 +174,7 @@ def collate_examples(batch):
         inputs[i, :len(x['input'])] = x['input']
         targets[i, :len(x['target'])] = x['target']
     return {'input': inputs, 'target': targets,
-            **{key: torch.stack([x[key] for x in batch]) for key in ('genre', 'multi_hot', 'strength')},
+            **{key: torch.stack([x[key] for x in batch]) for key in ('genre', 'multi_hot', 'strength', 'style_values', 'style_mask')},
             'task': torch.tensor([x['task'] for x in batch])}
 
 

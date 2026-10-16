@@ -3,7 +3,8 @@ from pathlib import Path
 from improvnet.utils.melody import MelodyTokenizer
 
 DATA_ROOT = Path('/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data')
-DATA_FILE = DATA_ROOT / 'prepared' / 'performances.jsonl'
+DATA_FILE = DATA_ROOT / 'prepared' / 'performances_v3.jsonl'
+STYLE_REFERENCES = Path(__file__).resolve().parents[1] / 'inference' / 'style_references.json'
 SAVE_DIR = '/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v1'
 RUN_NAME = 'melody_refinement_v1'
 INIT_CHECKPOINT = '/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/ar_context_split_instrument/best_model.pt'
@@ -18,13 +19,16 @@ SEQ_LEN = 8192  # Includes prompt + response; two conditioning positions are res
 PAD_ID = 2
 IGNORE_INDEX = -100
 
-CHUNK_TOKENS = 3000  # Corrupted input cap; also the clean melody/rhythm response cap.
+CHUNK_TOKENS = 512  # Source and response cap for refine/rhythm/harmony, including wrappers.
 HISTORY_TOKENS = 2048
 HISTORY_PROB = 0.5  # Clean left history during training; never provide right context.
-HARMONY_EXPANSION = 3.0  # Inference reserves arrangement space per melody token.
+INPUT_MONO_PROB = 0.5  # History follows the clean target view; harmony is always polyphonic.
+HARMONY_STYLE_PROB = 0.5
+RHYTHM_STYLE_PROB = 0.5
+HARMONY_EXPANSION = 3.0  # Reserve room for new voices within the 512-token response.
 SKYLINE_TOLERANCE_MS = 50
 MAX_CORRUPTIONS = 3
-TASK_WEIGHTS = (0.35, 0.30, 0.35)  # refine, rhythm, harmonize
+TASK_WEIGHTS = (0.30, 0.25, 0.30, 0.15)  # refine, rhythm, harmonize, drums
 DATA_SPLIT_SEED = 42
 DATA_SPLIT_RATIOS = {'train': .90, 'validation': .05, 'test': .05}
 

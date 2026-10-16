@@ -47,7 +47,8 @@ def record():
     selected = {id(n) for n in melody}
     return dict(notes=[astuple(n) for n in notes],
                 melody_indices=[i for i, n in enumerate(notes) if id(n) in selected],
-                genre='jazz', source='fixture', windows=[0, 1], harmony_windows=[0, 1])
+                genre='jazz', source='fixture', windows=[0, 1], harmony_windows=[0, 1],
+                drums=[astuple(Note('drum', 51, 80, t, 100)) for t in range(0, 6000, 500)])
 
 
 def long_record(attacks=2400):
@@ -67,13 +68,14 @@ def response_notes(example):
 @pytest.mark.parametrize('history_prob', (0, 1))
 def test_long_training_chunks_respect_all_budgets(task, strength, history_prob):
     rec, tok = long_record(), MelodyTokenizer()
-    example = prepare_example(rec, random.Random(1), tune(HISTORY_PROB=history_prob),
+    # Choose a late window so present histories exercise the full token cap.
+    example = prepare_example(rec, random.Random(17), tune(HISTORY_PROB=history_prob, INPUT_MONO_PROB=1),
                               task=task, strength=strength)
     assert 0 < example['source_length'] <= cfg.CHUNK_TOKENS
     assert example['history_length'] <= cfg.HISTORY_TOKENS
     assert bool(example['history_length']) == bool(history_prob)
     assert len(example['input']) + 3 <= cfg.SEQ_LEN  # Full stream, including final E and conditions.
-    assert example['end_ms'] - example['start_ms'] > 5000
+    assert example['end_ms'] > example['start_ms']
     stream = [tok.id_to_tok[i] for i in example['input'].tolist()]
     assert stream.count('<SEP>') == 2  # No right-context slot.
     history = tokens_to_notes(stream[1:1 + example['history_length']], tok)
@@ -93,9 +95,9 @@ def test_long_training_chunks_respect_all_budgets(task, strength, history_prob):
     if task != 'harmonize':
         assert example['response_length'] < cfg.CHUNK_TOKENS
     if strength == 0 and task != 'harmonize':
-        assert example['source_length'] > 2700
+        assert example['source_length'] > 450
         if history_prob:
-            assert len(example['input']) > 7800
+            assert len(example['input']) > 2900
 
 
 def test_history_probability_and_short_piece_fallback():
@@ -133,7 +135,8 @@ def test_chunking_keeps_whole_chords_and_bounded_history():
 
 
 @pytest.mark.parametrize('task', ('refine', 'rhythm', 'harmonize'))
-def test_inference_history_uses_only_generated_output(task):
+@pytest.mark.parametrize('history_view', ('match', 'mono', 'poly'))
+def test_inference_history_uses_only_generated_output(task, history_view):
     from improvnet.inference.melody_inference import MelodyInference
     inference = MelodyInference.__new__(MelodyInference)
     inference.tokenizer = tok = MelodyTokenizer()
@@ -157,9 +160,12 @@ def test_inference_history_uses_only_generated_output(task):
                lambda core, *args: notes_to_tokens(core, tok)), patch(
                'improvnet.inference.melody_inference.mask_timing',
                lambda core, *args: notes_to_tokens(core, tok)):
-        result, stats = inference.transform(melody, task, 'jazz', .5, random.Random(2))
+        result, stats = inference.transform(melody, task, 'jazz', .5, random.Random(2),
+                                           history_view=history_view)
     assert len(calls) > 2 and len(result) == len(melody) * (2 if task == 'harmonize' else 1)
     assert stats[0]['history_tokens'] == 0 and calls[0][1] == '<SEP>'
+    expected_view = 'poly' if task == 'harmonize' else 'mono' if history_view == 'match' else history_view
+    assert all(s['history_view'] == expected_view for s in stats)
     for prompt, stat in zip(calls[1:], stats[1:]):
         history = tokens_to_notes(prompt[1:prompt.index('<SEP>')], tok)
         assert history and len(prompt[1:prompt.index('<SEP>')]) <= 42
@@ -167,6 +173,8 @@ def test_inference_history_uses_only_generated_output(task):
         assert all(n.velocity in ((60, 90) if task == 'harmonize' else (60,)) for n in history)
         previous = [n for n in result if n.onset < stat['start_ms']]
         assert notes_to_tokens(history, tok) == history_tokens(previous, 42, tok)
+        if task == 'harmonize':
+            assert any(n.pitch == 36 for n in history)  # Even a global mono option keeps harmony voices.
     assert all(s['total_token_budget'] <= 256 for s in stats)
     assert sum(s['input_notes'] for s in stats) == len(melody)
 
@@ -177,7 +185,7 @@ def test_expanding_corruption_shrinks_complete_training_chunk(monkeypatch):
     monkeypatch.setattr('improvnet.utils.melody_data.corrupt_melody', grow)
     example = prepare_example(long_record(), random.Random(1), task='refine', strength=1)
     assert example['source_length'] <= cfg.CHUNK_TOKENS
-    assert 1000 < example['response_length'] < 1600
+    assert 100 < example['response_length'] < cfg.CHUNK_TOKENS * .6
     assert len(example['input']) + 3 <= cfg.SEQ_LEN
 
 
@@ -211,9 +219,9 @@ def test_inference_advances_by_clean_input_when_corruption_changes_count(name, m
     def corrupt(core, strength, rng, tokenizer, *args):
         return corrupt_melody(core, strength, rng, tokenizer, names=[name])
     monkeypatch.setattr('improvnet.inference.melody_inference.corrupt_melody', corrupt)
-    def generate(prompt, *args, **kwargs):
+    def generate(prompt, genre, strength, instruments, window_ms, *args, **kwargs):
         assert len(prompt) + kwargs['max_new_tokens'] + 2 <= 8192
-        return [Note('Acoustic Piano', 65, 60, 0, 100)]
+        return [Note('Acoustic Piano', 65, 60, window_ms - 1000, 100)]
     inference.generate = generate
     result, stats = inference.transform(notes, 'refine', 'jazz', 1, random.Random(1))
     assert len(result) == len(stats) >= 3
@@ -226,6 +234,48 @@ def test_inference_advances_by_clean_input_when_corruption_changes_count(name, m
     assert all(s['source_tokens'] <= 3000 and s['total_token_budget'] <= 8192 for s in stats)
     if name == 'fragmentation':
         assert all(s['source_tokens'] == 2 for s in stats)
+
+
+@pytest.mark.parametrize('spacing', (200, 1000))
+def test_early_refinement_end_continues_unprocessed_music(monkeypatch, spacing):
+    from improvnet.inference.melody_inference import MelodyInference
+    inference = MelodyInference.__new__(MelodyInference)
+    inference.tokenizer = tok = MelodyTokenizer()
+    inference.meta = dict(seq_len=8192, chunk_tokens=3000, history_tokens=2048,
+                          harmony_expansion=3., max_corruptions=3)
+    melody = [Note('Acoustic Piano', 60 + i % 12, 90, i * spacing, 200) for i in range(20 if spacing == 200 else 100)]
+    monkeypatch.setattr('improvnet.inference.melody_inference.corrupt_melody',
+                        lambda core, *args: notes_to_tokens(core, tok))
+    prompts = []
+    def generate(prompt, *args, **kwargs):
+        prompts.append(prompt)
+        core = tokens_to_notes(prompt[prompt.index('<SEP>') + 1:-2], tok)
+        # Reproduce premature <E> after a short prefix of a long input.
+        if len(prompts) == 1:
+            core = core[:8]
+        return [replace(n, velocity=60) for n in core]
+    inference.generate = generate
+    result, stats = inference.transform(melody, 'refine', 'jazz', .2, random.Random(42))
+    assert [n.onset for n in result] == [n.onset for n in melody]
+    assert all(n.velocity == 60 for n in result)  # No copying of the skipped classical tail.
+    assert len(stats) == 2 and stats[0]['early_end'] and not stats[1]['early_end']
+    assert stats[0]['consumed_input_notes'] == 8 and stats[0]['advance_to_ms'] == 8 * spacing
+    assert stats[1]['start_ms'] == 8 * spacing and stats[1]['history_tokens'] > 0
+    assert sum(s['consumed_input_notes'] for s in stats) == len(melody)
+    assert all(s['total_token_budget'] <= 8192 for s in stats)
+    history = tokens_to_notes(prompts[1][1:prompts[1].index('<SEP>')], tok)
+    assert history == result[:8]
+
+
+def test_empty_refinement_cannot_silently_discard_input():
+    from improvnet.inference.melody_inference import MelodyInference
+    inference = MelodyInference.__new__(MelodyInference)
+    inference.tokenizer = MelodyTokenizer()
+    inference.meta = dict(seq_len=256, chunk_tokens=64, history_tokens=42,
+                          harmony_expansion=3., max_corruptions=3)
+    inference.generate = lambda *args, **kwargs: []
+    with pytest.raises(RuntimeError, match='Empty refinement response'):
+        inference.transform(performance(), 'refine', 'jazz', .2, random.Random(42))
 
 
 def test_fixed_timing_generation_across_multiple_clock_segments():
@@ -286,9 +336,14 @@ def test_checkpoint_records_long_chunk_protocol():
     model = MelodyRefinementModel(**tiny_kwargs())
     meta = checkpoint_metadata(model, cfg)
     assert validate_checkpoint({'refinement': meta}) == meta
-    assert (meta['version'], meta['chunk_tokens'], meta['history_tokens'], meta['history_prob']) == (2, 3000, 2048, .5)
+    assert (meta['version'], meta['chunk_tokens'], meta['history_tokens'], meta['history_prob']) == (3, 512, 2048, .5)
+    assert meta['harmony_history_view'] == 'poly'
+    assert meta['history_policy'] == 'clean_target_view' and meta['drum_history_includes_drums']
+    assert 'history_mono_prob' not in meta
+    with pytest.raises(ValueError, match='Resume settings differ'):
+        validate_checkpoint({'refinement': dict(meta, history_policy='independent')}, expected=meta)
     assert 'context_windows' not in meta and 'window_ms' not in meta
-    with pytest.raises(ValueError, match='Old short-window'):
+    with pytest.raises(ValueError, match='Old refinement protocol'):
         validate_checkpoint({'refinement': dict(meta, version=1)})
 
 
@@ -363,7 +418,7 @@ def test_vocabulary_and_timing_mask_endpoints():
     from improvnet.tokenizer.absolute import AbsTokenizer
     base = AbsTokenizer()
     assert tok.vocab[:base.vocab_size] == base.vocab
-    assert tok.vocab_size == base.vocab_size + 3
+    assert tok.vocab_size == base.vocab_size + 4
     notes = skyline(performance())[0]
     clean = notes_to_tokens(notes, tok)
     assert mask_timing(notes, 0, random.Random(0), tok) == clean
@@ -390,7 +445,7 @@ def test_quantized_solo_ties_become_one_melody_attack():
     assert [n.pitch for n in melody_voice(notes)] == [64, 62]
     rec = dict(notes=[astuple(n) for n in notes], melody_indices=[0, 1, 2],
                genre='jazz', source='weimar', windows=[0], harmony_windows=[])
-    x = prepare_example(rec, random.Random(1), tune(HISTORY_PROB=0), task='rhythm', strength=0)
+    x = prepare_example(rec, random.Random(1), tune(HISTORY_PROB=0, INPUT_MONO_PROB=1), task='rhythm', strength=0)
     tok = MelodyTokenizer()
     response = [tok.id_to_tok[i] for i in x['target'].tolist() if i != -100]
     assert [n.pitch for n in tokens_to_notes(response, tok)] == [64, 62]
@@ -457,10 +512,10 @@ def make_data(path):
     with path.open('wb') as handle:
         for split in ('train', 'validation', 'test'):
             for i in range(6):
-                rows.append(dict(offset=handle.tell(), split=split, genre='jazz', source='fixture', has_harmony=True))
+                rows.append(dict(offset=handle.tell(), split=split, genre='jazz', source='fixture', has_harmony=True, has_drums=True, sha256=f'{i:064x}'))
                 handle.write((json.dumps(row) + '\n').encode())
     path.with_suffix('.index.json').write_text(json.dumps(dict(
-        version=2, tokenizer=MelodyTokenizer().signature(), rows=rows)))
+        version=3, tokenizer=MelodyTokenizer().signature(), rows=rows)))
 
 
 def test_stateless_epoch_resampling(tmp_path):
@@ -539,7 +594,7 @@ def test_cpu_training_resume_and_inference(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, 'argv', ['melody_inference', '--model',
         str(tmp_path / 'resumed/latest_checkpoint.pt'), '--input', str(input_path),
         '--output', str(output_path), '--melody-strength', '0',
-        '--rhythm-strength', '1', '--temperature', '0', '--device', 'cpu'])
+        '--rhythm-strength', '1', '--temperature', '0', '--device', 'cpu', '--no-style-conditioning'])
     main()
     assert read_midi_notes(output_path)
     assert output_path.with_suffix('.json').exists()

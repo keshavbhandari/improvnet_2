@@ -20,6 +20,7 @@ from improvnet.model.melody_model import (MelodyRefinementModel, checkpoint_meta
 from improvnet.utils.ar_utils import (build_optimizer, collect_rng_state_for_checkpoint,
                                     load_checkpoint, resume_epoch_loader, save_checkpoint)
 from improvnet.utils.melody_data import build_dataloader
+from improvnet.utils.melody import TASKS
 
 
 def autocast(device):
@@ -31,7 +32,8 @@ def autocast(device):
 
 def loss_for_batch(model, batch, ignore_index=-100):
     logits = model(target=batch['input'], genre=batch['genre'],
-                   multi_hot=batch['multi_hot'], strength=batch['strength'])
+                   multi_hot=batch['multi_hot'], strength=batch['strength'],
+                   style_values=batch['style_values'], style_mask=batch['style_mask'])
     return F.cross_entropy(logits.flatten(0, 1), batch['target'].flatten(), ignore_index=ignore_index)
 
 
@@ -39,17 +41,18 @@ def loss_for_batch(model, batch, ignore_index=-100):
 def evaluate_validation(model, loader, device, config=cfg, max_batches=100):
     model.eval()
     # Sums/counts per task avoid comparing losses with different token counts.
-    totals = torch.zeros(3, 2, dtype=torch.float64, device=device)
+    totals = torch.zeros(len(TASKS), 2, dtype=torch.float64, device=device)
     for i, batch in enumerate(loader):
         if i >= max_batches:
             break
         batch = {k: v.to(device) for k, v in batch.items()}
         with autocast(device):
             logits = model(target=batch['input'], genre=batch['genre'],
-                           multi_hot=batch['multi_hot'], strength=batch['strength'])
+                           multi_hot=batch['multi_hot'], strength=batch['strength'],
+                           style_values=batch['style_values'], style_mask=batch['style_mask'])
             losses = F.cross_entropy(logits.transpose(1, 2), batch['target'],
                                      ignore_index=config.IGNORE_INDEX, reduction='none')
-        for task in range(3):
+        for task in range(len(TASKS)):
             mask = (batch['task'] == task).unsqueeze(1) & (batch['target'] != config.IGNORE_INDEX)
             totals[task, 0] += losses[mask].sum().double()
             totals[task, 1] += mask.sum()
@@ -57,7 +60,7 @@ def evaluate_validation(model, loader, device, config=cfg, max_batches=100):
         dist.all_reduce(totals)
     model.train()
     metrics = {name: (totals[i, 0] / totals[i, 1]).item() for i, name in
-               enumerate(('refine', 'rhythm', 'harmonize')) if totals[i, 1] > 0}
+               enumerate(TASKS) if totals[i, 1] > 0}
     metrics['loss'] = (totals[:, 0].sum() / totals[:, 1].sum().clamp_min(1)).item()
     return metrics
 
@@ -81,13 +84,15 @@ def train(config=cfg, n_steps=None):
               f'effective batch={config.BATCH_SIZE * config.ACCUM_STEPS * world}, stop step={n_steps}', flush=True)
     random.seed(config.DATA_SPLIT_SEED + rank)
     torch.manual_seed(config.DATA_SPLIT_SEED + rank)
+    latest = Path(config.SAVE_DIR) / 'latest_checkpoint.pt'
+    checkpoint = torch.load(latest, map_location='cpu', weights_only=False, mmap=True) if (
+        config.RESUME_TRAINING and latest.exists()) else None
+    if checkpoint is not None:
+        validate_checkpoint(checkpoint)  # Reject incompatible protocols before allocating the model.
     train_loader = build_dataloader('train', config.BATCH_SIZE, distributed, config)
     val_loader = build_dataloader('validation', config.BATCH_SIZE, distributed, config)
     model = MelodyRefinementModel(**config.MODEL_KWARGS)
     metadata = checkpoint_metadata(model, config)
-    latest = Path(config.SAVE_DIR) / 'latest_checkpoint.pt'
-    checkpoint = torch.load(latest, map_location='cpu', weights_only=False, mmap=True) if (
-        config.RESUME_TRAINING and latest.exists()) else None
     if checkpoint is not None:
         validate_checkpoint(checkpoint, metadata)
         for key, value in [('batch_size', config.BATCH_SIZE), ('accum_steps', config.ACCUM_STEPS), ('world_size', world)]:
@@ -100,7 +105,7 @@ def train(config=cfg, n_steps=None):
         initialize_from_ar(model, initial)
         del initial
         if rank == 0:
-            print('Loaded AR weights; initialized task rows/strength condition; fresh optimizer.', flush=True)
+            print('Loaded pretrained weights; initialized missing task/style parameters; fresh optimizer.', flush=True)
     model.to(device)
     if distributed:
         model = DDP(model, device_ids=[local_rank] if device.type == 'cuda' else None)
@@ -206,9 +211,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--data', type=Path, default=cfg.DATA_FILE)
     parser.add_argument('--save-dir', default=cfg.SAVE_DIR)
+    parser.add_argument('--init-checkpoint', type=Path, default=cfg.INIT_CHECKPOINT,
+                        help='Load AR/earlier-refiner weights only when starting a fresh run')
     parser.add_argument('--steps', type=int, default=cfg.N_STEPS,
                         help='Stop at this update; scheduler horizon remains config N_STEPS')
     args = parser.parse_args()
     settings = SimpleNamespace(**{k: v for k, v in vars(cfg).items() if k.isupper()})
     settings.DATA_FILE, settings.SAVE_DIR = args.data, args.save_dir
+    settings.INIT_CHECKPOINT = args.init_checkpoint
     train(settings, args.steps)

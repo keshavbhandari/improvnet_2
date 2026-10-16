@@ -1,7 +1,8 @@
 """Note-aware token budgets shared by training and left-to-right inference."""
 from dataclasses import replace
+import math
 
-from improvnet.utils.melody import notes_to_tokens, ordered
+from improvnet.utils.melody import notes_to_tokens, ordered, TASKS
 
 
 def token_count(notes, start=0, stop=None):
@@ -86,5 +87,10 @@ def validate_lengths(config):
         raise ValueError('CHUNK_TOKENS must leave room for response and separators')
     if not 0 <= config.HISTORY_TOKENS < config.SEQ_LEN or not 0 <= config.HISTORY_PROB <= 1:
         raise ValueError('Invalid history token cap or probability')
-    if config.HARMONY_EXPANSION < 1:
+    if not math.isfinite(config.HARMONY_EXPANSION) or config.HARMONY_EXPANSION < 1:
         raise ValueError('HARMONY_EXPANSION must be at least 1')
+    for name in ('INPUT_MONO_PROB', 'HARMONY_STYLE_PROB', 'RHYTHM_STYLE_PROB'):
+        if not 0 <= getattr(config, name) <= 1:
+            raise ValueError(f'{name} must be in [0,1]')
+    if len(config.TASK_WEIGHTS) != len(TASKS) or any(not math.isfinite(x) or x < 0 for x in config.TASK_WEIGHTS) or sum(config.TASK_WEIGHTS) <= 0:
+        raise ValueError('Provide four nonnegative task weights with positive total')

@@ -1,212 +1,187 @@
-# Melody corruption/refinement: implemented design
+# Four-task refinement design, protocol 3
 
-The branch uses one causal AR transformer for three tasks. This document describes
-the implementation, rather than a second-stage diffusion experiment. The first
-full fine-tuning run and listening evaluation remain future work.
+This branch uses one causal autoregressive transformer for refinement, rhythmic
+repair, harmonization and drum addition. The architecture retains the original
+20-layer/2,048-width backbone and its genre/instrument conditioning positions.
+Musical quality of the new four-task model still requires training and listening.
 
-## Representation and model
+## Representation and prompt
 
-Use the existing AR tokenizer unchanged for musical events: each note is
-`instrument, (pitch, velocity), onset_ms, duration_ms`. Timing resolution is 10 ms;
-`<T>` advances the clock by 5,000 ms. Notes are assigned to chunks by onset, and
-held-note durations can extend through the boundary without creating an attack.
-
-Three task tokens are appended to the original 2,778 IDs, giving 2,781 tokens:
-`<REFINE>`, `<RHYTHM>`, `<HARMONIZE>`. No corruption-type tokens are added. A task
-token identifies the requested job; it does not identify the sampled corruption.
-Old token IDs, genre IDs and transformer weights are retained. The four genre
-conditions remain `classical, jazz, blues, unknown`.
-
-A small MLP embeds a scalar strength in [0,1] and adds it to the existing genre
-conditioning vector. Its final projection starts at zero, initially preserving
-the old model's conditioning behavior. The backbone remains the AR transformer;
-no separate encoder or diffusion model is introduced. Existing AR calls retain
-their original default behavior.
-
-## Decoder-only seq2seq
+Each note is four tokens: instrument, pitch/velocity, onset, duration. Timing is
+10 ms and `<T>` advances the local clock by 5,000 ms. Held-note durations cross
+chunk boundaries without creating new attacks. The existing 2,778 musical IDs
+are retained; `<REFINE>`, `<RHYTHM>`, `<HARMONIZE>`, `<DRUMS>` give 2,782 IDs.
+The original three task IDs keep their values. The four genre IDs remain
+`classical, jazz, blues, unknown`. Drums use the existing drum instrument token
+and the existing 41-instrument condition; MIDI export reserves channel 10.
 
 ```text
-continuous genre/instrument/strength conditions
-<TASK> optional_clean_left_history <SEP> corrupted_chunk <SEP>
-<S> complete_target_response <E>
+continuous genre + strength + masked style controls / instrument conditions
+<TASK> optional_clean_left_history <SEP> corrupted_or_incomplete_source <SEP>
+<S> complete_response <E>
 ```
 
-Each nonempty history/source stream has its own `<S>`/`<E>` wrapper and local
-millisecond clock. There is no right context. Chunks use token budgets rather
-than fixed durations: `CHUNK_TOKENS=3000` caps the corrupted source and the
-serialized clean melody/rhythm response. `HISTORY_PROB=0.5` provides a clean
-left prefix on half the training examples, capped at `HISTORY_TOKENS=2048`.
-For a short piece fitting one chunk, history examples start at a later attack
-when possible. A one-attack piece cannot supply a nonempty earlier history.
+Music streams have independent local clocks and `<S>/<E>` wrappers. There is no
+right context. Teacher forcing predicts every response attribute and structural
+marker, with prompt/padding labels ignored. `<D>` is reserved and unused here.
+The note grammar permits only complete valid events during inference.
 
-Full-length melody/rhythm examples with history use about 8,053 positions.
-`SEQ_LEN=8192` includes history, source, response, wrappers, separators, task
-token and both continuous conditioning positions. Harmonization fits the actual
-melody-plus-retained-harmony source and full arrangement response jointly;
-its denser response may exceed 3,000 tokens, so its source may be shorter.
-No example exceeds the full 8K budget.
+## Lengths and mixed views
 
-Budget checks happen **after corruption and serialization**, so note additions,
-removals and all `<T>` tokens count. If the source or combined stream is too long,
-shorten the clean chunk by whole onset groups and reapply corruption with the
-same RNG state. Never truncate a target, split note attributes, or split a
-simultaneous chord. Shrinking must make progress; an individual onset group that
-cannot fit raises an explicit error rather than looping. History keeps complete
-notes from the tail and resets its clock at the first retained attack.
+Refine/rhythm/harmony cap both source and serialized complete response at 512
+tokens. Harmony can use a shorter source to leave room for added voices in its
+512-token response. Inference's expansion estimate also accounts for requested
+voicing density. Drum addition caps its source at 512 but permits a longer full
+mix response. Every example, including its clean history, wrappers, task,
+separators, response and both continuous positions, fits at most 8,192 positions.
 
-Teacher forcing predicts every response attribute, including copied attributes,
-note count and required structural tokens. Prompt and padding labels are ignored.
-The initial response `<S>` is supplied like a decoder start symbol. `<T>` is
-needed in streams spanning multiple 5-second segments. `<D>` remains reserved
-in the base vocabulary and is not introduced into these task examples. Only valid musical tokens can be
-sampled by inference's note grammar.
+Lengths are measured after corruption and serialization. Overflow shrinks the
+source/target time span at whole onset groups and reapplies the same corruption
+RNG state. Targets and note attributes are never blindly truncated. Added and
+removed notes, drum density, and all clock markers count. Shrinking must make
+progress; an indivisible group that cannot fit raises an explicit error.
+Inference also bounds the final anchor-preserving arrangement/mix, adding only
+complete onset groups within the remaining response budget.
 
-## Corruptions and strength
+For each task, choose a mono or poly pitched input view with probability 0.5 where
+available. Solo sources naturally have identical views. Refinement/rhythm targets
+use the selected view. Harmony targets use the full pitched arrangement. A mono
+harmony source is melody only, with strength 1; poly harmony sources retain a
+random subset of accompaniment according to strength. Drum input is the chosen
+pitched view; target is that same view plus its aligned original drums. Drums
+are not transposed. All paired pitched notes/history/targets share augmentation.
+
+History is available with probability 0.5. For harmony, always use the clean
+preceding polyphonic pitched performance, irrespective of the input view.
+Refinement/rhythm history uses the same mono/poly view as its clean target.
+Drum history uses that target's pitched view plus its preceding original drums,
+including when the pitched view is monophonic. There is no independent history
+view draw: corruption or masking cannot change the selected clean history view.
+Cap it at 2,048 tokens, keeping complete tail notes and rebasing its first attack
+to zero. Short pieces may start at a later attack to provide a clean prefix.
+No future notes, corrupted history or genre-mismatched history are supplied.
+
+## Corruptions
 
 The [ImprovNet paper](https://arxiv.org/html/2502.04522v1) supplies the starting
-corruption families: pitch/velocity masking, timing masking, whole masking,
-pitch permutation, pitch/velocity permutation, fragmentation, incorrect
-transposition, note modification, and skyline for harmonization. Our version
-scales the affected subset by strength and composes up to three edits. Fragmentation
-drops a suffix; note modification merges omissions or splits longer notes.
-Slot masks are applied after note edits so they remain attached correctly.
+corruption families. Refinement composes up to three of: pitch/velocity masking,
+onset/duration masking, whole masking, pitch permutation, pitch/velocity
+permutation, fragmentation, incorrect transposition, and note modification.
+Strength scales the affected subset; zero is identity. Fragmentation removes a
+suffix. Note modification merges omissions or splits long notes. Slot masks are
+applied after structural edits. Corruption names are never serialized.
 
-For melody refinement, sample 1–3 distinct corruptions from the eight non-skyline
-families. The model sees their combined result and the scalar strength, never
-the corruption names. Zero strength is identity. Strong fragmentation or masking
-can remove all note evidence in the center, leaving context to guide recovery.
+Rhythm keeps instrument/pitch/velocity and masks onset/duration together for a
+sampled fraction of simultaneous attack groups. Polyphonic decoding samples one
+onset per original simultaneous chord and repeats it for its remaining notes.
+It reserves space for remaining attack groups inside each five-second bin.
+Durations are generated individually. Exact strengths zero/one occur with 5%
+probability each; other strengths are uniform. Harmony controls the fraction of
+accompaniment removed. Drum addition always removes all original drum notes
+from its source; its response contains the complete pitched-plus-drums mix.
 
-For timing refinement, retain pitches/velocities/instruments and randomly choose
-a fraction of note slots from 0–100%, masking both onset and duration for each
-selected note. The fraction is the strength condition. Sample exact zero and
-one with 5% probability each; otherwise draw a continuous uniform strength.
-Each training example/epoch resamples deterministically from its data seed so
-resume and worker scheduling do not change the experiment.
+## Aggregate style conditioning
 
-No beat-position, beat-grid, inferred-tempo feature or diffusion timestep enters
-the model. With 100% timing masking, the target is a plausible learned rhythmic
-interpretation, not uniquely determined timing. The surrounding context helps;
-examples at piece boundaries have less evidence. Jazz labels include straight
-and swung music, so this system does not promise a universal swing ratio.
+A separate small MLP receives seven transformed values plus seven presence bits.
+Its output is added to the same genre vector as the strength embedding; no new
+sequence positions are consumed. Its final projection starts at zero so weight
+migration initially preserves the previous model's behavior.
 
-## Dataset preparation and skyline
-
-Raw root:
-`/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data`.
-
-| Source | Role |
+| Control | Definition |
 | --- | --- |
-| ARIA: 18,839 jazz + 1,248 blues copied MIDIs | Melody/timing repair and aligned harmonization |
-| PiJAMA: 2,736 MIDIs; Doug McKenzie: 307 MIDIs | Piano melody/timing repair and aligned harmonization |
-| Weimar: 456 unquantized solos | Clean solo melody/timing repair |
-| WikiMT: 213 Jazz-labelled MusicXML lead sheets | Notated melody repair; excluded from performed timing and harmonization tasks |
-| Other 3,859-sheet Wikifonia mirror | Requires genre curation; excluded by default |
-| DTL1000 metadata | Excluded until note transcriptions are acquired |
+| Accompaniment attack frequency | Anchored accompaniment attack groups per second |
+| Accompaniment voicing density | Mean distinct sounding pitch/instrument pairs at accompaniment group attacks, including held notes |
+| IOI mean | Mean pitched attack-group interval, milliseconds |
+| IOI standard deviation | Population standard deviation of those intervals |
+| IOI quartiles | 25th and 75th percentiles, milliseconds |
+| IOI lag-one correlation | Correlation between adjacent intervals; negative values describe alternation |
 
-MusicXML is read with music21; written repeats are expanded and chord symbols
-are excluded from note events. Missing score tempo uses music21's notated-score
-default; this does not turn lead sheets into expressive performances. Source
-licences and acquisition reports remain with the raw data. R&B is not relabelled
-as blues. Additional curated scores can be listed in `curated_scores.jsonl`.
+Performed groups are anchored at the first attack and extend at most 50 ms.
+Same-pitch retriggers and nonoverlapping fast notes start new groups. Style
+statistics contain no pitches, individual note times, instrument IDs or chord
+progressions. IOI measures are not beat-grid features or a guaranteed swing ratio.
+Positive controls use `log1p` scaling, with milliseconds first divided by 1,000;
+correlation is unscaled. Missing values are zeroed behind explicit presence bits.
 
-Known solo/lead-sheet sources retain their melody directly. Simultaneous attacks
-in melody candidates, including ties introduced by 10 ms rounding, are resolved
-to the upper note when constructing a task. This applies to training and inference;
-the stored performance remains unchanged. Polyphonic performance
-files use attack-based skyline: group overlapping, distinct-pitch attacks within
-50 ms of the first attack, keep the highest, and put the other original notes
-in accompaniment. Same-pitch repeated attacks and nonoverlapping fast notes start
-new groups. Preserve original velocities/durations rather than fixing dynamics.
+Harmony controls are visible on 50% of harmony examples; rhythm controls on 50%
+of rhythm examples. They summarize the clean local target, so this is deliberate
+conditional supervision. Hidden controls cannot expose their values to the model.
+Refinement/drums have no additional numeric style controls. Validation retains
+fixed examples and visibility masks; held-out reconstruction with target-derived
+controls is distinct from listening to transfer with an external reference.
 
-Skyline partitions original notes without duplication; it is not a reliable
-separator for every arrangement. High accompaniment notes or inner-voice tunes
-remain extraction failure cases. Inspect `.melody.mid` examples before a long
-run. No hand-verified melody quality filter is claimed.
+Inference either samples a same-genre entry from the training-only JSON reference
+bank using the seed, or summarizes `--style-reference` MIDI. One reference is
+held fixed across chunks/stages. Mono rhythm uses its melody IOIs; poly rhythm
+uses pitched-mix IOIs. A mono reference has no harmony controls. The JSON bank
+contains aggregate statistics and provenance, not note sequences. It currently
+has 40 entries: 32 jazz and 8 blues, from performed sources. `--no-style-conditioning`
+tests the learned missing-control mode. All control probabilities are configurable.
 
-The preparer writes one record per performance plus a byte-offset index. It
-hash-deduplicates files and groups title/full-melody-fingerprint matches before
-a deterministic 90/5/5 split. Full melody fingerprints are transposition invariant;
-they do not guarantee detection of every arrangement or alternate performance.
-Full-performance prepared records from the earlier fixed-window implementation
-are reusable; old window lists are ignored. New preparation stores full notes
-without excluding dense five-second spans.
-Original AR pretraining overlap is explicitly not audited yet, so held-out
-fine-tuning results must not be described as proof of unseen-composition ability.
+## Data and splitting
 
-Sampling balances task, genre and source rather than letting raw ARIA file count
-dominate. Defaults are 35% melody refinement, 30% timing and 35% harmonization.
-Each example gets a new chunk, strength and edits each epoch. Validation examples
-remain fixed. Paired pitch augmentation is applied to context, source and target.
+Raw root is `/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data`.
+Sources remain the copied ARIA jazz/blues subset, PiJAMA, Doug McKenzie, Weimar
+solos, and labelled WikiMT Jazz scores. MusicXML repeats are expanded with
+music21; chord symbols are excluded from note events. Other unlabelled scores
+and DTL metadata are excluded. Scores teach refinement but not performed timing
+or drums. Raw licences/acquisition reports remain with the data; R&B is not
+relabeled as blues. Explicit additional sources use `curated_scores.jsonl`.
 
-## Harmonization supervision
+Polyphonic pitched performances use attack-based 50 ms skyline with original
+note identity/velocity/duration retained. Quantized simultaneous melody ties
+resolve to the upper note. Skyline is approximate: high accompaniment and inner
+melodies remain failure cases. Known solo sources retain their own melody.
 
-For each polyphonic performance, let `P` be all notes, `M` the skyline selection,
-and `H` the remaining original notes. The source is `M` plus a randomly retained
-fraction of `H`; strength controls the fraction of harmony removed. The response
-is the complete original `P`. At strength one, source is melody only, matching
-harmonization inference. Optional clean left history is the preceding arrangement;
-melody/rhythm tasks use the preceding clean melody. Neither task sees future context.
+`performances_v3.jsonl` stores pitched notes, selected melody indices and aligned
+drum notes separately, with byte-offset indexing and task eligibility. Rebuilt
+v3 data has 23,764 performances (21,422/1,160/1,182 splits) and 158 drum-bearing
+performances (140/9/9 splits). All current drum labels are jazz from Doug McKenzie;
+blues drum transfer has no corresponding labelled supervision here. Old prepared
+files and raw files remain intact. Older prepared data discarded drums and must
+not silently supply empty drum targets for the fourth task.
 
-Melody and harmony must come from the same aligned performance. Unrelated
-monophonic and polyphonic datasets cannot be paired as supervised harmonization
-examples. Lead-sheet chord symbols are not treated as recorded piano voicings.
+Files are hash-deduplicated; title/full transposition-invariant melody fingerprints
+group matched tunes before the deterministic 90/5/5 split. This does not guarantee
+identifying every alternate arrangement. Original AR pretraining overlap remains
+unaudited. Sampling balances eligible task, genre, then source. Defaults are
+30% refine, 25% rhythm, 30% harmony, 15% drums. Missing enabled-task supervision
+raises an error. Training resamples deterministic task/chunk/edits each epoch;
+validation stays fixed, with the same worker/resume guarantees.
 
-Inference generates a complete polyphonic response, replaces generated melody
-attacks within 50 ms of each anchor or during its held span, and reinstates the conditioning melody
-exactly. Additional generated notes can still be inappropriate; this safeguard
-preserves anchors rather than proving a correct arrangement or eliminating every
-possible extra-note error. Melody has priority over accompaniment restrikes of
-the same pitch/instrument while held. MIDI export ends a previous same-pitch
-strike at its next attack to prevent a late note-off from cutting off a retrigger.
-Evaluate harmony density, clashes and releases.
+## Operation and verification
 
-## Training and inference operation
+Protocol 3 checkpoints record vocabulary, seven-feature ordering, all view/style
+probabilities, the clean-target history policy, the inclusion of preceding drums,
+task weights, budgets and data-index hash. Earlier three-task
+checkpoints cannot resume optimizer/data state. `--init-checkpoint` can migrate
+their weights into a fresh run, retaining all old IDs and strength parameters,
+while initializing the fourth task row and style projection. The original AR
+checkpoint can also initialize it. Batch/accumulation/run-directory settings
+remain user-controlled. DDP, AMP, atomic saves, per-task validation, RNG/data
+position resume and Slurm checkpoint requests retain the existing AR workflow.
 
-`melody_train.py` follows the existing AR trainer's DDP/AMP/accumulation,
-AdamW, scheduler, gradient clipping, TensorBoard and resumable atomic checkpoint
-structure. The first launch migrates AR weights only, appends task rows and starts
-a new optimizer/schedule. Subsequent launches restore the fine-tuning run state.
-Checkpoint metadata records exact vocabulary, model settings, genre ordering,
-chunk/history budgets and data-index hash. The left-only protocol has metadata
-version 2; old short-window fine-tuning checkpoints cannot resume into it. Resume
-rejects incompatible settings. The configured batch size, accumulation and run
-directory remain user-controlled.
+The default inference order is refine, rhythm, harmonize, drums. `--pipeline-order`
+can move harmony before rhythm; `--input-view poly` retains a complete input
+arrangement. Single-task auto input is poly; multi-stage auto input extracts a
+melody. Drum addition is last and preserves every pitched input note exactly,
+discarding any invented pitched notes in its response. Harmony reinstates all
+supplied pitched anchors and removes generated near-duplicates. A held anchor
+has priority over same-pitch/instrument accompaniment restrikes. Export releases
+an earlier same-pitch strike at its next attack.
 
-Current settings: batch 48 per GPU, accumulation 1, learning rate 2e-5, warmup 500,
-and 20,000 optimizer updates, with learning-rate decay over the final 5,000
-updates. The step count is set by `N_STEPS` in `melody_config.py`; the standard
-training command needs no step argument. Treat this as an initial fine-tuning
-ceiling, not a benchmarked optimum, and select checkpoints using per-task
-validation curves and listening results.
+Each stage starts without history, then uses its generated output. Harmony always
+keeps its full polyphonic history. The default history view for the other tasks
+matches their target pitched view; drum history also retains generated drums.
+Explicit mono/poly history overrides remain available for those other tasks.
+Refinement continues an uncovered source suffix
+when the model ends prematurely; the phrase-ending allowance is 5% of the input
+attack span, capped at five seconds. This prevents short responses from dropping
+large sections and works for short chunks too. No classical-copy fallback is
+inserted. Empty refinement raises an error. Reports distinguish attempted spans
+from consumed input and include checkpoint/reference identity and all budgets.
 
-`melody_inference.py` extracts a classical melody, optionally refines it, restores
-new timing and harmonizes. It processes a full piece chunk by chunk and can run
-multiple melody/timing passes. Each pass starts with **no history**, then uses
-only that pass's generated output as left history for subsequent chunks (up to
-2,048 tokens). Original classical left history and right context are never
-provided. Input ownership advances through all source notes even if corruption
-removes notes or generation changes their count. Timing decoding preserves note count and
-pitch/velocity/instrument by default while generating onsets and durations;
-free attribute generation is also available. Use melody strength zero for the
-first timing-plus-harmony experiment, then gradually permit melodic changes.
-
-Inference uses checkpointed budgets. Melody/rhythm sources are capped at 3,000
-tokens and reserve a complete response of up to 2,999 new tokens (the initial
-`<S>` is already in the prompt). Harmony reserves more output space using
-`HARMONY_EXPANSION=3.0`, an adjustable estimate of arrangement tokens per source
-melody token; the hard bound is still the actual remaining 8K context. At every
-note start the grammar reserves four attributes plus `<E>`; a `<T>` also reserves
-room for a subsequent complete note. This permits added notes without cutting
-off a response mid-note. Fixed-pitch timing additionally checks room for every
-anchored note and required clock marker. Per-chunk budgets/history lengths are
-written to the inference JSON report.
-
-Saved stage MIDIs and JSON counts allow comparison of input melody, refinement,
-timing and final arrangement. Check recognizability, motif/contour retention,
-repeated attacks, rests, releases and musical style by listening. Syntax/genre/
-pitch/continuity metrics are useful supporting evidence; reconstruction loss or
-a genre score alone cannot establish successful style transfer.
-
-The original AR tools and metrics are retained. Unused diffusion and archived
-latent-model scripts are removed only from this branch. Raw data, original AR
-weights, and other worktrees are not deleted.
+Syntax, genre, pitch and continuity metrics support listening; none alone proves
+recognizable style transfer. Check repeats, rests, endings, releases, accompaniment
+clashes and drum alignment. The first production training/listening evaluation
+of the four-task model is still to be run.

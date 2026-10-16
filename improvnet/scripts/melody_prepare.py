@@ -83,7 +83,7 @@ def read_job(job):
         tok = MelodyTokenizer()
         digest = hashlib.file_digest(path.open('rb'), 'sha256').hexdigest()
         notes = (read_score_notes(path, tok) if path.suffix.lower() in ('.mxl', '.xml', '.musicxml')
-                 else read_midi_notes(path, tok))
+                 else read_midi_notes(path, tok, include_drums=True))
         return job, digest, notes, None
     except Exception as exc:
         return job, None, None, f'{type(exc).__name__}: {exc}'
@@ -96,7 +96,7 @@ def prepare(root=cfg.DATA_ROOT, output=cfg.DATA_FILE, max_files=0, workers=0):
         raise FileExistsError(f'Choose a fresh output path: {output}')
     tok = MelodyTokenizer()
     rows, errors, seen_hashes, parents, keys = [], [], set(), [], {}
-    counts = Counter()
+    counts, drum_counts = Counter(), Counter()
     def find(i):
         while parents[i] != i:
             parents[i] = parents[parents[i]]
@@ -125,10 +125,12 @@ def prepare(root=cfg.DATA_ROOT, output=cfg.DATA_FILE, max_files=0, workers=0):
                 if digest in seen_hashes:
                     counts['duplicate_files'] += 1
                     continue
-                if not notes:
+                if not any(n.instrument != 'drum' for n in notes):
                     raise ValueError('No pitched notes')
                 offset = min(n.onset for n in notes)
                 notes = [replace(n, onset=n.onset - offset) for n in ordered(notes)]
+                drums = [n for n in notes if n.instrument == 'drum']
+                notes = [n for n in notes if n.instrument != 'drum']
                 melody, harmony = (notes, []) if mono else skyline(notes, cfg.SKYLINE_TOLERANCE_MS)
                 selected = {id(n) for n in melody}
                 melody_indices = [i for i, n in enumerate(notes) if id(n) in selected]
@@ -145,12 +147,15 @@ def prepare(root=cfg.DATA_ROOT, output=cfg.DATA_FILE, max_files=0, workers=0):
                 connect(idx, 'title:' + normalized_title if normalized_title else '')
                 record = dict(path=str(path), source=source, genre=genre, title=title,
                               notes=[astuple(n) for n in notes], melody_indices=melody_indices,
-                              has_harmony=has_harmony)
+                              has_harmony=has_harmony, drums=[astuple(n) for n in drums],
+                              has_drums=bool(drums))
                 rows.append(dict(offset=handle.tell(), source=source, genre=genre,
-                                 has_harmony=has_harmony, sha256=digest))
+                                 has_harmony=has_harmony, has_drums=bool(drums), sha256=digest))
                 handle.write((json.dumps(record, separators=(',', ':')) + '\n').encode())
                 seen_hashes.add(digest)
                 counts[source] += 1
+                if drums:
+                    drum_counts[source] += 1
                 if len(rows) % 250 == 0:
                     print(f'Prepared {len(rows)} performances; {len(errors)} failures', flush=True)
             except Exception as exc:
@@ -164,10 +169,12 @@ def prepare(root=cfg.DATA_ROOT, output=cfg.DATA_FILE, max_files=0, workers=0):
         row['group'] = group
         row['split'] = ('train' if number < cfg.DATA_SPLIT_RATIOS['train'] else
                         'validation' if number < cfg.DATA_SPLIT_RATIOS['train'] + cfg.DATA_SPLIT_RATIOS['validation'] else 'test')
-    index = dict(version=2, tokenizer=tok.signature(),
+    index = dict(version=3, tokenizer=tok.signature(),
                  skyline_tolerance_ms=cfg.SKYLINE_TOLERANCE_MS, rows=rows)
     report = dict(prepared=len(rows), sources=dict(counts),
                   splits=dict(Counter(r['split'] for r in rows)), errors=errors,
+                  drum_performances=dict(drum_counts),
+                  drum_splits=dict(Counter(r['split'] for r in rows if r['has_drums'])),
                   excluded='DTL metadata and unlabelled Wikifonia mirror scores',
                   pretraining_overlap_audited=False)
     if not rows:

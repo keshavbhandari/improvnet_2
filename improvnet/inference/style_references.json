@@ -1,0 +1,933 @@
+{
+  "version": 1,
+  "feature_names": [
+    "accompaniment_attacks_per_second",
+    "accompaniment_voicing_density",
+    "ioi_mean_ms",
+    "ioi_std_ms",
+    "ioi_q25_ms",
+    "ioi_q75_ms",
+    "ioi_lag1_correlation"
+  ],
+  "definitions": {
+    "accompaniment_attacks_per_second": "Accompaniment attack groups per second; 50 ms anchored grouping.",
+    "accompaniment_voicing_density": "Mean distinct sounding accompaniment pitch/instrument pairs at group attacks, including held notes.",
+    "ioi_mean_ms": "Mean interval in milliseconds between pitched attack groups.",
+    "ioi_std_ms": "Population standard deviation of pitched attack intervals in milliseconds.",
+    "ioi_q25_ms": "25th percentile of pitched attack intervals in milliseconds.",
+    "ioi_q75_ms": "75th percentile of pitched attack intervals in milliseconds.",
+    "ioi_lag1_correlation": "Lag-one correlation of consecutive attack intervals; negative values describe alternation, not a guaranteed swing ratio."
+  },
+  "data_index_sha256": "2bc5b17476d950953bca34d30ac12e6d32bf8c9fee02ea70f576bb49a8d2b134",
+  "note": "Aggregate statistics only. Use melody_statistics for mono rhythm and statistics for poly rhythm/harmony.",
+  "examples": [
+    {
+      "id": "277643be637052b0",
+      "genre": "blues",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/ey/256418_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 1.8934485241180705,
+        "accompaniment_voicing_density": 2.5247148288973382,
+        "ioi_mean_ms": 247.71700356718193,
+        "ioi_std_ms": 177.0178942795985,
+        "ioi_q25_ms": 120.0,
+        "ioi_q75_ms": 360.0,
+        "ioi_lag1_correlation": 0.3769784391059041
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 251.60628019323673,
+        "ioi_std_ms": 176.11365335418276,
+        "ioi_q25_ms": 120.0,
+        "ioi_q75_ms": 360.0,
+        "ioi_lag1_correlation": 0.3881540759695072
+      }
+    },
+    {
+      "id": "6e4e55ca4252d323",
+      "genre": "blues",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/in/443695_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 1.9996244836650394,
+        "accompaniment_voicing_density": 2.2331768388106417,
+        "ioi_mean_ms": 318.85229540918164,
+        "ioi_std_ms": 278.20313831332993,
+        "ioi_q25_ms": 200.0,
+        "ioi_q75_ms": 390.0,
+        "ioi_lag1_correlation": 0.41882234444321553
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 325.0050864699898,
+        "ioi_std_ms": 278.6969661780224,
+        "ioi_q25_ms": 200.0,
+        "ioi_q75_ms": 390.0,
+        "ioi_lag1_correlation": 0.42236295424437753
+      }
+    },
+    {
+      "id": "1d26c368182a96ce",
+      "genre": "blues",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/ek/229526_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 1.8802611910943277,
+        "accompaniment_voicing_density": 2.98744769874477,
+        "ioi_mean_ms": 220.9391304347826,
+        "ioi_std_ms": 259.87720467999367,
+        "ioi_q25_ms": 90.0,
+        "ioi_q75_ms": 280.0,
+        "ioi_lag1_correlation": 0.4776029333725111
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 226.04982206405694,
+        "ioi_std_ms": 260.50877747311654,
+        "ioi_q25_ms": 100.0,
+        "ioi_q75_ms": 280.0,
+        "ioi_lag1_correlation": 0.48922335323598515
+      }
+    },
+    {
+      "id": "8f82cc7070766ab0",
+      "genre": "blues",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/cd/111474_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 1.9151998228716927,
+        "accompaniment_voicing_density": 1.6907514450867052,
+        "ioi_mean_ms": 208.8167053364269,
+        "ioi_std_ms": 143.31019137043273,
+        "ioi_q25_ms": 140.0,
+        "ioi_q75_ms": 290.0,
+        "ioi_lag1_correlation": 0.406438986909503
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 208.8167053364269,
+        "ioi_std_ms": 143.27942715300625,
+        "ioi_q25_ms": 140.0,
+        "ioi_q75_ms": 290.0,
+        "ioi_lag1_correlation": 0.4086656764545219
+      }
+    },
+    {
+      "id": "48639f47c3a72882",
+      "genre": "blues",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/ix/462343_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 1.794357218746311,
+        "accompaniment_voicing_density": 3.289473684210526,
+        "ioi_mean_ms": 185.7239819004525,
+        "ioi_std_ms": 101.93177478066552,
+        "ioi_q25_ms": 100.0,
+        "ioi_q75_ms": 230.0,
+        "ioi_lag1_correlation": 0.2660640063088797
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 186.99316628701595,
+        "ioi_std_ms": 100.95027959853533,
+        "ioi_q25_ms": 100.0,
+        "ioi_q75_ms": 230.0,
+        "ioi_lag1_correlation": 0.2744807276679176
+      }
+    },
+    {
+      "id": "f1f3e9dac85f7315",
+      "genre": "blues",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/bw/096676_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 4.926320981564832,
+        "accompaniment_voicing_density": 1.8523153942428034,
+        "ioi_mean_ms": 128.86327503974562,
+        "ioi_std_ms": 47.079022997978925,
+        "ioi_q25_ms": 90.0,
+        "ioi_q75_ms": 160.0,
+        "ioi_lag1_correlation": -0.10244192931754792
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 130.61240934730057,
+        "ioi_std_ms": 46.776291102047985,
+        "ioi_q25_ms": 100,
+        "ioi_q75_ms": 160,
+        "ioi_lag1_correlation": -0.07204257723358837
+      }
+    },
+    {
+      "id": "47f3739a3360ff33",
+      "genre": "blues",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/ed/215427_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 1.551791025475236,
+        "accompaniment_voicing_density": 2.7708333333333335,
+        "ioi_mean_ms": 414.7683923705722,
+        "ioi_std_ms": 179.10278443767518,
+        "ioi_q25_ms": 310.0,
+        "ioi_q75_ms": 610.0,
+        "ioi_lag1_correlation": 0.3252321868877969
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 420.49723756906076,
+        "ioi_std_ms": 175.7125233907557,
+        "ioi_q25_ms": 310.0,
+        "ioi_q75_ms": 617.5,
+        "ioi_lag1_correlation": 0.3917624770695834
+      }
+    },
+    {
+      "id": "455a2c7a3fec0519",
+      "genre": "blues",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/de/165977_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 5.835162340119579,
+        "accompaniment_voicing_density": 2.4798962386511025,
+        "ioi_mean_ms": 153.906432748538,
+        "ioi_std_ms": 46.68862283768283,
+        "ioi_q25_ms": 120.0,
+        "ioi_q75_ms": 200.0,
+        "ioi_lag1_correlation": -0.33758206053148315
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 156.270783847981,
+        "ioi_std_ms": 42.72613808469718,
+        "ioi_q25_ms": 130.0,
+        "ioi_q75_ms": 190.0,
+        "ioi_lag1_correlation": -0.40062502701533187
+      }
+    },
+    {
+      "id": "089bf1ae3dbdb126",
+      "genre": "jazz",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/cu/145432_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 0.9293332501715212,
+        "accompaniment_voicing_density": 3.208053691275168,
+        "ioi_mean_ms": 419.11528150134046,
+        "ioi_std_ms": 283.0445736593511,
+        "ioi_q25_ms": 230,
+        "ioi_q75_ms": 480,
+        "ioi_lag1_correlation": 0.3510107970774377
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 420.241935483871,
+        "ioi_std_ms": 282.99415922487475,
+        "ioi_q25_ms": 230.0,
+        "ioi_q75_ms": 480.0,
+        "ioi_lag1_correlation": 0.349631225298011
+      }
+    },
+    {
+      "id": "805105c19f3bc39e",
+      "genre": "jazz",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/ki/536609_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 2.8125573710299245,
+        "accompaniment_voicing_density": 2.5613577023498695,
+        "ioi_mean_ms": 175.35438144329896,
+        "ioi_std_ms": 151.99321126110527,
+        "ioi_q25_ms": 90.0,
+        "ioi_q75_ms": 210.0,
+        "ioi_lag1_correlation": 0.42893326555485684
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 177.64360313315927,
+        "ioi_std_ms": 151.78484112166242,
+        "ioi_q25_ms": 90.0,
+        "ioi_q75_ms": 220.0,
+        "ioi_lag1_correlation": 0.44875917890721095
+      }
+    },
+    {
+      "id": "e3bda24143dd3efa",
+      "genre": "jazz",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/fi/276207_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 1.3129418554321166,
+        "accompaniment_voicing_density": 3.076923076923077,
+        "ioi_mean_ms": 298.49557522123894,
+        "ioi_std_ms": 240.23116168051175,
+        "ioi_q25_ms": 150.0,
+        "ioi_q75_ms": 360.0,
+        "ioi_lag1_correlation": 0.4327646155611521
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 300.48997772828506,
+        "ioi_std_ms": 241.85296295518057,
+        "ioi_q25_ms": 150,
+        "ioi_q75_ms": 360,
+        "ioi_lag1_correlation": 0.44777277440871144
+      }
+    },
+    {
+      "id": "8bbf5cda206633ca",
+      "genre": "jazz",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/ii/433033_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 0.5668257756563246,
+        "accompaniment_voicing_density": 3.909090909090909,
+        "ioi_mean_ms": 321.24119718309856,
+        "ioi_std_ms": 321.2154375444561,
+        "ioi_q25_ms": 150.0,
+        "ioi_q75_ms": 280.0,
+        "ioi_lag1_correlation": 0.2606718507581688
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 322.94690265486724,
+        "ioi_std_ms": 320.6868828416426,
+        "ioi_q25_ms": 150.0,
+        "ioi_q75_ms": 280.0,
+        "ioi_lag1_correlation": 0.27440197131709504
+      }
+    },
+    {
+      "id": "62faca3e546005fb",
+      "genre": "jazz",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/hi/381822_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 0.8589692369157012,
+        "accompaniment_voicing_density": 7.062015503875969,
+        "ioi_mean_ms": 511.59722222222223,
+        "ioi_std_ms": 366.47563810656925,
+        "ioi_q25_ms": 320.0,
+        "ioi_q75_ms": 730.0,
+        "ioi_lag1_correlation": -0.002937718888900559
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 528.100358422939,
+        "ioi_std_ms": 360.9976875687422,
+        "ioi_q25_ms": 330.0,
+        "ioi_q75_ms": 725.0,
+        "ioi_lag1_correlation": 0.05313663458104899
+      }
+    },
+    {
+      "id": "0b0060e17d383c61",
+      "genre": "jazz",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/au/040363_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 1.6189116735717022,
+        "accompaniment_voicing_density": 4.873118279569892,
+        "ioi_mean_ms": 248.4695652173913,
+        "ioi_std_ms": 150.70473993521708,
+        "ioi_q25_ms": 160.0,
+        "ioi_q75_ms": 350.0,
+        "ioi_lag1_correlation": 0.42386256643804354
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 250.86918349429325,
+        "ioi_std_ms": 150.60439986116702,
+        "ioi_q25_ms": 160.0,
+        "ioi_q75_ms": 350.0,
+        "ioi_lag1_correlation": 0.42323768404743956
+      }
+    },
+    {
+      "id": "a4058da6e533f324",
+      "genre": "jazz",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/kg/533915_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 0.9105595535320898,
+        "accompaniment_voicing_density": 5.040322580645161,
+        "ioi_mean_ms": 416.55172413793105,
+        "ioi_std_ms": 214.95940344692121,
+        "ioi_q25_ms": 295.0,
+        "ioi_q75_ms": 510.0,
+        "ioi_lag1_correlation": 0.02968170828860029
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 419.1482649842271,
+        "ioi_std_ms": 213.47559521526122,
+        "ioi_q25_ms": 300,
+        "ioi_q75_ms": 500,
+        "ioi_lag1_correlation": 0.08120640824772725
+      }
+    },
+    {
+      "id": "f6116c02faf043ac",
+      "genre": "jazz",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/dg/168919_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 3.556266196173568,
+        "accompaniment_voicing_density": 2.012403100775194,
+        "ioi_mean_ms": 129.15278783490226,
+        "ioi_std_ms": 147.87196440808313,
+        "ioi_q25_ms": 90,
+        "ioi_q75_ms": 120,
+        "ioi_lag1_correlation": 0.2954391219960772
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 130.38011695906434,
+        "ioi_std_ms": 148.80715359615553,
+        "ioi_q25_ms": 90.0,
+        "ioi_q75_ms": 120.0,
+        "ioi_lag1_correlation": 0.3101822109416835
+      }
+    },
+    {
+      "id": "b1be310f9fd9fe0e",
+      "genre": "jazz",
+      "source": "doug",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/doug_mcenzie_jazz/Baby its Cold outside.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 2.563995837669095,
+        "accompaniment_voicing_density": 5.779220779220779,
+        "ioi_mean_ms": 265.5754189944134,
+        "ioi_std_ms": 224.34430506924681,
+        "ioi_q25_ms": 60.0,
+        "ioi_q75_ms": 440.0,
+        "ioi_lag1_correlation": -0.19424047199056518
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 316.07712765957444,
+        "ioi_std_ms": 220.64800457666632,
+        "ioi_q25_ms": 190.0,
+        "ioi_q75_ms": 470.0,
+        "ioi_lag1_correlation": -0.11266694069730966
+      }
+    },
+    {
+      "id": "5d06a7cbdb2a7c85",
+      "genre": "jazz",
+      "source": "doug",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/doug_mcenzie_jazz/Long Ago and Far away - 3 versions.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 1.5541308229183575,
+        "accompaniment_voicing_density": 2.864229765013055,
+        "ioi_mean_ms": 294.1696535244922,
+        "ioi_std_ms": 156.4142246997071,
+        "ioi_q25_ms": 180,
+        "ioi_q75_ms": 350,
+        "ioi_lag1_correlation": 0.22054527226875753
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 294.874251497006,
+        "ioi_std_ms": 155.58990237238464,
+        "ioi_q25_ms": 185.0,
+        "ioi_q75_ms": 350.0,
+        "ioi_lag1_correlation": 0.2222851211966775
+      }
+    },
+    {
+      "id": "c2bc2610dd3f4afd",
+      "genre": "jazz",
+      "source": "doug",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/doug_mcenzie_jazz/Zingaro - Jobim.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 2.004531436843099,
+        "accompaniment_voicing_density": 3.6514913657770802,
+        "ioi_mean_ms": 261.4190871369295,
+        "ioi_std_ms": 146.95660397923112,
+        "ioi_q25_ms": 190,
+        "ioi_q75_ms": 360,
+        "ioi_lag1_correlation": 0.19378564528088207
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 263.84422110552765,
+        "ioi_std_ms": 145.92584055716898,
+        "ioi_q25_ms": 190.0,
+        "ioi_q75_ms": 360.0,
+        "ioi_lag1_correlation": 0.22561972176206502
+      }
+    },
+    {
+      "id": "e99de997db9e8450",
+      "genre": "jazz",
+      "source": "doug",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/doug_mcenzie_jazz/McKenzie-secret love.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 2.40831964969896,
+        "accompaniment_voicing_density": 3.0961538461538463,
+        "ioi_mean_ms": 227.46859903381642,
+        "ioi_std_ms": 220.51710797055898,
+        "ioi_q25_ms": 110.0,
+        "ioi_q75_ms": 270.0,
+        "ioi_lag1_correlation": 0.11104531642655344
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 234.0159045725646,
+        "ioi_std_ms": 220.38457202807749,
+        "ioi_q25_ms": 130.0,
+        "ioi_q75_ms": 270.0,
+        "ioi_lag1_correlation": 0.18090829306206221
+      }
+    },
+    {
+      "id": "7a15cb38335ed302",
+      "genre": "jazz",
+      "source": "doug",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/doug_mcenzie_jazz/gonewind.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 1.7356079567909366,
+        "accompaniment_voicing_density": 3.7760910815939277,
+        "ioi_mean_ms": 292.2211445198836,
+        "ioi_std_ms": 204.62217928450505,
+        "ioi_q25_ms": 160.0,
+        "ioi_q75_ms": 400.0,
+        "ioi_lag1_correlation": 0.33466960756434455
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 298.00197823936696,
+        "ioi_std_ms": 205.26204331381996,
+        "ioi_q25_ms": 170.0,
+        "ioi_q75_ms": 415.0,
+        "ioi_lag1_correlation": 0.36332780578887086
+      }
+    },
+    {
+      "id": "5eadd2a814f087b7",
+      "genre": "jazz",
+      "source": "doug",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/doug_mcenzie_jazz/Prelude1 (1).mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 1.2706571010457937,
+        "accompaniment_voicing_density": 4.561797752808989,
+        "ioi_mean_ms": 477.6632302405498,
+        "ioi_std_ms": 336.4066788820318,
+        "ioi_q25_ms": 290.0,
+        "ioi_q75_ms": 550.0,
+        "ioi_lag1_correlation": 0.29184243283278216
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 485.16579406631763,
+        "ioi_std_ms": 335.51218757253787,
+        "ioi_q25_ms": 300,
+        "ioi_q75_ms": 560,
+        "ioi_lag1_correlation": 0.2988061767347749
+      }
+    },
+    {
+      "id": "05e098aea00b5e72",
+      "genre": "jazz",
+      "source": "doug",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/doug_mcenzie_jazz/AfterYou.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 2.9159896359404507,
+        "accompaniment_voicing_density": 3.1340361445783134,
+        "ioi_mean_ms": 165.65597667638485,
+        "ioi_std_ms": 108.8111934363793,
+        "ioi_q25_ms": 80.0,
+        "ioi_q75_ms": 230.0,
+        "ioi_lag1_correlation": 0.05813146872898908
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 177.1473109898675,
+        "ioi_std_ms": 110.76070545255797,
+        "ioi_q25_ms": 90.0,
+        "ioi_q75_ms": 250.0,
+        "ioi_lag1_correlation": 0.1333938457847555
+      }
+    },
+    {
+      "id": "8c8348898a3d56eb",
+      "genre": "jazz",
+      "source": "doug",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/doug_mcenzie_jazz/If Ever I Should Leave You.MID",
+      "statistics": {
+        "accompaniment_attacks_per_second": 0.9945721064777197,
+        "accompaniment_voicing_density": 5.490196078431373,
+        "ioi_mean_ms": 589.9610136452242,
+        "ioi_std_ms": 386.7367329648344,
+        "ioi_q25_ms": 410,
+        "ioi_q75_ms": 660,
+        "ioi_lag1_correlation": 0.20316831611025551
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 599.3069306930693,
+        "ioi_std_ms": 382.3809137748539,
+        "ioi_q25_ms": 420,
+        "ioi_q75_ms": 670,
+        "ioi_lag1_correlation": 0.19817202349277677
+      }
+    },
+    {
+      "id": "7c1c55a855053dc5",
+      "genre": "jazz",
+      "source": "pijama",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/pijama-retranscribed/pijama-retranscribed/data/studio/George Shearing/Piano/John O'Groats_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 1.0258722732653176,
+        "accompaniment_voicing_density": 4.543956043956044,
+        "ioi_mean_ms": 526.6869300911854,
+        "ioi_std_ms": 281.2968704818014,
+        "ioi_q25_ms": 410,
+        "ioi_q75_ms": 640,
+        "ioi_lag1_correlation": 0.06343687494384126
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 562.5974025974026,
+        "ioi_std_ms": 262.29334523447704,
+        "ioi_q25_ms": 480.0,
+        "ioi_q75_ms": 650.0,
+        "ioi_lag1_correlation": 0.0641188117169707
+      }
+    },
+    {
+      "id": "e0548cf1f00966a3",
+      "genre": "jazz",
+      "source": "pijama",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/pijama-retranscribed/pijama-retranscribed/data/studio/Dick Hyman/Dick Hyman Plays Fats Waller/Stealin' Apples_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 3.671450466768845,
+        "accompaniment_voicing_density": 2.062618595825427,
+        "ioi_mean_ms": 118.8255033557047,
+        "ioi_std_ms": 74.8631621083026,
+        "ioi_q25_ms": 80.0,
+        "ioi_q75_ms": 160.0,
+        "ioi_lag1_correlation": 0.5060514078641021
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 119.31760741364785,
+        "ioi_std_ms": 74.60509491335284,
+        "ioi_q25_ms": 80.0,
+        "ioi_q75_ms": 160.0,
+        "ioi_lag1_correlation": 0.5299430856780301
+      }
+    },
+    {
+      "id": "ecb815e0e658e711",
+      "genre": "jazz",
+      "source": "pijama",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/pijama-retranscribed/pijama-retranscribed/data/studio/Clare Fischer/Alone Together/Excerpt from Canonic Passacaglia_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 2.238447826683121,
+        "accompaniment_voicing_density": 3.4716692189892804,
+        "ioi_mean_ms": 248.12765957446808,
+        "ioi_std_ms": 117.32073097197694,
+        "ioi_q25_ms": 180.0,
+        "ioi_q75_ms": 320.0,
+        "ioi_lag1_correlation": 0.3792967571938175
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 250.24034334763948,
+        "ioi_std_ms": 115.68320180251439,
+        "ioi_q25_ms": 190,
+        "ioi_q75_ms": 320,
+        "ioi_lag1_correlation": 0.40831764243937085
+      }
+    },
+    {
+      "id": "fc2e8af8b445c9e9",
+      "genre": "jazz",
+      "source": "pijama",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/pijama-retranscribed/pijama-retranscribed/data/live/Roger Kellaway/The Maybeck Recital Series, Vol. 11/Close Your Eyes - Live At Maybeck Recital Hall, Berkeley, CA  March 10, 1991_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 3.0517762660619803,
+        "accompaniment_voicing_density": 2.9930340557275543,
+        "ioi_mean_ms": 168.59194256082966,
+        "ioi_std_ms": 129.70238332360904,
+        "ioi_q25_ms": 90.0,
+        "ioi_q75_ms": 210.0,
+        "ioi_lag1_correlation": 0.2981760205537655
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 172.5142857142857,
+        "ioi_std_ms": 129.73868870517705,
+        "ioi_q25_ms": 100.0,
+        "ioi_q75_ms": 220.0,
+        "ioi_lag1_correlation": 0.3076056890396261
+      }
+    },
+    {
+      "id": "7b999b6e82f908d3",
+      "genre": "jazz",
+      "source": "pijama",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/pijama-retranscribed/pijama-retranscribed/data/studio/Andy Laverne/Tadd's Delight/Soultrane_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 0.9747629857123782,
+        "accompaniment_voicing_density": 4.950684931506849,
+        "ioi_mean_ms": 326.832895888014,
+        "ioi_std_ms": 362.70893768425617,
+        "ioi_q25_ms": 110.0,
+        "ioi_q75_ms": 390.0,
+        "ioi_lag1_correlation": 0.3940288135041606
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 329.71756398940863,
+        "ioi_std_ms": 363.38861880819246,
+        "ioi_q25_ms": 120,
+        "ioi_q75_ms": 390,
+        "ioi_lag1_correlation": 0.3977448228870888
+      }
+    },
+    {
+      "id": "dd9a11bd68015e59",
+      "genre": "jazz",
+      "source": "pijama",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/pijama-retranscribed/pijama-retranscribed/data/studio/Dick Hyman/Dick Hyman Plays Duke Ellington/I Let a Song Go Out of My Heart_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 1.7105516048433596,
+        "accompaniment_voicing_density": 3.18876404494382,
+        "ioi_mean_ms": 222.12564543889846,
+        "ioi_std_ms": 171.01662624068217,
+        "ioi_q25_ms": 120.0,
+        "ioi_q75_ms": 240.0,
+        "ioi_lag1_correlation": 0.4505124976077507
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 222.8929188255613,
+        "ioi_std_ms": 170.60951568141996,
+        "ioi_q25_ms": 120.0,
+        "ioi_q75_ms": 240.0,
+        "ioi_lag1_correlation": 0.47417215049566946
+      }
+    },
+    {
+      "id": "e7a3b1adc247e550",
+      "genre": "jazz",
+      "source": "pijama",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/pijama-retranscribed/pijama-retranscribed/data/live/Joanne Brackeen/The Maybeck Recital Series, Vol. 1/Thou Swell_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 2.346897290904387,
+        "accompaniment_voicing_density": 4.133858267716535,
+        "ioi_mean_ms": 201.0126582278481,
+        "ioi_std_ms": 105.03278495650122,
+        "ioi_q25_ms": 120.0,
+        "ioi_q75_ms": 270.0,
+        "ioi_lag1_correlation": 0.3386253838229318
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 202.67267267267266,
+        "ioi_std_ms": 104.70136742327826,
+        "ioi_q25_ms": 120.0,
+        "ioi_q75_ms": 260.0,
+        "ioi_lag1_correlation": 0.3362636041040901
+      }
+    },
+    {
+      "id": "0abe2cfb989f0a21",
+      "genre": "jazz",
+      "source": "pijama",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/pijama-retranscribed/pijama-retranscribed/data/live/Jaki Byard/The Maybeck Recital Series, Vol. 17/Family Suite - Live At Maybeck Recital Hall, Berkeley, CA  September 8, 1991_0.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 2.1331964104419265,
+        "accompaniment_voicing_density": 4.541575492341357,
+        "ioi_mean_ms": 224.91730112890522,
+        "ioi_std_ms": 247.77041969171407,
+        "ioi_q25_ms": 110,
+        "ioi_q75_ms": 240,
+        "ioi_lag1_correlation": 0.3758574866763711
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 231.48338286949473,
+        "ioi_std_ms": 249.83861650195198,
+        "ioi_q25_ms": 120,
+        "ioi_q75_ms": 250,
+        "ioi_lag1_correlation": 0.40381991551628776
+      }
+    },
+    {
+      "id": "7ed71e0295486abc",
+      "genre": "jazz",
+      "source": "weimar",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/weimar/raw/JoeLovano_ICan'tGetStarted_FINAL.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 0.07089370375293544,
+        "accompaniment_voicing_density": 15.0,
+        "ioi_mean_ms": 247.27172717271728,
+        "ioi_std_ms": 335.0973683817238,
+        "ioi_q25_ms": 110,
+        "ioi_q75_ms": 240,
+        "ioi_lag1_correlation": 0.024538660644698996
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 247.27172717271728,
+        "ioi_std_ms": 335.0973683817238,
+        "ioi_q25_ms": 110,
+        "ioi_q75_ms": 240,
+        "ioi_lag1_correlation": 0.024538660644698996
+      }
+    },
+    {
+      "id": "948932fd75211f9f",
+      "genre": "jazz",
+      "source": "weimar",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/weimar/raw/CharlieParker_K.C.Blues_FINAL.mid",
+      "statistics": {
+        "ioi_mean_ms": 255.69230769230768,
+        "ioi_std_ms": 313.8314224798089,
+        "ioi_q25_ms": 120.0,
+        "ioi_q75_ms": 245.0,
+        "ioi_lag1_correlation": -0.07051540000811675
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 255.69230769230768,
+        "ioi_std_ms": 313.8314224798089,
+        "ioi_q25_ms": 120.0,
+        "ioi_q75_ms": 245.0,
+        "ioi_lag1_correlation": -0.07051540000811675
+      }
+    },
+    {
+      "id": "9e0b9533da0d2c26",
+      "genre": "jazz",
+      "source": "weimar",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/weimar/raw/JoeHenderson_In'NOut-2_FINAL.mid",
+      "statistics": {
+        "accompaniment_attacks_per_second": 0.1344414568565143,
+        "accompaniment_voicing_density": 8.0,
+        "ioi_mean_ms": 164.7983870967742,
+        "ioi_std_ms": 221.3465929056671,
+        "ioi_q25_ms": 90.0,
+        "ioi_q75_ms": 170.0,
+        "ioi_lag1_correlation": 0.053188918918916285
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 164.7983870967742,
+        "ioi_std_ms": 221.3465929056671,
+        "ioi_q25_ms": 90.0,
+        "ioi_q75_ms": 170.0,
+        "ioi_lag1_correlation": 0.053188918918916285
+      }
+    },
+    {
+      "id": "7778600966ed233f",
+      "genre": "jazz",
+      "source": "weimar",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/weimar/raw/JJJohnson_CrazyRhythm_FINAL.mid",
+      "statistics": {
+        "ioi_mean_ms": 228.62295081967213,
+        "ioi_std_ms": 233.93092464667174,
+        "ioi_q25_ms": 110.0,
+        "ioi_q75_ms": 240.0,
+        "ioi_lag1_correlation": 0.01584483762646637
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 228.62295081967213,
+        "ioi_std_ms": 233.93092464667174,
+        "ioi_q25_ms": 110.0,
+        "ioi_q75_ms": 240.0,
+        "ioi_lag1_correlation": 0.01584483762646637
+      }
+    },
+    {
+      "id": "1aca89dc213f2270",
+      "genre": "jazz",
+      "source": "weimar",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/weimar/raw/OrnetteColeman_Chronology_FINAL.mid",
+      "statistics": {
+        "ioi_mean_ms": 241.65662650602408,
+        "ioi_std_ms": 310.85089622680044,
+        "ioi_q25_ms": 110.0,
+        "ioi_q75_ms": 220.0,
+        "ioi_lag1_correlation": -0.1044678248496089
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 241.65662650602408,
+        "ioi_std_ms": 310.85089622680044,
+        "ioi_q25_ms": 110.0,
+        "ioi_q75_ms": 220.0,
+        "ioi_lag1_correlation": -0.1044678248496089
+      }
+    },
+    {
+      "id": "0e30880e2af98eb7",
+      "genre": "jazz",
+      "source": "weimar",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/weimar/raw/DonEllis_ILoveYou_FINAL.mid",
+      "statistics": {
+        "ioi_mean_ms": 343.94736842105266,
+        "ioi_std_ms": 415.0747521368842,
+        "ioi_q25_ms": 140.0,
+        "ioi_q75_ms": 340.0,
+        "ioi_lag1_correlation": 0.01560346347682348
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 343.94736842105266,
+        "ioi_std_ms": 415.0747521368842,
+        "ioi_q25_ms": 140.0,
+        "ioi_q75_ms": 340.0,
+        "ioi_lag1_correlation": 0.01560346347682348
+      }
+    },
+    {
+      "id": "ce9a1af685201598",
+      "genre": "jazz",
+      "source": "weimar",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/weimar/raw/BixBeiderbecke_Margie_FINAL.mid",
+      "statistics": {
+        "ioi_mean_ms": 314.26229508196724,
+        "ioi_std_ms": 233.1006889764377,
+        "ioi_q25_ms": 160,
+        "ioi_q75_ms": 340,
+        "ioi_lag1_correlation": -0.034845528974617325
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 314.26229508196724,
+        "ioi_std_ms": 233.1006889764377,
+        "ioi_q25_ms": 160,
+        "ioi_q75_ms": 340,
+        "ioi_lag1_correlation": -0.034845528974617325
+      }
+    },
+    {
+      "id": "3d903c79010ebac8",
+      "genre": "jazz",
+      "source": "weimar",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/weimar/raw/SteveLacy_EasyToLove_FINAL.mid",
+      "statistics": {
+        "ioi_mean_ms": 268.0431654676259,
+        "ioi_std_ms": 286.4798477602111,
+        "ioi_q25_ms": 130.0,
+        "ioi_q75_ms": 250.0,
+        "ioi_lag1_correlation": 0.08263635401507498
+      },
+      "melody_statistics": {
+        "ioi_mean_ms": 268.0431654676259,
+        "ioi_std_ms": 286.4798477602111,
+        "ioi_q25_ms": 130.0,
+        "ioi_q75_ms": 250.0,
+        "ioi_lag1_correlation": 0.08263635401507498
+      }
+    }
+  ]
+}

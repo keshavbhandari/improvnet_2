@@ -9,8 +9,8 @@ import random
 from improvnet.tokenizer.absolute import AbsTokenizer
 from improvnet.tokenizer.midi import MidiDict
 
-TASKS = ("refine", "rhythm", "harmonize")
-TASK_TOKENS = dict(zip(TASKS, ("<REFINE>", "<RHYTHM>", "<HARMONIZE>")))
+TASKS = ("refine", "rhythm", "harmonize", "drums")
+TASK_TOKENS = dict(zip(TASKS, ("<REFINE>", "<RHYTHM>", "<HARMONIZE>", "<DRUMS>")))
 
 
 class MelodyTokenizer(AbsTokenizer):
@@ -87,12 +87,12 @@ def tokens_to_notes(tokens, tokenizer=None):
     return ordered(notes)
 
 
-def read_midi_notes(path, tokenizer=None):
+def read_midi_notes(path, tokenizer=None, include_drums=False):
     tok = tokenizer or MelodyTokenizer()
     midi = MidiDict.from_midi(str(path))
     tokens = tok.tokenize(midi, remove_preceding_silence=False, add_dim_tok=False)
     # Drum examples are not melody/harmony supervision for the piano pilot.
-    return [n for n in tokens_to_notes(tokens, tok) if n.instrument != "drum"]
+    return [n for n in tokens_to_notes(tokens, tok) if include_drums or n.instrument != "drum"]
 
 
 def write_midi_notes(notes, path, tokenizer=None):
@@ -110,25 +110,28 @@ def write_midi_notes(notes, path, tokenizer=None):
     tok.detokenize(notes_to_tokens(released, tok)).to_midi().save(str(path))
 
 
-def skyline(notes, chord_tolerance_ms=50):
-    """Partition by original note identity: highest attack per rolled chord.
-
-    A group is anchored at its first attack, avoiding chained timing drift.
-    Durations/velocities are retained, including pedal-related overlaps. This
-    is an approximate melody extractor, not a ground-truth voice separator.
-    """
+def attack_groups(notes, tolerance_ms=50):
+    """Anchored performed-chord groups; preserve fast runs and retriggers."""
     notes = ordered(notes)
-    selected, i = set(), 0
+    groups, i = [], 0
     while i < len(notes):
         j = i + 1
-        while (j < len(notes) and notes[j].onset - notes[i].onset <= chord_tolerance_ms
+        while (j < len(notes) and notes[j].onset - notes[i].onset <= tolerance_ms
                and notes[j].pitch not in {n.pitch for n in notes[i:j]}
                and max(n.onset + n.duration for n in notes[i:j]) > notes[j].onset):
             j += 1
-        selected.add(max(range(i, j), key=lambda k: (notes[k].pitch, -notes[k].onset)))
+        groups.append(notes[i:j])
         i = j
-    return ([n for i, n in enumerate(notes) if i in selected],
-            [n for i, n in enumerate(notes) if i not in selected])
+    return groups
+
+
+def skyline(notes, chord_tolerance_ms=50):
+    """Highest original attack per rolled chord; an approximate voice separator."""
+    notes = ordered(notes)
+    selected = {id(max(g, key=lambda n: (n.pitch, -n.onset)))
+                for g in attack_groups(notes, chord_tolerance_ms)}
+    return ([n for n in notes if id(n) in selected],
+            [n for n in notes if id(n) not in selected])
 
 
 def window(notes, start, end):
@@ -218,12 +221,15 @@ def mask_timing(notes, fraction, rng, tokenizer=None):
     if not 0 <= fraction <= 1:
         raise ValueError("Mask fraction must be in [0,1]")
     tokens = notes_to_tokens(notes, tokenizer)
-    chosen = set(rng.sample(range(len(notes)), round(fraction * len(notes))))
+    # Mask simultaneous notes together, so polyphonic timing edits preserve chords.
+    onsets = sorted({n.onset for n in notes})
+    chosen = set(rng.sample(onsets, round(fraction * len(onsets))))
+    selected = [n.onset in chosen for n in ordered(notes)]
     note_idx = -1
     for i, token in enumerate(tokens):
         if isinstance(token, tuple) and token[0] == "instrument":
             note_idx += 1
-        if note_idx in chosen and isinstance(token, tuple) and token[0] in ("onset", "dur"):
+        if note_idx >= 0 and selected[note_idx] and isinstance(token, tuple) and token[0] in ("onset", "dur"):
             tokens[i] = "<MASK>"
     return tokens
 
