@@ -1,6 +1,6 @@
 """Standalone genre-encoder training: python -m or torchrun, never on import.
 
-Matches uniform_diffusion_train's config/DDP/AMP/checkpoint organization, but
+Matches the stage-2 trainer's config/DDP/AMP/checkpoint organization, but
 uses independent parameters, class-balanced music excerpts and classification
 CE. It does not load AR weights or alter shared data/preprocessing.
 """

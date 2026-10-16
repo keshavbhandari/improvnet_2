@@ -13,17 +13,17 @@ import mido
 import numpy as np
 import torch
 
-from improvnet.model import latent_diffusion_config as defaults
-from improvnet.model.latent_diffusion_model import LatentDiffusionConfig, LatentDiffusionModel
-from improvnet.model.latent_diffusion_train import batch_objective, model_config, validate_config
+from improvnet.model import latent_flow_config as defaults
+from improvnet.model.latent_flow_model import LatentFlowConfig, LatentFlowModel
+from improvnet.model.latent_flow_train import batch_objective, model_config, validate_config
 from improvnet.model.local_vae_model import LocalVAE, LocalVAEConfig
 from improvnet.tokenizer.hierarchical import GridConfig, HierarchicalTokenizer, read_performance
 from improvnet.utils.local_vae_data import build_midi_index
-from improvnet.utils.latent_diffusion import (LatentNormalizer, checkpoint_digest, clean_from_velocity,
-    encode_windows, noise_target, sample, weighted_loss)
-from improvnet.utils.latent_diffusion_data import (LatentDiffusionDataset, accompaniment, collate_windows,
+from improvnet.utils.latent_flow import (LatentNormalizer, checkpoint_digest, clean_from_velocity,
+    encode_windows, flow_target, sample, weighted_loss)
+from improvnet.utils.latent_flow_data import (LatentFlowDataset, accompaniment, collate_windows,
     genre_labels, transpose_window, window_tensors)
-from improvnet.inference.latent_diffusion_inference import generate, load_model, reference_events, resize_piece
+from improvnet.inference.latent_flow_inference import generate, load_model, reference_events, resize_piece
 from improvnet.utils.note_decoding import NoteDecoding
 
 
@@ -64,7 +64,7 @@ def fixture(mode="full", start=1, *, latent_channels=8, **overrides):
     item = window_tensors(piece, start, c, mode=mode)
     item["retries"] = torch.tensor(0)
     batch = collate_windows([item])
-    model = LatentDiffusionModel(model_config(c, vae, ("<unconditioned>", "classical", "jazz")))
+    model = LatentFlowModel(model_config(c, vae, ("<unconditioned>", "classical", "jazz")))
     normalizer = LatentNormalizer(torch.zeros(latent_channels), torch.ones(latent_channels))
     return c, vae, piece, batch, model, normalizer
 
@@ -133,15 +133,20 @@ class Stage2Tests(unittest.TestCase):
         self.assertFalse(w[:, -1].any())
         self.assertFalse(z[:, -1].any())
 
-    def test_velocity_noise_inversion_and_clean_history(self):
+    def test_straight_flow_path_velocity_and_clean_history(self):
         c, vae, _, batch, _, norm = fixture()
         z, w = encode_windows(vae, batch)
         z = norm.normalize(z, w)
         for time in (0., .2, .5, 1.):
-            noisy, v, levels = noise_target(z, batch["known"], w, torch.tensor([time]), torch.randn_like(z))
+            epsilon = torch.randn_like(z)
+            noisy, v, levels = flow_target(z, batch["known"], w, torch.tensor([time]), epsilon)
+            expected_state = torch.where(batch["known"][..., None, None, None], z, (1-time)*epsilon + time*z).masked_fill(~(w > 0), 0)
+            expected_velocity = (z-epsilon).masked_fill(batch["known"][..., None, None, None] | ~(w > 0), 0)
+            torch.testing.assert_close(noisy, expected_state)
+            torch.testing.assert_close(v, expected_velocity)
             torch.testing.assert_close(noisy[:, :1], z[:, :1])
             torch.testing.assert_close(clean_from_velocity(noisy, v, levels), z, atol=1e-6, rtol=1e-5)
-            self.assertFalse(levels[:, :1].any())
+            self.assertTrue((levels[:, :1] == 1).all())
 
     def test_loss_excludes_history_and_padding_even_nan(self):
         p = torch.zeros(1, 3, 2, 4, 5)
@@ -166,11 +171,11 @@ class Stage2Tests(unittest.TestCase):
             self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters()))
             self.assertTrue(all(p.grad is None for p in vae.parameters()))
 
-    def test_vector_vae_one_token_per_bin_diffusion_and_sampling(self):
+    def test_vector_vae_one_token_per_bin_flow_and_sampling(self):
         c, _, piece, batch, _, _ = fixture("rhythm", PATCH_PITCH=1, PATCH_TIME=1)
         vae = LocalVAE(LocalVAEConfig(base_channels=4, res_blocks=1,
                        latent_layout="vector", latent_channels=256)).eval().requires_grad_(False)
-        model = LatentDiffusionModel(model_config(c, vae, ("unconditioned", "jazz")))
+        model = LatentFlowModel(model_config(c, vae, ("unconditioned", "jazz")))
         norm = LatentNormalizer(torch.zeros(256), torch.ones(256))
         z, w = encode_windows(vae, batch, 1)
         self.assertEqual(z.shape, (1, 3, 256, 1, 1))
@@ -187,8 +192,8 @@ class Stage2Tests(unittest.TestCase):
         output, baseline, reference, report = generate(model, vae, norm, piece, c,
             task="reconstruct", prompt_bins=1, max_bins=3, steps=2, strength=.2,
             progress=False, note_decoding=NoteDecoding('held', .5, 20))
-        self.assertEqual(report["diffusion_architecture"]["tokens_per_bin"], 1)
-        self.assertEqual(report["diffusion_architecture"]["tokens_per_window"], 3)
+        self.assertEqual(report["flow_architecture"]["tokens_per_bin"], 1)
+        self.assertEqual(report["flow_architecture"]["tokens_per_window"], 3)
         torch.testing.assert_close(torch.from_numpy(output.velocity[:1]), torch.from_numpy(reference.velocity[:1]))
 
     def test_padding_and_inactive_modalities_are_invariant(self):
@@ -197,7 +202,7 @@ class Stage2Tests(unittest.TestCase):
         # Nonzero final projection lets us test conditioning influence, not only zero initialization.
         torch.nn.init.normal_(model.output.weight, std=.02)
         z, w = encode_windows(vae, batch)
-        levels = torch.ones(1, 3) * .5; levels[batch["known"]] = 0
+        levels = torch.ones(1, 3) * .5; levels[batch["known"]] = 1
         a = model(z, levels, batch["known"], w, batch)
         other = deepcopy(batch)
         other["events"][:] = 999
@@ -223,8 +228,45 @@ class Stage2Tests(unittest.TestCase):
         b, _ = model.conditions(other, w.flatten(2).any(-1))
         torch.testing.assert_close(a, b)
 
+    def test_flow_training_exact_resume_with_frozen_vector_vae(self):
+        from improvnet.model.latent_flow_train import train
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); folder = root / "data"; folder.mkdir()
+            for i in range(16):
+                midi().save(folder / f"{i}.mid")
+            c = config(DATASETS={"doug": str(folder)}, INDEX_PATH=str(root / "index.sqlite"),
+                SAVE_DIR=str(root / "expected"), VAE_CHECKPOINT=str(root / "vae.pt"),
+                BATCH_SIZE=2, ACCUM_STEPS=1, N_STEPS=3, WARMUP_STEPS=1,
+                LOG_EVERY=1, VALIDATE_EVERY=2, SAVE_EVERY=1, MAX_VALIDATION_BATCHES=2,
+                PATCH_PITCH=1, PATCH_TIME=1)
+            with redirect_stdout(io.StringIO()):
+                build_midi_index(c)
+            vae = LocalVAE(LocalVAEConfig(base_channels=4, res_blocks=1,
+                latent_layout="vector", latent_channels=512))
+            torch.save(dict(format="local_vae_training_v1", model_config=asdict(vae.config),
+                model_state_dict=vae.state_dict(), train_config=vars(c), step=0), c.VAE_CHECKPOINT)
+            before = checkpoint_digest(c.VAE_CHECKPOINT)
+            with redirect_stdout(io.StringIO()):
+                train(c, force_cpu=True)
+            expected = torch.load(Path(c.SAVE_DIR) / "latest_checkpoint.pt", weights_only=False)
+            c.SAVE_DIR = str(root / "resumed")
+            request = root / "request"; request.touch()
+            with patch.dict(os.environ, CHECKPOINT_REQUEST_FILE=str(request)), redirect_stdout(io.StringIO()):
+                train(c, force_cpu=True)
+            request.unlink()
+            with redirect_stdout(io.StringIO()):
+                train(c, force_cpu=True)
+            actual = torch.load(Path(c.SAVE_DIR) / "latest_checkpoint.pt", weights_only=False)
+            self.assertEqual(actual["format"], "latent_flow_training_v1")
+            self.assertEqual(actual["step"], 3)
+            self.assertEqual(before, checkpoint_digest(c.VAE_CHECKPOINT))
+            for key in ("model_state_dict", "ema_state_dict"):
+                for name in expected[key]:
+                    torch.testing.assert_close(actual[key][name], expected[key][name], rtol=0, atol=0)
+
     def test_augmented_dataset_and_calibration_ignore_non_targets(self):
-        from improvnet.model.latent_diffusion_train import calibrate
+        from improvnet.model.latent_flow_train import calibrate
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); folder = root / "data"; folder.mkdir()
             for i in range(16):
@@ -233,7 +275,7 @@ class Stage2Tests(unittest.TestCase):
                        PITCH_AUGMENTATION=True, PITCH_SHIFT_RANGE=(3, 3))
             with redirect_stdout(io.StringIO()):
                 build_midi_index(c)
-            dataset = LatentDiffusionDataset(c)
+            dataset = LatentFlowDataset(c)
             item = dataset[0]
             self.assertTrue(item["roll"][:, 0, 63:66].any())
             vae = LocalVAE(LocalVAEConfig(base_channels=4, res_blocks=1)).eval().requires_grad_(False)
@@ -247,7 +289,7 @@ class Stage2Tests(unittest.TestCase):
         torch.nn.init.normal_(model.output.weight, std=.02)
         model.eval()
         z, w = encode_windows(vae, batch)
-        levels = torch.ones(1, 3) * .3; levels[batch["known"]] = 0
+        levels = torch.ones(1, 3) * .3; levels[batch["known"]] = 1
         a = model(z, levels, batch["known"], w, batch)
         other = deepcopy(batch); other["pitch"].zero_()
         b = model(z, levels, batch["known"], w, other)
@@ -272,9 +314,7 @@ class Stage2Tests(unittest.TestCase):
         clean, w = encode_windows(vae, batch); clean = norm.normalize(clean, w)
         class Oracle:
             def __call__(self, z, levels, known, weights, conditioning):
-                from improvnet.utils.latent_diffusion import coefficients
-                a, s = (q[..., None, None, None] for q in coefficients(levels))
-                return (a * z - clean) / s.clamp_min(1e-8)
+                return (clean - z) / (1 - levels[..., None, None, None]).clamp_min(1e-8)
         for strength in (.2, .8, 1.):
             output = sample(Oracle(), clean, batch["known"], w, batch, steps=4, strength=strength)
             torch.testing.assert_close(output, clean, atol=2e-5, rtol=2e-5)
@@ -306,15 +346,15 @@ class Stage2Tests(unittest.TestCase):
             calls.append((source.clone(), result.clone(), weights.clone()))
             return result
 
-        with patch("improvnet.inference.latent_diffusion_inference.sample", side_effect=checked_sample):
+        with patch("improvnet.inference.latent_flow_inference.sample", side_effect=checked_sample):
             output, _, _, report = generate(model.eval(), vae, norm, piece, c, task="reconstruct",
                 prompt_bins=1, max_bins=3, steps=2, strength=.2, mode="none", progress=False,
                 note_decoding=NoteDecoding("held", .5, 20))
         self.assertEqual(len(calls), 2)
         self.assertFalse(calls[-1][2][:, -1].any())
         np.testing.assert_array_equal(output.velocity[0], piece.velocity[0])
-        self.assertEqual(report["diffusion_architecture"]["tokens_per_bin"], 800)
-        self.assertEqual(report["diffusion_architecture"]["latent_channels"], 4)
+        self.assertEqual(report["flow_architecture"]["tokens_per_bin"], 800)
+        self.assertEqual(report["flow_architecture"]["latent_channels"], 4)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "unit-patch.mid"
             HierarchicalTokenizer().decode(output).save(path)
@@ -333,12 +373,12 @@ class Stage2Tests(unittest.TestCase):
             PATCH_PITCH=1, PATCH_TIME=1, N_LAYERS=16)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            vae_path, checkpoint = root / "vae.pt", root / "diffusion.pt"
+            vae_path, checkpoint = root / "vae.pt", root / "flow.pt"
             torch.save(dict(format="local_vae_training_v1", model_config=asdict(vae.config),
                 model_state_dict=vae.state_dict(), step=35, train_config=dict(COARSE_MS=1000, FINE_MS=10,
                 PIANO_PROGRAMS=tuple(range(8)), MAX_FRAMES=360000)), vae_path)
             c.VAE_CHECKPOINT = str(vae_path)
-            state = dict(format="latent_diffusion_training_v1", model_config=asdict(model.config),
+            state = dict(format="latent_flow_training_v1", model_config=asdict(model.config),
                 train_config=vars(c), genres=["<unconditioned>", "classical", "jazz"],
                 model_state_dict=model.state_dict(), ema_state_dict=model.state_dict(),
                 normalizer=norm.state_dict(), vae_sha256=checkpoint_digest(vae_path), step=7)
@@ -384,7 +424,7 @@ class Stage2Tests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_config(c)
         with self.assertRaises(ValueError):
-            LatentDiffusionConfig(max_tracks=4)
+            LatentFlowConfig(max_tracks=4)
         with self.assertRaises(ValueError):
             LatentNormalizer([0], [0])
 
@@ -397,7 +437,7 @@ class Stage2Tests(unittest.TestCase):
                 PIANO_PROGRAMS=tuple(range(8)), MAX_FRAMES=360000)), path)
             c.VAE_CHECKPOINT = str(path)
             checkpoint = root / "stage2.pt"
-            torch.save(dict(format="latent_diffusion_training_v1", model_config=asdict(model.config),
+            torch.save(dict(format="latent_flow_training_v1", model_config=asdict(model.config),
                 train_config=vars(c), genres=["<unconditioned>", "classical", "jazz"],
                 model_state_dict=model.state_dict(), ema_state_dict=model.state_dict(),
                 normalizer=norm.state_dict(), vae_sha256=checkpoint_digest(path), step=7), checkpoint)
@@ -417,7 +457,7 @@ class Stage2Tests(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 build_midi_index(c)
             self.assertEqual(genre_labels(c.INDEX_PATH), ("<unconditioned>", "jazz"))
-            dataset = LatentDiffusionDataset(c)
+            dataset = LatentFlowDataset(c)
             first, second = dataset[0], dataset[0]
             for key in first:
                 if isinstance(first[key], torch.Tensor):

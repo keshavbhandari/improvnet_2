@@ -15,8 +15,7 @@ python -m improvnet.tokenizer.roundtrip \
 
 Symbolic music generation and genre style transfer with an autoregressive (AR)
 model and a new hierarchical instrument-roll pipeline. Independent MIDI syntax,
-genre, continuity and pitch-preservation metrics support evaluation. Legacy
-uniform discrete diffusion is [archived](improvnet/archive/uniform_diffusion/README.md).
+genre, continuity and pitch-preservation metrics support evaluation. The old generative experiments have been removed in favor of latent flow matching.
 
 ## Setup
 
@@ -71,29 +70,29 @@ through a separate labelled index. Missing genres do not block unconditional VAE
 training. The original VAE index is unchanged. Retraining its encoder requires
 a fresh stage-2 run and new latent calibration, even if the latent shape matches.
 
-## Stage-2 latent diffusion
+## Stage-2 latent flow matching
 
-Frozen-VAE continuous diffusion with soft per-second pitch guidance, genre/instrument
+Frozen-VAE continuous flow matching with soft per-second pitch guidance, genre/instrument
 conditioning, clean history, and up to three full or rhythm-only accompaniment parts.
-Settings are in `latent_diffusion_config.py`. See the
-[training, accompaniment and diagnostic inference guide](docs/latent_diffusion.md).
+Settings are in `latent_flow_config.py`. See the
+[training, accompaniment and diagnostic inference guide](docs/latent_flow.md).
 
 ```bash
 # Read-only forward check; does NOT start training.
-python -m improvnet.model.latent_diffusion_train --check
+python -m improvnet.model.latent_flow_train --check
 
 # Start/resume only when ready.
-torchrun --standalone --nproc_per_node=4 -m improvnet.model.latent_diffusion_train
+torchrun --standalone --nproc_per_node=4 -m improvnet.model.latent_flow_train
 
 # Evaluate a saved stage-2 checkpoint; outputs go to a fresh scratch directory.
-python -m improvnet.inference.latent_diffusion_inference \
+python -m improvnet.inference.latent_flow_inference \
   --input improvnet/inference/examples/debussy-clair-de-lune_original.mid \
-  --genre jazz --accompaniment-mode rhythm --noise-strength 0.8 --passes 48
+  --genre jazz --accompaniment-mode rhythm --strength 0.8 --passes 48
 
 # Separate the VAE reconstruction floor from stage-2 reconstruction errors.
-python -m improvnet.inference.latent_diffusion_inference \
+python -m improvnet.inference.latent_flow_inference \
   --input improvnet/inference/examples/debussy-clair-de-lune_original.mid \
-  --task reconstruct --genre classical --noise-strength 0.2 --passes 48
+  --task reconstruct --genre classical --strength 0.2 --passes 48
 ```
 
 ## Training
@@ -142,7 +141,7 @@ python -m improvnet.inference.ar_inference \
   --genre jazz --prompt_len 256 --max_tokens 2048
 ```
 
-`max_tokens` includes the prompt. AR inference uses underscore flags; diffusion
+`max_tokens` includes the prompt. AR inference uses underscore flags; flow matching
 evaluators use hyphenated flags. Outputs stop when the model emits `<E>`.
 
 ## Metrics
@@ -192,5 +191,5 @@ OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES='' python -m unittest discover -s tests -
 ```
 
 More: [local VAE](docs/local_vae.md), [metrics](improvnet/metrics/README.md),
-and [legacy uniform diffusion](improvnet/archive/uniform_diffusion/README.md).
+and [latent flow matching](docs/latent_flow.md).
 Legacy masked TwoTower/FSQ experiments are under `improvnet/archive`.

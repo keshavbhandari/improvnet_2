@@ -74,5 +74,5 @@ def classifier_tokens(serialized, tokenizer):
         if token not in tokenizer.tok_to_id:
             raise ValueError(f"Unknown classifier training token: {token!r}")
         if token in (tokenizer.mask_tok, tokenizer.sep_tok, tokenizer.unk_tok):
-            raise ValueError("Classifier training expects clean music, not diffusion noise")
+            raise ValueError("Classifier training expects clean music, not flow matching noise")
     return tokens

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from improvnet.model.latent_diffusion_train import main, resume_setting_changes
+from improvnet.model.latent_flow_train import main, resume_setting_changes
 
 
 class ResumeTests(unittest.TestCase):
@@ -38,7 +38,7 @@ class ResumeTests(unittest.TestCase):
                 resume_setting_changes(self.state, self.config, model, world, allow_batch_size_change=True)
 
     def test_cli_passes_flag_without_starting_training(self):
-        with patch("improvnet.model.latent_diffusion_train.train") as train:
+        with patch("improvnet.model.latent_flow_train.train") as train:
             main(["--batch-size", "16", "--allow-batch-size-change", "--cpu"])
             self.assertEqual(train.call_args.args[0].BATCH_SIZE, 16)
             self.assertTrue(train.call_args.kwargs["allow_batch_size_change"])

@@ -38,7 +38,7 @@ N_LAYERS = 20
 # TRAINING HYPERPARAMETERS
 # ==========================================
 # AR training is highly efficient, so we can use larger batch sizes 
-# or sequences compared to the complex unrolled diffusion model.
+# or sequences compared to the complex unrolled flow model.
 BATCH_SIZE = 24
 ACCUM_STEPS = 1 # Optimized run, 2 for old run
 LR = 1.5e-4

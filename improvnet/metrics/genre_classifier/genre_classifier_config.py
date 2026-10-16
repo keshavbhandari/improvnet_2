@@ -8,7 +8,7 @@ JSONL_FILES = (
 )
 ARTIFACT_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/genre_classifier"
 
-# Independent encoder architecture, matching the uniform-diffusion backbone.
+# Independent encoder architecture, matching the AR-sized backbone.
 # Vocabulary, padding ID and genre count are derived by the trainer.
 EMBED_DIM = 2048
 N_HEADS = 16
@@ -43,7 +43,7 @@ VALIDATION_BATCH_SIZE = 16
 MAX_VALIDATION_BATCHES = 0  # Full shard; rare classes matter.
 NUM_WORKERS = 4
 N_STEPS = 30000
-# Fresh encoder training, not the low-rate AR-initialized diffusion SFT.
+# Fresh encoder training, not the low-rate AR-initialized flow matching SFT.
 LR = 1.5e-4
 MIN_LR = 1e-5
 WARMUP_STEPS = 1000

@@ -2,7 +2,7 @@
 
 Independent bidirectional encoder for finalized musical excerpts. It receives
 no genre/instrument conditioning and strips all metadata prefixes to prevent
-label leakage. It does not import/change AR or diffusion training/checkpoints.
+label leakage. It does not import/change AR or flow matching training/checkpoints.
 
 ## One config, one model, one trainer
 
@@ -19,7 +19,7 @@ There are no compatibility `config.py`, `model.py`, or `train.py` files and no
 second training-config module. Supporting audit/data/tokenization/evaluation/
 scoring modules contain distinct logic, not duplicate trainers or configs.
 
-Backbone settings match uniform diffusion: 2048 dimensions, 20 layers, 16 query
+Backbone settings match the AR model: 2048 dimensions, 20 layers, 16 query
 heads / 4 KV heads, 128-dimensional heads, SwiGLU 8/3 (5504 hidden units),
 RMSNorm and Q/K normalization, RoPE base 500000, dropout 0.1 and gradient
 checkpointing. Classification uses masked mean pooling and a **12-class head**.
@@ -113,7 +113,7 @@ From the repository root in the `improvnet` environment:
 python -m improvnet.metrics.genre_classifier.genre_classifier_train
 ```
 
-Use `torchrun` for multiple GPUs as for uniform diffusion. `--config` defaults
+Use `torchrun` for multiple GPUs as for the AR model. `--config` defaults
 to the single `genre_classifier_config` module; custom modules may import and
 override it. Other overrides: `--manifest`, `--save-dir`, `--batch-size`,
 `--accum-steps`, `--steps`, `--workers`, `--device`, `--max-validation-batches`,

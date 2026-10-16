@@ -3,13 +3,13 @@
 Branch: `hierarchical-pianoroll-tokenizer`. This is a structured encoding, not a
 learned VAE compression stage. No model architectures or checkpoints are changed.
 Legacy event tokenizers remain in `improvnet/archive/tokenizer_legacy`, with the
-existing public compatibility imports used by trained AR/diffusion/metric models.
+existing public compatibility imports used by trained AR/flow/metric models.
 
 ## Time hierarchy and channels
 
 Inspired by the three information channels in [Huang et al., §5](https://arxiv.org/html/2402.14285v4):
 velocity, onset and sustain pedal. We borrow the representation idea, not their
-learned VAE or diffusion implementation. Our pedal array does **not** duplicate
+learned VAE or flow implementation. Our pedal array does **not** duplicate
 the controller across every pitch row.
 
 Default `coarse_ms=1000`, `fine_ms=10`: each coarse bin contains 100 fine frames.

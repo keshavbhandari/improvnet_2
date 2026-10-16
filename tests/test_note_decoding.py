@@ -13,7 +13,7 @@ from improvnet.tokenizer.hierarchical import roll_notes
 from improvnet.utils.note_decoding import NoteDecoding, apply_note_decoding, decode_held_notes
 from improvnet.inference.local_vae_inference import Scores
 from improvnet.inference.local_vae_note_calibration import load_cached_confidence, release_guard, save_calibration
-from improvnet.utils.latent_diffusion import checkpoint_digest
+from improvnet.utils.latent_flow import checkpoint_digest
 
 
 class HeldNoteTests(unittest.TestCase):

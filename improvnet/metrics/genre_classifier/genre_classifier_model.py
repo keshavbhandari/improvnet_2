@@ -1,7 +1,7 @@
-"""Bidirectional genre encoder with the uniform-diffusion backbone architecture.
+"""Bidirectional genre encoder with the AR-sized backbone architecture.
 
 Independent parameters and local primitives: importing this module does not
-import/change AR or diffusion training configs. No conditioning or LM head.
+import/change AR or flow matching training configs. No conditioning or LM head.
 """
 
 from dataclasses import dataclass, field

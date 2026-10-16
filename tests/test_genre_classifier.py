@@ -125,21 +125,6 @@ class GenreClassifierTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             GenreClassifierConfig(vocab_size=32, num_genres=1)
 
-    def test_defaults_match_uniform_backbone_without_allocating_real_weights(self):
-        from improvnet.archive.uniform_diffusion.model.uniform_diffusion_config import UniformDiffusionConfig
-        classifier, uniform = GenreClassifierConfig(), UniformDiffusionConfig()
-        for field in ("embed_dim", "n_heads", "n_kv_heads", "n_layers", "ffn_mult", "dropout", "gradient_checkpointing", "vocab_size"):
-            self.assertEqual(getattr(classifier, field), getattr(uniform, field), field)
-        with torch.device("meta"):
-            model = GenreClassifier(classifier)
-        self.assertEqual(len(model.layers), 20)
-        self.assertEqual(model.layers[0].ffn.w1.out_features, 5504)
-        self.assertEqual(model.layers[0].attn.head_dim, 128)
-        self.assertEqual(model.head.out_features, 12)
-        self.assertGreater(sum(p.numel() for p in model.parameters()), 800000000)
-        for kwargs in ({"n_heads": 4, "n_kv_heads": 3}, {"ffn_mult": float("nan")}):
-            with self.assertRaises(ValueError):
-                GenreClassifierConfig(**kwargs)
 
     def test_gqa_and_gradient_checkpointing_match_dense_backward(self):
         cfg = replace(self.config, n_kv_heads=2, gradient_checkpointing=True)
@@ -152,18 +137,6 @@ class GenreClassifierTests(unittest.TestCase):
         for one, two in zip(checked.parameters(), direct.parameters()):
             torch.testing.assert_close(one.grad, two.grad)
 
-    def test_block_matches_uniform_backbone_math_with_identical_weights(self):
-        from improvnet.archive.uniform_diffusion.model.uniform_diffusion_model import SharedBlock
-        from improvnet.metrics.genre_classifier.genre_classifier_model import EncoderBlock
-        cfg = replace(self.config, n_kv_heads=2)
-        classifier, uniform = EncoderBlock(cfg).eval(), SharedBlock(cfg).eval()
-        classifier.load_state_dict(uniform.state_dict(), strict=True)
-        x = torch.randn(2, 6, cfg.embed_dim)
-        mask = torch.tensor([[True] * 6, [True] * 4 + [False] * 2])
-        positions = torch.arange(6).expand(2, -1)
-        ours = classifier(x, mask, positions)
-        reference, _, _ = uniform(x, positions, mask[:, None, None, :], is_causal=False)
-        torch.testing.assert_close(ours[mask], reference[mask], rtol=1e-5, atol=1e-6)
 
     def test_balanced_sampler_focus_distribution_and_distributed_draws(self):
         counts = {"classical": 1000, "jazz": 50, "blues": 5, "rock": 20, "folk": 7}

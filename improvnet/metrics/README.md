@@ -140,7 +140,7 @@ excerpt. Diagnostic indices and event counts refer to that joined excerpt
 ### Noise and timestep evaluation
 
 Score **predicted clean outputs**, not noisy input canvases, at each selected
-diffusion timestep/noise level. The grammar and scoring criterion do not change
+flow matching timestep/noise level. The grammar and scoring criterion do not change
 with noise. `noise_level` is optional metadata in `[0, 1]`; `summarize_syntax`
 reports rates in configurable noise bins alongside total rates and failure
 counts. For discrete timestep curves, group the returned flags by the caller's

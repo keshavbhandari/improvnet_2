@@ -11,12 +11,12 @@ import numpy as np
 import torch
 
 from improvnet.inference.local_vae_inference import Scores, inputs, load_model as load_vae, note_decoding_options, resolve_thresholds, write_report
-from improvnet.model import latent_diffusion_config as defaults
-from improvnet.model.latent_diffusion_model import LatentDiffusionConfig, LatentDiffusionModel
+from improvnet.model import latent_flow_config as defaults
+from improvnet.model.latent_flow_model import LatentFlowConfig, LatentFlowModel
 from improvnet.model.local_vae_train import amp_context
 from improvnet.tokenizer.hierarchical import TempoMap, read_performance
-from improvnet.utils.latent_diffusion import LatentNormalizer, checkpoint_digest, encode_windows, sample
-from improvnet.utils.latent_diffusion_data import collate_windows, window_tensors
+from improvnet.utils.latent_flow import LatentNormalizer, checkpoint_digest, encode_windows, sample
+from improvnet.utils.latent_flow_data import collate_windows, window_tensors
 from improvnet.utils.note_decoding import NoteDecoding, apply_note_decoding, confidence_arrays
 
 
@@ -33,23 +33,23 @@ def validate_inference_config(model_config, config):
     conflicts = [name for name, field in fields.items()
                  if getattr(config, name, None) != getattr(model_config, field)]
     if conflicts:
-        raise ValueError("Inference settings differ from the diffusion checkpoint architecture: "
+        raise ValueError("Inference settings differ from the flow matching checkpoint architecture: "
                          + ", ".join(conflicts))
 
 
 def load_model(path, device, *, vae_checkpoint=None, use_ema=True):
     state = torch.load(path, map_location="cpu", weights_only=False)
-    if state.get("format") != "latent_diffusion_training_v1":
-        raise ValueError("Expected a stage-2 latent diffusion checkpoint")
+    if state.get("format") != "latent_flow_training_v1":
+        raise ValueError("Expected a stage-2 latent flow matching checkpoint")
     config = SimpleNamespace(**state["train_config"])
-    architecture = LatentDiffusionConfig(**state["model_config"])
+    architecture = LatentFlowConfig(**state["model_config"])
     validate_inference_config(architecture, config)
     vae_path = Path(vae_checkpoint or config.VAE_CHECKPOINT)
     if checkpoint_digest(vae_path) != state["vae_sha256"]:
         raise ValueError("This stage-2 checkpoint belongs to a different VAE; decoder/latents cannot be mixed")
     vae, tokenizer, vae_step, _ = load_vae(vae_path, device)
     vae.requires_grad_(False)
-    model = LatentDiffusionModel(architecture)
+    model = LatentFlowModel(architecture)
     c = model.config
     if tuple(vae.config.latent_shape) != (c.latent_channels, c.latent_pitch, c.latent_time) or vae.config.frames_per_bin != c.frames_per_bin:
         raise ValueError("Stage-2 latent shape differs from its frozen VAE")
@@ -116,7 +116,7 @@ def diagnostics(reference, vae_baseline, prediction, ids, latent_squared_sum, la
             "VAE-only errors measure the stage-1 floor. Large output errors do not by themselves imply the VAE needs retraining.")
     if task != "reconstruct":
         note = ("Transfer/continuation: source distances include intentional musical changes, not only denoising errors. "
-                "Use --task reconstruct at several noise strengths to diagnose stage 1 versus stage 2.")
+                "Use --task reconstruct at several flow strengths to diagnose stage 1 versus stage 2.")
     return dict(vae_only=baseline, generated_vs_source=generated,
                 latent_nrmse_vs_source=round(nrmse, 5) if nrmse is not None else None, interpretation=note)
 
@@ -134,7 +134,7 @@ def generate(model, vae, normalizer, piece, config, *, genre=0, task="transfer",
     if prompt_bins > len(piece.velocity) or (prompt_bins == len(piece.velocity) and task != "continue"):
         raise ValueError("Prompt leaves no target bins in the source")
     if task == "continue" and (prompt_bins < 1 or strength != 1 or piece.n_frames < prompt_bins * piece.config.frames_per_bin):
-        raise ValueError("Continuation requires a complete-bin prompt and noise strength 1")
+        raise ValueError("Continuation requires a complete-bin prompt and flow strength 1")
     if not 0 < activity_threshold < 1 or not 0 < onset_threshold < 1:
         raise ValueError("Invalid decoder thresholds")
     if tuple(vae.config.latent_shape) != (model.config.latent_channels, model.config.latent_pitch, model.config.latent_time):
@@ -232,7 +232,7 @@ def generate(model, vae, normalizer, piece, config, *, genre=0, task="transfer",
     output.refresh_coarse().validate(); baseline.refresh_coarse().validate()
     ids = np.arange(prompt_bins, length)
     report = diagnostics(reference, baseline, output, ids, latent_squared_sum, latent_cells, task)
-    report["diffusion_architecture"] = dict(asdict(model.config),
+    report["flow_architecture"] = dict(asdict(model.config),
         tokens_per_bin=int(np.prod(model.config.spatial_grid)),
         tokens_per_window=int(model.config.bins * np.prod(model.config.spatial_grid)))
     report["note_decoding"] = vars(options)
@@ -264,7 +264,7 @@ def generate(model, vae, normalizer, piece, config, *, genre=0, task="transfer",
                 activity_threshold=activity_threshold, onset_threshold=onset_threshold)
         jittered.refresh_coarse().validate()
         report["vae_jitter_at_measured_residual"] = score(reference, jittered, ids)
-        report["jitter_caveat"] = "One isotropic draw at measured std-relative RMSE; actual diffusion errors may be structured."
+        report["jitter_caveat"] = "One isotropic draw at measured std-relative RMSE; actual flow matching errors may be structured."
     return output, baseline, reference, report
 
 
@@ -280,7 +280,7 @@ def main(argv=None):
     parser.add_argument("--prompt-bins", type=int, default=0)
     parser.add_argument("--max-bins", type=int, default=32, help="Generated bins, excluding the preserved prompt")
     parser.add_argument("--passes", type=int, default=48)
-    parser.add_argument("--noise-strength", type=float, default=1.)
+    parser.add_argument("--strength", type=float, default=1.)
     parser.add_argument("--accompaniment-mode", choices=("full", "rhythm", "none"), default="rhythm")
     parser.add_argument("--accompaniment-midi", type=Path, help="Optional external conditioning MIDI; not mixed into output")
     parser.add_argument("--reference-time-scale", type=float, default=1., help="Explicit external rhythm/tempo alignment")
@@ -315,7 +315,7 @@ def main(argv=None):
         time_scale=args.reference_time_scale, offset_seconds=args.reference_offset_seconds) if args.accompaniment_midi else None
     output, baseline, reference, report = generate(model, vae, normalizer, piece, config, genre=genre,
         task=args.task, prompt_bins=args.prompt_bins, max_bins=args.max_bins, steps=args.passes,
-        strength=args.noise_strength, mode=args.accompaniment_mode, events=events, seed=args.seed,
+        strength=args.strength, mode=args.accompaniment_mode, events=events, seed=args.seed,
         activity_threshold=args.activity_threshold, onset_threshold=args.onset_threshold,
         note_decoding=note_decoding_options(args))
     if args.output_dir is None:
@@ -330,7 +330,7 @@ def main(argv=None):
     report = dict(step=info["step"], vae_step=info["vae_step"], weights=info["weights"], task=args.task,
         genre=args.genre, target_program=piece.metadata["target_program"], is_drum=piece.metadata["target_is_drum"],
         prompt_bins=args.prompt_bins, generated_bins=len(output.velocity) - args.prompt_bins,
-        passes=args.passes, noise_strength=args.noise_strength,
+        passes=args.passes, strength=args.strength,
         external_accompaniment=bool(args.accompaniment_midi), **report)
     write_report(directory / "report.json", report)
     print(json.dumps(report, allow_nan=False))

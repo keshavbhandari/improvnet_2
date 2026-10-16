@@ -161,7 +161,7 @@ def collate_windows(items):
     return batch
 
 
-class LatentDiffusionDataset(LocalVAEDataset):
+class LatentFlowDataset(LocalVAEDataset):
     """Reuse the MIDI index/splits and fixed drum subset; sample windows rather than bins."""
     def __init__(self, config, split="train", *, labels=None, error_dir=None):
         super().__init__(config, split, error_dir=error_dir)

@@ -44,7 +44,7 @@ class LocalVAEConfig:
     @property
     def latent_shape(self):
         if self.latent_layout == "vector":
-            # Singleton spatial axes keep the encoder/decoder/diffusion API shared.
+            # Singleton spatial axes keep the encoder/decoder/flow API shared.
             return (self.latent_channels, 1, 1)
         return (self.latent_channels, 128 // self.factor, math.ceil(self.frames_per_bin / self.factor))
 

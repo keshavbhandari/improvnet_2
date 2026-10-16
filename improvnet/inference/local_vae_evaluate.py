@@ -17,7 +17,7 @@ from improvnet.utils.local_vae_data import LocalVAEDataset, seed_for
 
 
 def readiness(metrics, latent, sampled_f1, zero_f1, files, bins, sampled_onset_f1=None):
-    """Conservative smoke-test rubric, NOT a learned/validated diffusion predictor."""
+    """Conservative smoke-test rubric, NOT a learned/validated flow predictor."""
     reasons = []
     if files < 20 or bins < 128:
         return dict(status="insufficient_evidence", reasons=["Use at least 20 files and 128 bins"])
@@ -37,7 +37,7 @@ def readiness(metrics, latent, sampled_f1, zero_f1, files, bins, sampled_onset_f
     if zero_f1 is None or (metrics["activity_f1"] or 0) - zero_f1 < .1:
         reasons.append("Zeroing latents does not sufficiently harm activity reconstruction")
     return dict(status="needs_review" if reasons else "promising_not_proven",
-                reasons=reasons or ["Try a small diffusion pilot; these checks do not guarantee good generation"])
+                reasons=reasons or ["Try a small flow pilot; these checks do not guarantee good generation"])
 
 
 def candidates(dataset, seed):

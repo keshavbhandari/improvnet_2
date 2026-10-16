@@ -50,7 +50,7 @@ class ARContextInference:
         self.model.load_state_dict(state_dict)
         self.model.eval()
         
-        # Prevent the model from hallucinating structural/diffusion padding
+        # Prevent the model from hallucinating structural/flow padding
         self.forbidden_ids = [
             PAD_ID, MASK_ID, BLANK_ID, SEP_ID,
             self.tokenizer.tok_to_id.get('<U>', -1)

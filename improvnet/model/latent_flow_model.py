@@ -1,4 +1,4 @@
-"""Multi-bin continuous latent diffusion with clean-prefix and soft musical conditions.
+"""Multi-bin continuous latent flow matching with clean-prefix and soft musical conditions.
 
 Local VAE latents are patchified spatially; bin/pitch/fine-time positions remain
 distinct. Bidirectional self attention couples the complete generated window.
@@ -14,7 +14,7 @@ from torch.utils.checkpoint import checkpoint
 
 
 @dataclass(frozen=True)
-class LatentDiffusionConfig:
+class LatentFlowConfig:
     latent_channels: int = 8
     latent_pitch: int = 32
     latent_time: int = 25
@@ -83,17 +83,17 @@ class Block(nn.Module):
         return (x + self.ff(self.norm3(x))).masked_fill(~valid[..., None], 0)
 
 
-class LatentDiffusionModel(nn.Module):
+class LatentFlowModel(nn.Module):
     def __init__(self, config=None):
         super().__init__()
-        self.config = c = config or LatentDiffusionConfig()
+        self.config = c = config or LatentFlowConfig()
         gh, gw = c.spatial_grid
         self.patch_dim = c.latent_channels * c.patch_pitch * c.patch_time
         self.input = nn.Linear(self.patch_dim, c.d_model)
         self.bin_position = nn.Embedding(c.bins, c.d_model)
         self.pitch_position = nn.Embedding(gh, c.d_model)
         self.time_position = nn.Embedding(gw, c.d_model)
-        self.noise_embedding = nn.Sequential(nn.Linear(64, c.d_model), nn.SiLU(), nn.Linear(c.d_model, c.d_model))
+        self.time_embedding = nn.Sequential(nn.Linear(64, c.d_model), nn.SiLU(), nn.Linear(c.d_model, c.d_model))
         self.known_embedding = nn.Embedding(2, c.d_model)
         self.genre_embedding = nn.Embedding(c.num_genres, c.d_model)
         self.program_embedding = nn.Embedding(128, c.d_model)
@@ -154,19 +154,19 @@ class LatentDiffusionModel(nn.Module):
         valid = torch.cat((torch.ones(b, 1, dtype=torch.bool, device=bin_valid.device), pitch_mask, event_mask, rhythm_mask.flatten(1)), dim=1)
         return context.masked_fill(~valid[..., None], 0), valid
 
-    def forward(self, noisy, noise_levels, known, weights, condition):
+    def forward(self, noisy, flow_times, known, weights, condition):
         c = self.config
         expected = (c.bins, c.latent_channels, c.latent_pitch, c.latent_time)
         if noisy.ndim != 5 or tuple(noisy.shape[1:]) != expected:
             raise ValueError(f"Expected latent windows [batch,{expected}]")
-        if noise_levels.shape != noisy.shape[:2] or known.shape != noise_levels.shape or known.dtype != torch.bool:
+        if flow_times.shape != noisy.shape[:2] or known.shape != flow_times.shape or known.dtype != torch.bool:
             raise ValueError("Invalid bin timestep/history shapes")
         if weights.shape != (len(noisy), c.bins, 1, 1, c.latent_time):
             raise ValueError("Invalid latent padding weights")
         if condition["events"].shape[1] > c.max_events:
             raise ValueError("Accompaniment event budget exceeded")
-        if not bool(torch.isfinite(noise_levels).all() & (noise_levels >= 0).all() & (noise_levels <= 1).all()) or bool((noise_levels[known] != 0).any()):
-            raise ValueError("Clean history must have timestep zero; target timesteps must lie in [0,1]")
+        if not bool(torch.isfinite(flow_times).all() & (flow_times >= 0).all() & (flow_times <= 1).all()) or bool((flow_times[known] != 1).any()):
+            raise ValueError("Clean history must have flow time one; target timesteps must lie in [0,1]")
         gh, gw = c.spatial_grid
         w = F.pad(weights[..., 0, 0, :], (0, gw * c.patch_time - c.latent_time))
         valid = w.reshape(len(noisy), c.bins, gw, c.patch_time).any(-1)[:, :, None].expand(-1, -1, gh, -1)
@@ -175,8 +175,8 @@ class LatentDiffusionModel(nn.Module):
             raise ValueError("Every canvas needs valid tokens")
         x = self.input(self.patchify(noisy.masked_fill(~(weights > 0), 0)))
         frequency = torch.exp(torch.arange(32, device=x.device).float() * (-math.log(10000) / 31))
-        phase = noise_levels[..., None].float() * 1000 * frequency
-        time = self.noise_embedding(torch.cat((phase.sin(), phase.cos()), -1))
+        phase = flow_times[..., None].float() * 1000 * frequency
+        time = self.time_embedding(torch.cat((phase.sin(), phase.cos()), -1))
         global_condition = (self.genre_embedding(condition["genre"]) + self.program_embedding(condition["program"])
                             + self.drum_embedding(condition["is_drum"].long()) + self.mode_embedding(condition["mode"]))
         x = x + (self.bin_position.weight[None] + time + self.known_embedding(known.long()) + global_condition[:, None])[:, :, None, None]

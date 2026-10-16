@@ -1,4 +1,4 @@
-"""Continuous cosine diffusion and frozen-VAE window encoding (no training side effects)."""
+"""Straight-path conditional flow matching and frozen-VAE window encoding (no training side effects)."""
 import hashlib
 import math
 
@@ -58,24 +58,20 @@ class LatentNormalizer:
         return (z * s + m).masked_fill(~(weights > 0), 0)
 
 
-def coefficients(t):
-    return (t * (math.pi / 2)).cos(), (t * (math.pi / 2)).sin()
+def flow_target(clean, known, weights, t, epsilon):
+    """t=0 is noise, t=1 is data; clean history stays at t=1."""
+    if t.shape != (len(clean),) or epsilon.shape != clean.shape or not bool(torch.isfinite(t).all() & ((t >= 0) & (t <= 1)).all()):
+        raise ValueError("Invalid flow time/noise shape or range")
+    levels = torch.where(known, torch.ones_like(t[:, None]), t[:, None])
+    time = levels[..., None, None, None]
+    state = ((1 - time) * epsilon + time * clean).masked_fill(~(weights > 0), 0)
+    velocity = (clean - epsilon).masked_fill(known[..., None, None, None] | ~(weights > 0), 0)
+    return state, velocity, levels
 
 
-def noise_target(clean, known, weights, t, epsilon):
-    """History is clean, targets noisy; v = alpha*epsilon - sigma*x0."""
-    if t.shape != (len(clean),) or epsilon.shape != clean.shape or not bool(((t >= 0) & (t <= 1)).all()):
-        raise ValueError("Invalid timestep/noise shape or range")
-    levels = t[:, None] * (~known)
-    a, s = (v[..., None, None, None] for v in coefficients(levels))
-    noisy = (a * clean + s * epsilon).masked_fill(~(weights > 0), 0)
-    target = (a * epsilon - s * clean).masked_fill(~(weights > 0), 0)
-    return noisy, target, levels
-
-
-def clean_from_velocity(noisy, velocity, levels):
-    a, s = (v[..., None, None, None] for v in coefficients(levels))
-    return a * noisy - s * velocity
+def clean_from_velocity(state, velocity, levels):
+    """Straight-path endpoint estimate, used only as a training diagnostic."""
+    return state + (1 - levels[..., None, None, None]) * velocity
 
 
 def weighted_loss(prediction, target, weights, known):
@@ -90,29 +86,31 @@ def weighted_loss(prediction, target, weights, known):
 
 @torch.inference_mode()
 def sample(model, source, known, weights, conditioning, *, steps=48, strength=1., generator=None, callback=None):
-    """Deterministic DDIM updates with v prediction; exactly reclamp clean prefix each pass."""
-    if steps < 1 or not math.isfinite(strength) or not 0 < strength <= 1:
-        raise ValueError("Positive pass count and noise strength in (0,1] required")
+    """Euler integration from t=1-strength to t=1; reclamp history every step.
+
+    strength=1 starts from pure noise; lower strengths interpolate the source
+    with noise before following the learned vector field toward the data end.
+    """
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1 or not math.isfinite(strength) or not 0 < strength <= 1:
+        raise ValueError("Positive step count and strength in (0,1] required")
     if not bool(((weights > 0) & (~known)[..., None, None, None]).flatten(1).any(1).all()):
         raise ValueError("Sampling needs at least one target bin per example")
     epsilon = torch.randn(source.shape, device=source.device, generator=generator)
-    start = source.new_full((len(source),), strength)
-    z, _, _ = noise_target(source, known, weights, start, epsilon)
-    # At strength=1 there is no dependence on source target values, even numerically.
+    start = source.new_full((len(source),), 1 - strength)
     if strength == 1:
         z = torch.where(known[..., None, None, None], source, epsilon).masked_fill(~(weights > 0), 0)
-    grid = torch.linspace(strength, 0, steps + 1, device=source.device)
+    else:
+        z, _, _ = flow_target(source, known, weights, start, epsilon)
+    grid = torch.linspace(1 - strength, 1, steps + 1, device=source.device)
     for index in range(steps):
-        levels = grid[index].expand(len(z), len(known[0])) * (~known)
-        v = model(z, levels, known, weights, conditioning)
-        if not bool(torch.isfinite(v).all()):
-            raise FloatingPointError("Non-finite diffusion prediction")
-        a, s = (q[..., None, None, None] for q in coefficients(levels))
-        clean, eps = a * z - s * v, s * z + a * v
-        next_levels = grid[index + 1].expand_as(levels) * (~known)
-        an, sn = (q[..., None, None, None] for q in coefficients(next_levels))
-        z = torch.where(known[..., None, None, None], source, an * clean + sn * eps)
+        levels = torch.where(known, torch.ones_like(known, dtype=z.dtype), grid[index].expand_as(known))
+        velocity = model(z, levels, known, weights, conditioning)
+        if not bool(torch.isfinite(velocity).all()):
+            raise FloatingPointError("Non-finite flow velocity")
+        z = torch.where(known[..., None, None, None], source, z + (grid[index + 1] - grid[index]) * velocity)
         z = z.masked_fill(~(weights > 0), 0)
+        if not bool(torch.isfinite(z).all()):
+            raise FloatingPointError("Non-finite flow integration state")
         if callback:
             callback(index + 1, float(grid[index + 1]), z)
     return z

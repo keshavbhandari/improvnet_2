@@ -1,4 +1,4 @@
-"""Stage-2 MIDI latent diffusion training. No AR changes and no VAE weight updates.
+"""Stage-2 MIDI latent flow matching training. No AR changes and no VAE weight updates.
 
 --check performs one inference-only model/data check; it never starts training.
 """
@@ -22,20 +22,20 @@ from torch.utils.data.distributed import DistributedSampler
 
 from improvnet.inference.local_vae_inference import load_model as load_vae
 from improvnet.model.local_vae_train import ResumableBatchSampler, amp_context, cpu_tree, index_identity, lr_factor
-from improvnet.model.latent_diffusion_model import LatentDiffusionConfig, LatentDiffusionModel
-from improvnet.utils.latent_diffusion import (
-    LatentNormalizer, checkpoint_digest, clean_from_velocity, encode_windows, noise_target, weighted_loss,
+from improvnet.model.latent_flow_model import LatentFlowConfig, LatentFlowModel
+from improvnet.utils.latent_flow import (
+    LatentNormalizer, checkpoint_digest, clean_from_velocity, encode_windows, flow_target, weighted_loss,
 )
-from improvnet.utils.latent_diffusion_data import LatentDiffusionDataset, collate_windows, genre_labels
+from improvnet.utils.latent_flow_data import LatentFlowDataset, collate_windows, genre_labels
 
-FORMAT = "latent_diffusion_training_v1"
+FORMAT = "latent_flow_training_v1"
 STAT_KEYS = ("loss", "latent_squared_error", "examples", "low_squared_error", "low_examples",
              "mid_squared_error", "mid_examples", "high_squared_error", "high_examples", "retries")
 
 
 def model_config(config, vae, labels):
     channels, pitch, time = vae.config.latent_shape
-    return LatentDiffusionConfig(latent_channels=channels, latent_pitch=pitch, latent_time=time,
+    return LatentFlowConfig(latent_channels=channels, latent_pitch=pitch, latent_time=time,
         frames_per_bin=vae.config.frames_per_bin, history_bins=config.HISTORY_BINS, target_bins=config.TARGET_BINS,
         patch_pitch=config.PATCH_PITCH, patch_time=config.PATCH_TIME, d_model=config.D_MODEL,
         n_layers=config.N_LAYERS, n_heads=config.N_HEADS, ff_multiplier=config.FF_MULTIPLIER,
@@ -100,7 +100,7 @@ def batch_objective(model, vae, normalizer, batch, config, *, generator=None):
         clean = normalizer.normalize(clean, weights)
         t = torch.rand(len(clean), device=clean.device, generator=generator).clamp_min(1e-4)
         epsilon = torch.randn(clean.shape, device=clean.device, generator=generator)
-        noisy, target, levels = noise_target(clean, batch["known"], weights, t, epsilon)
+        noisy, target, levels = flow_target(clean, batch["known"], weights, t, epsilon)
     prediction = model(noisy, levels, batch["known"], weights, batch)
     losses = weighted_loss(prediction, target, weights, batch["known"])
     with torch.no_grad():
@@ -108,7 +108,7 @@ def batch_objective(model, vae, normalizer, batch, config, *, generator=None):
         errors = weighted_loss(estimate, clean, weights, batch["known"])
         stats = dict(loss=losses.sum(), latent_squared_error=errors.sum(), examples=losses.new_tensor(len(losses)),
                      retries=batch["retries"].sum())
-        for prefix, selection in (("low", t < .25), ("mid", (t >= .25) & (t < .75)), ("high", t >= .75)):
+        for prefix, selection in (("low", t >= .75), ("mid", (t >= .25) & (t < .75)), ("high", t < .25)):
             stats[prefix + "_squared_error"], stats[prefix + "_examples"] = errors[selection].sum(), selection.sum()
         vector = torch.stack([stats[k].double() for k in STAT_KEYS])
     return losses.mean(), vector
@@ -198,9 +198,9 @@ def prepare(c, device):
 def check(c, device):
     """Read-only forward check; no optimizer, backward, checkpoints or calibration artifacts."""
     vae, labels = prepare(c, device)
-    dataset = LatentDiffusionDataset(c, "validation", labels=labels)
+    dataset = LatentFlowDataset(c, "validation", labels=labels)
     batch = move_batch(collate_windows([dataset[0]]), device)
-    model = LatentDiffusionModel(model_config(c, vae, labels)).to(device).eval()
+    model = LatentFlowModel(model_config(c, vae, labels)).to(device).eval()
     norm = LatentNormalizer(torch.zeros(vae.config.latent_shape[0]), torch.ones(vae.config.latent_shape[0]))
     with amp_context(device):
         loss, stats = batch_objective(model, vae, norm, batch, c)
@@ -250,13 +250,13 @@ def train(c, *, force_cpu=False, allow_batch_size_change=False):
                     raise FileExistsError("Use a fresh SAVE_DIR or resume existing stage-2 training")
                 if state is None:
                     state = candidate
-        model = LatentDiffusionModel(model_config(c, vae, labels)).to(device)
+        model = LatentFlowModel(model_config(c, vae, labels)).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=c.LR, betas=c.BETAS, weight_decay=c.WEIGHT_DECAY)
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: lr_factor(step, c))
         scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and not torch.cuda.is_bf16_supported())
         step, epoch, next_batch, best_val = 0, 0, 0, float("inf")
-        train_data = LatentDiffusionDataset(c, "train", labels=labels, error_dir=directory / "data_errors")
-        val_data = LatentDiffusionDataset(c, "validation", labels=labels, error_dir=directory / "data_errors")
+        train_data = LatentFlowDataset(c, "train", labels=labels, error_dir=directory / "data_errors")
+        val_data = LatentFlowDataset(c, "validation", labels=labels, error_dir=directory / "data_errors")
         if state:
             changed = resume_setting_changes(state, c, asdict(model.config), world,
                                              allow_batch_size_change=allow_batch_size_change)
@@ -385,7 +385,7 @@ def train(c, *, force_cpu=False, allow_batch_size_change=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="improvnet.model.latent_diffusion_config")
+    parser.add_argument("--config", default="improvnet.model.latent_flow_config")
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--allow-batch-size-change", action="store_true",

@@ -2,8 +2,8 @@
 
 The first learned compression stage for the hierarchical tokenizer. It is
 **unconditional**: no genre, instrument embedding, clean history or accompaniment
-is supplied to the network. Hierarchical diffusion and conditioning are later
-stages; this does not change any AR or discrete-diffusion checkpoint.
+is supplied to the network. Hierarchical flow matching and conditioning are later
+stages; this does not change any AR or discrete-flow matching checkpoint.
 
 ## What gets encoded
 
@@ -18,7 +18,7 @@ pitch/time order before a learned projection combines the complete second.
 | `corrupted_roll` | `[B, 2, 128, 100]` | Optional perturbed encoder input; `roll` remains the clean target |
 | `pedal` | `[B, 1, 100]` | CC64 / 127; not duplicated across pitches |
 | `valid_mask` | `[B, 100]` | True for actual fine frames, false for trailing padding |
-| `latent` | `[B, 256, 1, 1]` | One vector per second in `vae176_vector256`; singleton axes preserve the diffusion API; sampled for training, mean for validation |
+| `latent` | `[B, 256, 1, 1]` | One vector per second in `vae176_vector256`; singleton axes preserve the flow matching API; sampled for training, mean for validation |
 | `events` | `[B, Emax, 11]` | Typed accompaniment rows, padded separately |
 | `event_positions` | `[B, Emax, 2]` | Start/end relative to this bin in fine frames |
 | `event_mask` | `[B, Emax]` | True for actual accompaniment rows |
@@ -132,7 +132,7 @@ sees only its one-second input, not additional context bins.
 Training jitter amplitude is uniform per example from 0 to a warmed-up maximum
 of 10% of the detached, valid-weighted clean posterior-mean channel standard
 deviation in the **current minibatch**. It is additional to posterior sampling,
-not a diffusion timestep and not a per-example latent normalization. Entirely
+not a flow matching timestep and not a per-example latent normalization. Entirely
 padded columns receive no noise. This online scale follows the changing encoder;
 the separate post-training robustness sweep still calibrates on training data.
 
@@ -166,7 +166,7 @@ GigaMIDI's genres are in the separately distributed
 That CSV has now been supplied and moved into the GigaMIDI scratch directory.
 Stage 2 uses it through a **separate genre-labelled index**; the unconditional
 VAE's original index/configuration remains unchanged for checkpoint compatibility.
-See [stage-2 genre labels](latent_diffusion.md#genre-labelled-index).
+See [stage-2 genre labels](latent_flow.md#genre-labelled-index).
 
 Splits are new deterministic 97% / 2% / 1% hash-based grouped splits, **not** the
 published MAESTRO splits or legacy AR train/test split. ARIA segments sharing a
@@ -272,7 +272,7 @@ The default save directory is `artifacts/vae/vae176_vector256`. The
 checkpoint architecture metadata still lets inference load older models;
 model state keys and default inference behavior have not changed. Once the new
 encoder is trained, recompute stage-2 latent statistics and **retrain stage 2**;
-the old diffusion model is not compatible merely because the latent shape matches.
+the old flow matching model is not compatible merely because the latent shape matches.
 The denoising branches increase training work/memory; the wider model's batch
 capacity has not yet been benchmarked at full GPU occupancy.
 
@@ -320,9 +320,9 @@ retired `vae176_latent4` run used `[4,32,25]` (3,200 values per second).
 `vae176_vector256` uses `[256,1,1]` (256 values per second, 12.5x fewer).
 The 176-wide convolutional backbone is retained; this experiment reduces the
 information bottleneck, not the backbone width. Smaller vectors do not guarantee
-better diffusion or 99% reconstruction: evaluate clean/robust note scores and
+better flow matching or 99% reconstruction: evaluate clean/robust note scores and
 recalibrate held-note decoding on validation after training. The old VAE and
-diffusion checkpoint folders were removed at the user's request; historical
+flow matching checkpoint folders were removed at the user's request; historical
 evaluation reports and shared VAE TensorBoard logs remain. For a
 capacity-only comparison keep the data, loss settings and effective batch fixed
 where practical. The new defaults also change onset positive-class share to 20%,
@@ -424,7 +424,7 @@ inconsistency and retries. These are reconstruction metrics, not musical quality
 scores. A short default-model GH200 smoke test at batch 32 used about 4.1 GiB
 of allocated GPU memory; this is not a maximum-batch-size benchmark.
 
-## Reconstruction and diffusion-readiness checks
+## Reconstruction and flow matching-readiness checks
 
 ```bash
 # Reconstruct a full piece, using the checkpoint's tokenizer/architecture.
@@ -510,10 +510,10 @@ F1 < 0.90, onset/note F1 < 0.85, velocity MAE > 10, release MAE > 100 ms, bounda
 F1 < 0.85, fewer than half the channels varying, sampling losing > 0.10 F1, or
 zeroing latents losing < 0.10 activity F1. These are editable starting thresholds,
 not established musical-quality cutoffs. `promising_not_proven` means try a small
-diffusion pilot and listen. Channel spread includes spatial variation and does
+flow matching pilot and listen. Channel spread includes spatial variation and does
 not prove content diversity; low KL can indicate collapse and high KL need not
 be bad. Diffusion latents need not already be Gaussian—estimate their scaling
-before diffusion training. Check collection-level scores, not just the aggregate.
+before flow matching training. Check collection-level scores, not just the aggregate.
 
 ```bash
 python -m unittest discover -s tests -p test_local_vae_inference.py
@@ -533,7 +533,7 @@ windows at fixed thresholds. The default split is validation; use `--split test`
 after choosing thresholds on validation. Noise is `mean + alpha * training_channel_std * N(0,1)`.
 Defaults test alpha 0, 0.005, 0.01, 0.02, 0.05, 0.10 and 0.20, plus ordinary
 posterior sampling as a control. These are noise **standard deviations**, not
-percentages of replaced notes or diffusion timesteps. Zero alpha is clean mean
+percentages of replaced notes or flow matching timesteps. Zero alpha is clean mean
 decoding; no extra noise is added to a sampled posterior. Padding is excluded.
 All strengths share the same random directions per window/draw for fair comparison.
 
@@ -544,7 +544,7 @@ scores clip both sides at the same endpoints and retain continuity inside window
 Held-out splits are unchanged; cross-collection duplicates are not deduplicated.
 Training scale is pooled over valid spatial cells; it is not a per-coordinate
 whitening transform. A decoder tolerating isotropic jitter may still fail on
-structured diffusion errors. Inspect piano/drum/other results separately.
+structured flow matching errors. Inspect piano/drum/other results separately.
 
 `--alphas 0 0.01 0.05 0.1` customizes the sweep. Outputs go to a new unique
 scratch `artifacts/local_vae_evaluation/latent-robustness-*` directory by default.

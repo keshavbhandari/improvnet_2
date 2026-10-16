@@ -9,19 +9,19 @@ GIGAMIDI_METADATA = DATASETS["gigamidi"] + "/Final-Metadata-Extended-GigaMIDI-Da
 GIGAMIDI_GENRE_FIELDS = ("music_styles_curated",)
 INDEX_PATH = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/local_vae_dataset/midi_index_gigamidi_genres.sqlite"
 
-VAE_CHECKPOINT = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/vae/vae176_vector512/best_model.pt"
-# Pinned best-checkpoint snapshot: ongoing VAE training cannot replace this file.
-# Fresh stage-2 run: older diffusion checkpoints use a different frozen encoder.
-SAVE_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/latent_diffusion"
-EVALUATION_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/latent_diffusion_evaluation"
+VAE_CHECKPOINT = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/vae/vae176_vector512/best_model.flow.pt"
+# Fixed VAE snapshot: ongoing VAE training cannot replace this file.
+# Fresh flow objective: existing generative checkpoints are incompatible.
+SAVE_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/latent_flow"
+EVALUATION_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/latent_flow_evaluation"
 
-HISTORY_BINS = 8  # Up to 8 seconds of clean context, separate from the target.
-TARGET_BINS = 30  # 30 seconds generated; 38 tokens total for vector [512,1,1].
+HISTORY_BINS = 30  # Up to 8 seconds of clean context, separate from the target.
+TARGET_BINS = 120  # tokens as vector [512,1,1].
 PATCH_PITCH = 1
 PATCH_TIME = 1
-D_MODEL = 512
-N_LAYERS = 16
-N_HEADS = 8
+D_MODEL = 1024
+N_LAYERS = 24
+N_HEADS = 16
 FF_MULTIPLIER = 4
 GRADIENT_CHECKPOINTING = True
 MAX_ACCOMPANIMENT_TRACKS = 3
@@ -48,7 +48,7 @@ NUM_WORKERS = 16
 LATENT_CALIBRATION_SAMPLES = 512  # Training windows;
 VAE_BATCH_SIZE = 16
 
-BATCH_SIZE = 32  # Windows per GPU, not individual VAE bins; not yet benchmarked.
+BATCH_SIZE = 128  # Windows per GPU, not individual VAE bins; not yet benchmarked.
 VALIDATION_BATCH_SIZE = 4
 MAX_VALIDATION_BATCHES = 100
 ACCUM_STEPS = 1

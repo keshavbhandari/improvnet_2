@@ -21,7 +21,7 @@ Each training view gets an **independent** bounded random pitch shift up to
 used to resolve instrument roles before each crop; the two shifts need not
 match. Independent draws can coincide by chance. Validation/test do not augment.
 Genre metadata prefixes are stripped, and unknown/null genres are included.
-Default filtering excludes the same Gigamidi `drums-only` paths as AR/diffusion;
+Default filtering excludes the same Gigamidi `drums-only` paths as AR/flow matching;
 normal mixtures with drums remain. `audit --include-drums-only` includes those too.
 
 Symmetric cross-entropy/InfoNCE: compare A against all B views and B against all

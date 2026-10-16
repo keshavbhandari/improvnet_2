@@ -6,7 +6,7 @@ JSONL_FILES = (
     "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/misc_data_tokenized.jsonl",
     "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/gigamidi_data_tokenized.jsonl",
 )
-# Match the AR/diffusion corpus filtering; retain normal mixtures with drums.
+# Match the AR/flow matching corpus filtering; retain normal mixtures with drums.
 MIDI_FILEPATH_EXCLUDE_SUBSTRINGS = {JSONL_FILES[1]: ("/drums-only/",)}
 ARTIFACT_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/continuity"
 MANIFEST = str(Path(ARTIFACT_DIR) / "dataset_manifest.json")

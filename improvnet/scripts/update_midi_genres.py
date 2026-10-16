@@ -58,7 +58,7 @@ def refresh(source, config):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-index", default=local_vae_config.INDEX_PATH)
-    parser.add_argument("--config", default="improvnet.model.latent_diffusion_config")
+    parser.add_argument("--config", default="improvnet.model.latent_flow_config")
     args = parser.parse_args()
     module = importlib.import_module(args.config)
     config = SimpleNamespace(**{k: v for k, v in vars(module).items() if k.isupper()})

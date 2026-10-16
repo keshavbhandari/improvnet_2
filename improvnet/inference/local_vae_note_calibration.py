@@ -19,7 +19,7 @@ from improvnet.inference.local_vae_inference import (
     Scores, common_args, inputs, load_model, output_directory, resolve_thresholds, write_report,
 )
 from improvnet.utils.local_vae_data import LocalVAEDataset, seed_for
-from improvnet.utils.latent_diffusion import checkpoint_digest
+from improvnet.utils.latent_flow import checkpoint_digest
 from improvnet.utils.note_decoding import NoteDecoding, confidence_arrays, decode_held_notes
 
 
