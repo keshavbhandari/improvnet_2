@@ -9,15 +9,16 @@ import random
 from improvnet.tokenizer.absolute import AbsTokenizer
 from improvnet.tokenizer.midi import MidiDict
 
-TASKS = ("refine", "rhythm", "harmonize", "drums")
-TASK_TOKENS = dict(zip(TASKS, ("<REFINE>", "<RHYTHM>", "<HARMONIZE>", "<DRUMS>")))
+TASKS = ("refine", "rhythm", "harmonize", "stem")
+TASK_TOKENS = dict(zip(TASKS, ("<REFINE>", "<RHYTHM>", "<HARMONIZE>", "<STEM>")))
 
 
 class MelodyTokenizer(AbsTokenizer):
     def __init__(self):
         super().__init__()
         self.base_vocab_size = self.vocab_size
-        self.add_tokens_to_vocab(list(TASK_TOKENS.values()))
+        # Keep every previous vocabulary ID, including the retired drum task.
+        self.add_tokens_to_vocab(["<REFINE>", "<RHYTHM>", "<HARMONIZE>", "<DRUMS>", "<STEM>"])
 
     def signature(self):
         # JSON-safe and exact: detects even a same-sized reordered vocabulary.
@@ -234,6 +235,17 @@ def mask_timing(notes, fraction, rng, tokenizer=None):
     return tokens
 
 
-def make_prompt(task, source_tokens, left=()):
-    return ([TASK_TOKENS[task], *left, "<SEP>", *source_tokens,
+def make_prompt(task, source_tokens, left=(), target_instrument=None):
+    condition = []
+    if task == 'stem':
+        if ('instrument', target_instrument) not in MelodyTokenizer().tok_to_id:
+            raise ValueError('Stem task requires a supported target instrument')
+        condition = [('instrument', target_instrument)]
+    return ([TASK_TOKENS[task], *condition, *left, "<SEP>", *source_tokens,
              "<SEP>", "<S>"])
+
+
+def record_instruments(record):
+    """Instrument stems use the tokenizer's canonical classes, including drums."""
+    return sorted({'Acoustic Piano' if n[0] == 'piano' else n[0]
+                   for n in record['notes'] + record.get('drums', [])})

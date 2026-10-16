@@ -1,4 +1,4 @@
-# ImprovNet: refinement, rhythm, harmony and drums
+# ImprovNet: refinement, rhythm, harmony and targeted stems
 
 One causal AR transformer learns four genre-conditioned tasks. Each note remains
 `instrument, (pitch, velocity), onset, duration`. The tasks support both solo
@@ -17,26 +17,40 @@ export IMPROVNET_ARTIFACTS=/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/arti
 
 ## Data and controls
 
-The v3 dataset and reference bank are already built in this workspace. For a new
-checkout/dataset, prepare them with:
+The active protocol uses `prepared/performances_stems_v4.jsonl` under `DATA_ROOT`.
+To prepare a fresh corpus (existing output paths are never overwritten):
 
 ```bash
 python -m improvnet.scripts.melody_prepare
+python -m improvnet.scripts.melody_prepare_stems --workers 24
 python -m improvnet.scripts.melody_style_references
 ```
 
-The prepared dataset is `prepared/performances_v3.jsonl` under the configured
-`DATA_ROOT`. It stores pitched notes, melody indices, and aligned drum notes
-separately. The earlier prepared dataset and raw MIDI/MusicXML files are retained.
-Preparation refuses to overwrite an existing output. The current v3 dataset has
-23,764 performances with a 21,422/1,160/1,182 train/validation/test split. There
-are 158 drum performances from Doug McKenzie: 140/9/9 in those splits. These
-aligned drum labels are jazz; this collection has no labelled blues drum examples.
-Parse exclusions and duplicate counts are recorded in the preparation report.
+The corpus retains the 23,764 jazz/blues performances and adds **47,528 labelled
+classical performances**, a **2:1** non-jazz to jazz/blues ratio. Preparation
+prefers genuine instrument mixtures from the labelled GigaMIDI, ClassicalArchives
+and SymphonyNet pools, targeting 60% classical mixtures where available. The
+report beside the dataset records the actual fraction and exclusions. A mixture
+requires at least two distinct tokenizer instrument classes, counting drums.
+Multiple piano tracks alone are one instrument class and cannot supply this task.
+All notes, including percussion, remain aligned to the original performance.
+
+The current build contains **17,237 classical mixtures (36.3%)**, up from 2,654
+(11.2%) in the previous classical subset. This uses every verified mixture in
+the scanned pool; the requested 60% was not attainable from those candidates.
+Train/validation/test contain 64,233/3,538/3,521 pieces. Classical drum-bearing
+pieces number 9,574; the original 158 jazz drum-bearing pieces remain unchanged.
+
+The original jazz/blues splits are retained. Exact duplicates and full transposed
+melody copies of the base corpus are excluded. Added recording groups and full
+melody copies stay within one deterministic split. The new index records actual
+instrument classes and mixture eligibility. Raw data and older prepared corpora
+are retained. Original AR pretraining overlap remains unaudited.
 
 The style exporter writes [style_references.json](improvnet/inference/style_references.json).
 It contains 40 examples from the training split, with source provenance, aggregate
 statistics for the pitched mix and a separate set for its extracted melody.
+References remain jazz/blues; classical additions are training examples.
 Notated lead sheets are excluded from this performance reference bank. Rebuild
 with `--data`, `--output` and `--per-source` to use a different prepared corpus.
 
@@ -55,27 +69,36 @@ Settings are in `improvnet/model/melody_config.py`:
 
 - Refine, rhythm and harmony: at most **512 source and 512 complete response
   tokens**, including music wrappers. Whole notes/onset groups are preserved.
-- Drums: at most **512 source tokens**; the complete pitched-plus-drums response
+- Missing stem: at most **512 source tokens**; the complete original-mix response
   can use the remaining **8,192-position** context, including all history,
   separators and continuous conditions.
-- Inputs choose mono/poly views equally where available. History is present
+- Refinement/rhythm/harmony choose mono/poly input views equally where available. History is present
   50% of the time and capped at 2,048 tokens. Its view follows the clean target:
   refinement/rhythm use the same mono/poly view as the selected input; harmony
-  always uses the preceding polyphonic arrangement; drums use the selected
-  pitched view plus preceding drums. The view is selected before corruption,
+  always uses the preceding polyphonic arrangement; missing-stem examples use
+  the preceding complete mixture and retain all remaining instruments in the input.
+  The view is selected before corruption,
   with no independent history-view draw. History precedes the target and has no
   right side.
 - Harmony/rhythm controls are independently configured to be visible on 50% of
   their respective examples. Explicit presence masks distinguish missing values
   from genuine zero-valued statistics.
-- Task weights are 30% refinement, 25% rhythm, 30% harmony and 15% drums. Source
-  and genre balancing happens within each eligible task. Drum tasks use only
-  performances containing aligned drums.
+- Task weights are 30% refinement, 25% rhythm, 30% harmony and 15% missing-stem
+  restoration. In the fourth task, remove **all notes of one instrument class**,
+  explicitly name that class in the prompt, and predict the **complete original
+  mix**. Only verified mixtures qualify. Drums have selection weight 2; each
+  other eligible instrument has weight 1. There are no fabricated missing stems.
+- `CLASSICAL_PROB=2/3` samples classical versus jazz/blues combined at 2:1 within
+  each eligible task. Jazz/blues share the remaining portion. A task uses only
+  its eligible genres. Classical refinement/rhythm/harmony prefer mixture records
+  with probability `MULTI_INSTRUMENT_PROB=0.75` where both views are available.
+  Stem restoration always draws from mixtures. Sources are balanced within the
+  chosen genre and mixture pool.
 
-The new four-task/style-conditioning protocol is **version 3**. Three-task
-checkpoints cannot resume its optimizer/data state. Their weights can initialize
-it; the original three task IDs are retained, a `<DRUMS>` row is appended, and
-new style parameters start with a zero output projection.
+The targeted-stem protocol is **version 4**. Earlier optimizer/data state cannot
+resume it. Weight-only migration preserves all existing token IDs, including the
+reserved legacy `<DRUMS>` ID, and appends `<STEM>`. The stem prompt starts with
+`<STEM> (instrument, requested_class)` before the optional full-mix history.
 
 Your configured batch size (24), accumulation (1) and run directory have been
 retained. The old melody checkpoints and TensorBoard logs have been cleared from
@@ -100,14 +123,15 @@ failures do not queue another job. No job is submitted by editing the launcher.
 
 The trainer retains DDP, AMP, accumulation, clipping, TensorBoard and resumable
 atomic checkpoints. Only response tokens contribute to loss; validation reports
-all four tasks. `N_STEPS` sets the schedule horizon. `--steps` can stop a pilot
+all four tasks, plus missing-stem-only and per-instrument losses. These extra
+metrics exclude copied input notes so copying cannot conceal poor stem prediction. `N_STEPS` sets the schedule horizon. `--steps` can stop a pilot
 early without shortening that horizon. Monitor each task and listen to stage
 outputs when selecting checkpoints. The original AR weights are preserved.
 
 ## Generation
 
-After training a v3 checkpoint, the default pipeline runs refinement, rhythm,
-harmony and then drums. A seeded random jazz/blues reference from the JSON bank
+After training a v4 checkpoint, the default pipeline runs refinement, rhythm,
+harmony and then the requested stem (drums by default). A seeded random jazz/blues reference from the JSON bank
 supplies the controls unless `--style-reference /path/to/performed_jazz.mid` is
 provided. The same reference is used across chunks/stages; mono rhythm uses its
 melody statistics, and poly rhythm uses its pitched-mix statistics.
@@ -125,29 +149,38 @@ Examples of controls:
 ```bash
 # Additional arguments to the command above:
 --style-reference /path/to/performed_jazz.mid
---pipeline-order refine,harmonize,rhythm,drums
+--pipeline-order refine,harmonize,rhythm,stem
 --input-view poly --history-view poly
---no-drums
+--no-stem
 --no-style-conditioning
+--task stem --target-instrument "Acoustic Bass" --input-view poly
 ```
 
-`--task refine|rhythm|harmonize|drums` selects one task. Auto input view extracts
-a melody for a multi-stage pipeline and retains the pitched arrangement for a
+`--task refine|rhythm|harmonize|stem` selects one task. Auto input view extracts
+a melody for a multi-stage pipeline and retains the complete supplied mix for a
 single task; `--input-view mono|poly` overrides it. Harmony can precede rhythm:
 polyphonic timing keeps chord attacks together while preserving instrument,
 pitch, velocity and note count by default. `--free-timing-pitches` permits free
-attribute/count changes. Harmony preserves all supplied pitched notes. Drum
-addition preserves the complete supplied pitched arrangement and adds only drum
-notes, exported on MIDI channel 10. Drums must be the final selected task.
-`--passes` repeats the pitched tasks in their specified order; drums run once.
+attribute/count changes. Harmony preserves supplied pitched notes.
 
-Each stage begins without history. Later chunks use only that stage's generated
-output. The default `--history-view match` follows the target pitched view;
-harmony always keeps its full polyphonic history, and drum history retains its
-generated drums even with a monophonic pitched view. Explicit `mono`/`poly`
-overrides remain available for the other tasks. Corrupted inputs and complete
+`--target-instrument` selects an existing tokenizer instrument class, default
+`drum`. The stem task preserves **every supplied note**, including existing drums,
+and adds only notes of the requested instrument. Supply a mix with that instrument
+absent; requesting an instrument already present raises an error. Same-class
+tracks cannot be targeted separately. Stem addition is last and runs once after
+`--passes` repeats the other tasks. `--no-stem` skips it; `--no-drums` remains an
+alias. Drums export on MIDI channel 10.
+
+Each stage begins without history, then uses its generated output. Harmony keeps
+its preceding polyphonic pitched history. Stem restoration always keeps the full
+generated mixture, irrespective of `--history-view`. Refinement/rhythm default to
+the target's mono/poly view, with explicit overrides available.
+Corrupted inputs and complete
 outputs are measured after serialization, including `<T>` tokens. Growing
-corruptions or dense drum targets shrink input spans at complete onset groups.
+corruptions or dense missing-stem targets shrink input spans at complete onset groups.
+If a clean chord fits but a note-adding corruption makes that indivisible chord
+too large, refinement uses attribute masking at the same strength instead.
+This fallback applies during training and generation and preserves the target.
 Refinement treats a substantially premature `<E>` as a completed prefix and
 continues the uncovered input; its ending allowance is 5% of the input attack
 span, capped at five seconds. It supplies no copied classical fallback.

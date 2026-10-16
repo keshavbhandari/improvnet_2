@@ -1,4 +1,4 @@
-"""Pitched MIDI -> configurable refinement/timing/harmony order -> drum addition."""
+"""MIDI -> configurable refinement/timing/harmony order -> targeted stem addition."""
 import argparse
 from collections import Counter
 from dataclasses import replace
@@ -37,10 +37,10 @@ def preserve_melody(generated, melody, tolerance_ms=50):
     return ordered(remaining + list(melody))
 
 
-def merge_additions(generated, anchors, tokenizer, max_tokens, drums_only=False):
+def merge_additions(generated, anchors, tokenizer, max_tokens, target_instrument=None):
     """Keep input notes exactly; fit added whole onset groups into the response."""
-    merged = ([n for n in generated if n.instrument == 'drum'] + list(anchors)
-              if drums_only else preserve_melody(generated, anchors))
+    merged = ([n for n in generated if n.instrument == target_instrument] + list(anchors)
+              if target_instrument is not None else preserve_melody(generated, anchors))
     pending = Counter(anchors)
     extras = []
     for n in ordered(merged):
@@ -186,16 +186,23 @@ class MelodyInference:
 
     def transform(self, melody, task, genre, strength, rng, temperature=.9, top_k=50,
                   keep_pitches=True, output_instruments=None, progress=False,
-                  progress_desc=None, style_reference=None, history_view='match', monophonic=None):
+                  progress_desc=None, style_reference=None, history_view='match', monophonic=None,
+                  target_instrument=None):
         if task not in TASKS or history_view not in ('mono', 'poly', 'match'):
             raise ValueError('Unknown task or history view')
-        if task == 'harmonize':
-            history_view = 'poly'  # Match training: retain accompaniment from completed chunks.
+        if task == 'stem':
+            if ('instrument', target_instrument) not in self.tokenizer.tok_to_id:
+                raise ValueError('Choose a supported target instrument for stem generation')
+            if any(n.instrument == target_instrument for n in melody):
+                raise ValueError('Target instrument is already present; remove that stem from the input first')
+            monophonic = False
+        if task in ('harmonize', 'stem'):
+            history_view = 'poly'  # Match the complete clean target used during training.
         if task in ('refine', 'rhythm') and strength == 0:
             return list(melody), []
         tok = self.tokenizer
-        passthrough_drums = [n for n in melody if n.instrument == 'drum'] if task != 'drums' else []
-        melody = ordered([n for n in melody if n.instrument != 'drum'])
+        passthrough_drums = [n for n in melody if n.instrument == 'drum'] if task != 'stem' else []
+        melody = ordered(melody if task == 'stem' else [n for n in melody if n.instrument != 'drum'])
         result, stats = [], []
         if not melody:
             return result + passthrough_drums, stats
@@ -220,7 +227,7 @@ class MelodyInference:
                                                            self.meta.get('skyline_tolerance_ms', 50))[0])
                     history_notes = ordered(pitched_history + [n for n in result if n.instrument == 'drum'])
                 left = history_tokens(history_notes, self.meta['history_tokens'], tok)
-                available = self.meta['seq_len'] - len(left) - 6
+                available = self.meta['seq_len'] - len(left) - 6 - int(task == 'stem')
                 if task == 'harmonize':
                     expansion = max(self.meta['harmony_expansion'],
                                     1 + style_statistics.get('accompaniment_voicing_density', 0))
@@ -235,12 +242,14 @@ class MelodyInference:
                     input_cap = minimum_group
                 stop = chunk_end(melody, begin, input_cap)
                 corruption_rng = rng.getstate()
+                bounded_corruption = False
                 while True:
                     rng.setstate(corruption_rng)
                     start, end = chunk_bounds(melody, begin, stop)
                     core = window(melody, start, end)
                     if task == 'refine':
-                        source = corrupt_melody(core, strength, rng, tok, self.meta['max_corruptions'])
+                        options = {'names': ['whole_mask']} if bounded_corruption else {}
+                        source = corrupt_melody(core, strength, rng, tok, self.meta['max_corruptions'], **options)
                     elif task == 'rhythm':
                         source = mask_timing(core, strength, rng, tok)
                     else:
@@ -249,15 +258,20 @@ class MelodyInference:
                     if len(source) <= self.meta['chunk_tokens'] and len(source) + clean_reply <= available:
                         break
                     fraction = min(self.meta['chunk_tokens'] / len(source), available / (len(source) + clean_reply))
-                    stop = shorten_chunk(melody, begin, stop, fraction * .98)
-                prompt = make_prompt(task, source, left)
+                    try:
+                        stop = shorten_chunk(melody, begin, stop, fraction * .98)
+                    except ValueError:
+                        if task != 'refine' or bounded_corruption or clean_reply + 1 > self.meta['chunk_tokens']:
+                            raise
+                        bounded_corruption = True
+                prompt = make_prompt(task, source, left, target_instrument)
                 reply_budget = available - len(source)
-                if task != 'drums':
+                if task != 'stem':
                     reply_budget = min(self.meta['chunk_tokens'] - 1, reply_budget)
                 instruments = (output_instruments if task == 'harmonize' and output_instruments
                                else sorted({n.instrument for n in core}))
-                if task == 'drums':
-                    instruments = sorted(set(instruments) | {'drum'})
+                if task == 'stem':
+                    instruments = sorted(set(instruments) | {target_instrument})
                 note_progress.set_postfix(chunk=len(stats) + 1, source=len(source), history=len(left))
                 generated = self.generate(prompt, genre, strength, instruments, end - start,
                                           temperature, top_k,
@@ -277,20 +291,22 @@ class MelodyInference:
                         if early_end and progress:
                             tqdm.write(f'Early refinement end; continuing input from '
                                        f'{melody[consumed_stop].onset / 1000:.2f}s', file=sys.stderr)
-                if task in ('harmonize', 'drums'):
+                if task in ('harmonize', 'stem'):
                     generated = merge_additions(generated, core, tok, reply_budget + 1,
-                                                drums_only=task == 'drums')
+                                                target_instrument=target_instrument if task == 'stem' else None)
                 result.extend(replace(n, onset=n.onset + start) for n in generated)
                 response_tokens = len(notes_to_tokens(generated, tok)) - 1
                 if len(prompt) + response_tokens + 2 > self.meta['seq_len']:
                     raise RuntimeError('Complete output exceeds the context budget')
                 stats.append(dict(start_ms=start, end_ms=end, input_notes=len(core), output_notes=len(generated),
                                   task=task, strength=strength, history_view=history_view,
+                                  target_instrument=target_instrument,
                                   history_tokens=len(left), source_tokens=len(source),
                                   response_tokens=response_tokens, response_token_budget=reply_budget,
                                   total_token_budget=len(prompt) + reply_budget + 2,
                                   consumed_input_notes=consumed_stop - begin, early_end=early_end,
                                   input_mono=input_mono, style_mask=style_mask.tolist(),
+                                  bounded_corruption=bounded_corruption,
                                   advance_to_ms=melody[consumed_stop].onset if consumed_stop < len(melody) else end))
                 note_progress.update(consumed_stop - begin)
                 begin = consumed_stop
@@ -306,18 +322,20 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--genre', choices=['jazz', 'blues'], default='jazz')
     parser.add_argument('--task', choices=['pipeline', *TASKS], default='pipeline')
-    parser.add_argument('--pipeline-order', default=','.join(TASKS), help='Comma-separated task order; drums, if selected, must be last')
+    parser.add_argument('--pipeline-order', default=','.join(TASKS), help='Comma-separated task order; stem addition, if selected, must be last')
+    parser.add_argument('--target-instrument', default='drum', choices=ProcessData().INSTRUMENT_CLASSES,
+                        help='Missing instrument to add in the stem task (default: drum)')
     parser.add_argument('--input-view', choices=['auto', 'mono', 'poly'], default='auto', help='Auto extracts a melody for the pipeline and retains polyphony for individual tasks')
     parser.add_argument('--history-view', choices=['match', 'mono', 'poly'], default='match',
-                        help='Default matches the target pitched view; harmony is always polyphonic and drum history retains drums')
+                        help='Default matches the target view; harmony and stem addition use the complete generated mix')
     parser.add_argument('--style-reference', type=Path, help='Use aggregate controls from this MIDI')
     parser.add_argument('--style-presets', type=Path, default=cfg.STYLE_REFERENCES)
     parser.add_argument('--no-style-conditioning', action='store_true')
     parser.add_argument('--melody-strength', type=float, default=.2)
     parser.add_argument('--rhythm-strength', type=float, default=.5)
-    parser.add_argument('--passes', type=int, default=1, help='Repeat pitched tasks in order; drums are added once at the end')
+    parser.add_argument('--passes', type=int, default=1, help='Repeat pitched tasks in order; the requested stem is added once at the end')
     parser.add_argument('--no-harmonize', action='store_true')
-    parser.add_argument('--no-drums', action='store_true')
+    parser.add_argument('--no-stem', '--no-drums', dest='no_stem', action='store_true')
     parser.add_argument('--free-timing-pitches', action='store_true', help='Also allow pitch/velocity/count changes in timing responses')
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--top-k', type=int, default=50)
@@ -332,10 +350,10 @@ def main():
         parser.error('Pipeline order must contain distinct valid task names')
     if args.no_harmonize:
         order = [x for x in order if x != 'harmonize']
-    if args.no_drums:
-        order = [x for x in order if x != 'drums']
-    if not order or 'drums' in order and order[-1] != 'drums':
-        parser.error('Choose at least one task and place drums last')
+    if args.no_stem:
+        order = [x for x in order if x != 'stem']
+    if not order or 'stem' in order and order[-1] != 'stem':
+        parser.error('Choose at least one task and place stem addition last')
     outputs = [args.output, args.output.with_suffix('.json'), *(args.output.with_suffix('.' + suffix + '.mid')
                 for suffix in ('melody', 'input', *TASKS))]
     if args.input.resolve() in {p.resolve() for p in outputs}:
@@ -367,11 +385,11 @@ def main():
         tqdm.write(f'Model ready on {inference.device}; reading {args.input}', file=sys.stderr)
     original = read_midi_notes(args.input, inference.tokenizer, include_drums=True)
     pitched = [n for n in original if n.instrument != 'drum']
-    if not pitched:
+    if not pitched and not (order == ['stem'] and original):
         raise ValueError('Input has no supported pitched notes')
     melody = melody_voice(skyline(pitched, inference.meta['skyline_tolerance_ms'])[0])
     input_view = ('mono' if args.task == 'pipeline' and len(order) > 1 else 'poly') if args.input_view == 'auto' else args.input_view
-    current = melody if input_view == 'mono' else pitched
+    current = melody if input_view == 'mono' else original
     is_mono = input_view == 'mono'
     args.output.parent.mkdir(parents=True, exist_ok=True)
     stem = args.output.with_suffix('')
@@ -382,7 +400,7 @@ def main():
                    f'{reference["id"] if reference else "none"}', file=sys.stderr)
     rng, stats = random.Random(args.seed), []
     for pass_idx in range(args.passes):
-        for task in (t for t in order if t != 'drums'):
+        for task in (t for t in order if t != 'stem'):
             strength = args.melody_strength if task == 'refine' else args.rhythm_strength if task == 'rhythm' else 1.
             current, log = inference.transform(current, task, args.genre, strength, rng,
                                                args.temperature, args.top_k,
@@ -398,18 +416,21 @@ def main():
             if progress:
                 tqdm.write(f'Saved {stem}.{task}.mid ({len(current)} notes)', file=sys.stderr)
     result = current
-    if 'drums' in order:
-        result, log = inference.transform(current, 'drums', args.genre, 1., rng,
+    if 'stem' in order:
+        result, log = inference.transform(current, 'stem', args.genre, 1., rng,
                                           args.temperature, args.top_k, progress=progress,
-                                          progress_desc='Drums', history_view=args.history_view, monophonic=is_mono)
+                                          progress_desc='Add ' + args.target_instrument,
+                                          history_view='poly', monophonic=False,
+                                          target_instrument=args.target_instrument)
         stats.extend(log)
-        write_midi_notes(result, str(stem) + '.drums.mid', inference.tokenizer)
+        write_midi_notes(result, str(stem) + '.stem.mid', inference.tokenizer)
     write_midi_notes(result, args.output, inference.tokenizer)
     report = dict(model=str(args.model), checkpoint_step=inference.checkpoint_step,
                   input=str(args.input), output=str(args.output), genre=args.genre,
                   melody_strength=args.melody_strength, rhythm_strength=args.rhythm_strength,
                   passes=args.passes, temperature=args.temperature, top_k=args.top_k,
                   task_order=order, input_view=input_view, history_view=args.history_view,
+                  target_instrument=args.target_instrument if 'stem' in order else None,
                   style_reference=reference,
                   source_notes=len(original), skyline_notes=len(melody),
                   output_notes=len(result), drum_notes=sum(n.instrument == 'drum' for n in result),

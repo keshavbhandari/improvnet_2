@@ -16,7 +16,7 @@ def build_references(data=cfg.DATA_FILE, output=cfg.STYLE_REFERENCES, per_source
     index = json.loads(data.with_suffix('.index.json').read_text())
     groups = defaultdict(list)
     for row in index['rows']:
-        if row['split'] == 'train' and row['source'] not in ('wikifonia', 'curated'):
+        if row['split'] == 'train' and row['genre'] in ('jazz', 'blues') and row['source'] not in ('wikifonia', 'curated'):
             groups[(row['genre'], row['source'])].append(row)
     examples, rng = [], random.Random(seed)
     with data.open('rb') as handle:

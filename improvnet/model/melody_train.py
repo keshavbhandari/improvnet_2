@@ -17,7 +17,7 @@ from improvnet.model import melody_config as cfg
 from improvnet.model.ar_train import all_ranks_finite, build_scheduler, checkpoint_requested, next_training_position
 from improvnet.model.melody_model import (MelodyRefinementModel, checkpoint_metadata,
                                         initialize_from_ar, validate_checkpoint)
-from improvnet.utils.ar_utils import (build_optimizer, collect_rng_state_for_checkpoint,
+from improvnet.utils.ar_utils import (ProcessData, build_optimizer, collect_rng_state_for_checkpoint,
                                     load_checkpoint, resume_epoch_loader, save_checkpoint)
 from improvnet.utils.melody_data import build_dataloader
 from improvnet.utils.melody import TASKS
@@ -42,6 +42,8 @@ def evaluate_validation(model, loader, device, config=cfg, max_batches=100):
     model.eval()
     # Sums/counts per task avoid comparing losses with different token counts.
     totals = torch.zeros(len(TASKS), 2, dtype=torch.float64, device=device)
+    instruments = ProcessData().INSTRUMENT_CLASSES
+    stem_totals = torch.zeros(len(instruments), 2, dtype=torch.float64, device=device)
     for i, batch in enumerate(loader):
         if i >= max_batches:
             break
@@ -56,12 +58,23 @@ def evaluate_validation(model, loader, device, config=cfg, max_batches=100):
             mask = (batch['task'] == task).unsqueeze(1) & (batch['target'] != config.IGNORE_INDEX)
             totals[task, 0] += losses[mask].sum().double()
             totals[task, 1] += mask.sum()
+        if 'stem_mask' in batch:
+            for instrument in range(len(stem_totals)):
+                mask = batch['stem_mask'] & (batch['stem_instrument'] == instrument).unsqueeze(1)
+                stem_totals[instrument, 0] += losses[mask].sum().double()
+                stem_totals[instrument, 1] += mask.sum()
     if dist.is_initialized():
         dist.all_reduce(totals)
+        dist.all_reduce(stem_totals)
     model.train()
     metrics = {name: (totals[i, 0] / totals[i, 1]).item() for i, name in
                enumerate(TASKS) if totals[i, 1] > 0}
     metrics['loss'] = (totals[:, 0].sum() / totals[:, 1].sum().clamp_min(1)).item()
+    for i, name in enumerate(instruments):
+        if stem_totals[i, 1] > 0:
+            metrics['stem_target/' + name.replace(' ', '_')] = (stem_totals[i, 0] / stem_totals[i, 1]).item()
+    if stem_totals[:, 1].sum() > 0:
+        metrics['stem_target'] = (stem_totals[:, 0].sum() / stem_totals[:, 1].sum()).item()
     return metrics
 
 
@@ -91,6 +104,12 @@ def train(config=cfg, n_steps=None):
         validate_checkpoint(checkpoint)  # Reject incompatible protocols before allocating the model.
     train_loader = build_dataloader('train', config.BATCH_SIZE, distributed, config)
     val_loader = build_dataloader('validation', config.BATCH_SIZE, distributed, config)
+    if rank == 0:
+        print(f'Data: {config.DATA_FILE}; train={len(train_loader.dataset)}, '
+              f'validation={len(val_loader.dataset)}; task weights={dict(zip(TASKS, config.TASK_WEIGHTS))}', flush=True)
+        print(f'Classical probability={config.CLASSICAL_PROB:.3f}; classical mixture preference='
+              f'{config.MULTI_INSTRUMENT_PROB:.3f}; missing-stem drum weight={config.STEM_DRUM_WEIGHT}; '
+              'stem targets contain the complete original mix.', flush=True)
     model = MelodyRefinementModel(**config.MODEL_KWARGS)
     metadata = checkpoint_metadata(model, config)
     if checkpoint is not None:

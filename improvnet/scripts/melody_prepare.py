@@ -12,7 +12,7 @@ import re
 import sqlite3
 
 from improvnet.model import melody_config as cfg
-from improvnet.utils.melody import MelodyTokenizer, Note, ordered, read_midi_notes, skyline
+from improvnet.utils.melody import MelodyTokenizer, Note, ordered, read_midi_notes, skyline, record_instruments
 
 
 def title_key(text):
@@ -89,7 +89,35 @@ def read_job(job):
         return job, None, None, f'{type(exc).__name__}: {exc}'
 
 
-def prepare(root=cfg.DATA_ROOT, output=cfg.DATA_FILE, max_files=0, workers=0):
+def make_record(job, notes):
+    """Build the common pitched/melody/drum record for every labelled corpus."""
+    path, genre, source, title, mono = job
+    if genre not in ('jazz', 'blues', 'classical'):
+        raise ValueError(f'Unrecognized genre {genre}')
+    if not any(n.instrument != 'drum' for n in notes):
+        raise ValueError('No pitched notes')
+    offset = min(n.onset for n in notes)
+    notes = [replace(n, onset=n.onset - offset) for n in ordered(notes)]
+    drums = [n for n in notes if n.instrument == 'drum']
+    notes = [n for n in notes if n.instrument != 'drum']
+    melody, harmony = (notes, []) if mono else skyline(notes, cfg.SKYLINE_TOLERANCE_MS)
+    selected = {id(n) for n in melody}
+    record = dict(path=str(path), source=source, genre=genre, title=title,
+                  notes=[astuple(n) for n in notes],
+                  melody_indices=[i for i, n in enumerate(notes) if id(n) in selected],
+                  has_harmony=not mono and bool(harmony),
+                  drums=[astuple(n) for n in drums], has_drums=bool(drums))
+    return record, melody_fingerprint(record)
+
+
+def melody_fingerprint(record):
+    """Identify complete transposed copies without grouping shared short licks."""
+    melody = [record['notes'][i] for i in record['melody_indices']]
+    return hashlib.sha256(json.dumps([
+        (n[1] - melody[0][1], n[3] - melody[0][3], n[4]) for n in melody]).encode()).hexdigest()
+
+
+def prepare(root=cfg.DATA_ROOT, output=cfg.BASE_DATA_FILE, max_files=0, workers=0):
     root, output = Path(root), Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists() or output.with_suffix('.index.json').exists():
@@ -120,41 +148,24 @@ def prepare(root=cfg.DATA_ROOT, output=cfg.DATA_FILE, max_files=0, workers=0):
             try:
                 if error:
                     raise ValueError(error)
-                if genre not in ('jazz', 'blues', 'classical'):
-                    raise ValueError(f'Unrecognized genre {genre}')
                 if digest in seen_hashes:
                     counts['duplicate_files'] += 1
                     continue
-                if not any(n.instrument != 'drum' for n in notes):
-                    raise ValueError('No pitched notes')
-                offset = min(n.onset for n in notes)
-                notes = [replace(n, onset=n.onset - offset) for n in ordered(notes)]
-                drums = [n for n in notes if n.instrument == 'drum']
-                notes = [n for n in notes if n.instrument != 'drum']
-                melody, harmony = (notes, []) if mono else skyline(notes, cfg.SKYLINE_TOLERANCE_MS)
-                selected = {id(n) for n in melody}
-                melody_indices = [i for i, n in enumerate(notes) if id(n) in selected]
-                has_harmony = not mono and bool(harmony)
-                # Group transposed copies too. Full tune fingerprint avoids
-                # grouping unrelated songs solely by a shared short lick.
-                fingerprint = hashlib.sha256(json.dumps([
-                    (n.pitch - melody[0].pitch, n.onset - melody[0].onset, n.duration)
-                    for n in melody]).encode()).hexdigest()
+                record, fingerprint = make_record((path, genre, source, title, mono), notes)
+                has_harmony = record['has_harmony']
                 idx = len(rows)
                 parents.append(idx)
                 connect(idx, 'melody:' + fingerprint)
                 normalized_title = title_key(title)
                 connect(idx, 'title:' + normalized_title if normalized_title else '')
-                record = dict(path=str(path), source=source, genre=genre, title=title,
-                              notes=[astuple(n) for n in notes], melody_indices=melody_indices,
-                              has_harmony=has_harmony, drums=[astuple(n) for n in drums],
-                              has_drums=bool(drums))
+                instruments = record_instruments(record)
                 rows.append(dict(offset=handle.tell(), source=source, genre=genre,
-                                 has_harmony=has_harmony, has_drums=bool(drums), sha256=digest))
+                                 instruments=instruments, has_multi_instrument=len(instruments) >= 2,
+                                 has_harmony=has_harmony, has_drums=record['has_drums'], sha256=digest))
                 handle.write((json.dumps(record, separators=(',', ':')) + '\n').encode())
                 seen_hashes.add(digest)
                 counts[source] += 1
-                if drums:
+                if record['has_drums']:
                     drum_counts[source] += 1
                 if len(rows) % 250 == 0:
                     print(f'Prepared {len(rows)} performances; {len(errors)} failures', flush=True)
@@ -169,7 +180,7 @@ def prepare(root=cfg.DATA_ROOT, output=cfg.DATA_FILE, max_files=0, workers=0):
         row['group'] = group
         row['split'] = ('train' if number < cfg.DATA_SPLIT_RATIOS['train'] else
                         'validation' if number < cfg.DATA_SPLIT_RATIOS['train'] + cfg.DATA_SPLIT_RATIOS['validation'] else 'test')
-    index = dict(version=3, tokenizer=tok.signature(),
+    index = dict(version=4, tokenizer=tok.signature(),
                  skyline_tolerance_ms=cfg.SKYLINE_TOLERANCE_MS, rows=rows)
     report = dict(prepared=len(rows), sources=dict(counts),
                   splits=dict(Counter(r['split'] for r in rows)), errors=errors,
@@ -190,7 +201,7 @@ def prepare(root=cfg.DATA_ROOT, output=cfg.DATA_FILE, max_files=0, workers=0):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=cfg.DATA_ROOT)
-    parser.add_argument('--output', type=Path, default=cfg.DATA_FILE)
+    parser.add_argument('--output', type=Path, default=cfg.BASE_DATA_FILE)
     parser.add_argument('--max-files', type=int, default=0, help='Limit for a preparation smoke test')
     parser.add_argument('--workers', type=int, default=cfg.NUM_WORKERS, help='CPU conversion processes; 0 runs serially')
     args = parser.parse_args()

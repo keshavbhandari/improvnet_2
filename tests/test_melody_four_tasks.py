@@ -45,33 +45,33 @@ def test_target_matched_histories_with_complete_bounded_responses(task, mono, hi
     x = prepare_example(record, random.Random(17), settings(
         INPUT_MONO_PROB=mono, HISTORY_PROB=history_prob,
         HARMONY_STYLE_PROB=1, RHYTHM_STYLE_PROB=1), task, .4)
-    expected_history_mono = bool(mono) and task != 'harmonize'
-    assert x['input_mono'] == bool(mono) and x['history_mono'] == expected_history_mono
+    expected_history_mono = bool(mono) and task not in ('harmonize', 'stem')
+    assert x['input_mono'] == (bool(mono) and task != 'stem') and x['history_mono'] == expected_history_mono
     assert 0 < x['source_length'] <= 512 and x['history_length'] <= 2048
     assert len(x['input']) + 3 <= 8192
-    if task != 'drums':
+    if task != 'stem':
         assert x['response_length'] + 1 <= 512
     tok = MelodyTokenizer()
     stream = [tok.id_to_tok[i] for i in x['input'].tolist()]
-    history = tokens_to_notes(stream[1:1 + x['history_length']], tok)
+    history = tokens_to_notes(stream[1 + int(task == 'stem'):1 + int(task == 'stem') + x['history_length']], tok)
     assert bool(history) == bool(history_prob)
     clean = [Note(*n) for n in record['notes']]
     if expected_history_mono:
         clean = melody_voice([clean[i] for i in record['melody_indices']])
-    if task == 'drums':
+    if task == 'stem':
         clean += [Note(*n) for n in record['drums']]
     preceding = [n for n in clean if n.onset < x['start_ms']]
     expected_history = history_tokens(preceding, 2048, tok) if history_prob else []
-    assert stream[1:1 + x['history_length']] == expected_history
+    assert stream[1 + int(task == 'stem'):1 + int(task == 'stem') + x['history_length']] == expected_history
     if history:
         pitched_history = [n for n in history if n.instrument != 'drum']
         simultaneous = Counter(n.onset for n in pitched_history)
         assert (max(simultaneous.values()) == 1) == expected_history_mono
-        assert any(n.instrument == 'drum' for n in history) == (task == 'drums')
+        assert any(n.instrument == 'drum' for n in history) == (task == 'stem')
     response = decoded_response(x)
     pitched = [n for n in response if n.instrument != 'drum']
-    assert any(n.instrument == 'drum' for n in response) == (task == 'drums')
-    if task in ('refine', 'rhythm', 'drums'):
+    assert any(n.instrument == 'drum' for n in response) == (task == 'stem')
+    if task in ('refine', 'rhythm'):
         assert (max(Counter(n.onset for n in pitched).values()) == 1) == bool(mono)
     else:
         assert max(Counter(n.onset for n in pitched).values()) == 3
@@ -81,7 +81,7 @@ def test_target_matched_histories_with_complete_bounded_responses(task, mono, hi
 def test_drum_response_can_exceed_512_and_transposition_does_not_change_drum_pitches():
     record = arrangement()
     record['_augment'] = True
-    x = prepare_example(record, random.Random(5), settings(INPUT_MONO_PROB=1), 'drums')
+    x = prepare_example(record, random.Random(5), settings(INPUT_MONO_PROB=1), 'stem', target_instrument='drum')
     response = decoded_response(x)
     assert x['source_length'] <= 512 < x['response_length'] and len(x['input']) + 3 <= 8192
     assert {n.pitch for n in response if n.instrument == 'drum'} <= {42, 51}
@@ -110,7 +110,7 @@ def test_dense_drum_supervision_shrinks_input_without_truncating_the_mix():
     record['drums'] = [astuple(Note('drum', p, 80, t, 10))
                        for t in range(0, 40000, 10) for p in (36, 42, 51)]
     x = prepare_example(record, random.Random(5), settings(
-        INPUT_MONO_PROB=1, HISTORY_PROB=1), 'drums')
+        INPUT_MONO_PROB=1, HISTORY_PROB=1), 'stem', target_instrument='drum')
     assert x['source_length'] < 512 < x['response_length'] and len(x['input']) + 3 <= 8192
     drums = [n for n in decoded_response(x) if n.instrument == 'drum']
     expected = [Note(n[0], n[1], n[2], n[3] - x['start_ms'], n[4]) for n in record['drums']
@@ -230,7 +230,7 @@ def test_drum_generation_preserves_every_input_note_and_bounds_complete_mix():
         return [Note('Acoustic Piano', 65, 40, 0, 10)] + [
             Note('drum', p, 80, t, 10) for t in range(0, window_ms, 10) for p in (36, 42, 51)]
     inference.generate = generate
-    result, stats = inference.transform(anchors, 'drums', 'jazz', 1, random.Random(1), monophonic=False)
+    result, stats = inference.transform(anchors, 'stem', 'jazz', 1, random.Random(1), monophonic=False, target_instrument='drum')
     assert [n for n in result if n.instrument != 'drum'] == anchors
     assert any(n.instrument == 'drum' for n in result)
     assert all(s['total_token_budget'] <= 8192 and s['source_tokens'] <= 512 for s in stats)
@@ -253,17 +253,17 @@ def test_drum_inference_history_matches_pitched_target_and_retains_generated_dru
         core = tokens_to_notes(prompt[prompt.index('<SEP>') + 1:-2], tok)
         return core + [Note('drum', 42, 80, t, 20) for t in sorted({n.onset for n in core})]
     inference.generate = generate
-    result, stats = inference.transform(anchors, 'drums', 'jazz', 1, random.Random(1), monophonic=mono)
+    result, stats = inference.transform(anchors, 'stem', 'jazz', 1, random.Random(1), monophonic=mono, target_instrument='drum')
     assert len(stats) > 1 and stats[0]['history_tokens'] == 0
     for prompt, stat in zip(prompts[1:], stats[1:]):
-        history = prompt[1:prompt.index('<SEP>')]
+        history = prompt[2:prompt.index('<SEP>')]
         previous = [n for n in result if n.onset < stat['start_ms']]
         assert history == history_tokens(previous, 100, tok)
         decoded = tokens_to_notes(history, tok)
         assert any(n.instrument == 'drum' for n in decoded)
         pitched = [n for n in decoded if n.instrument != 'drum']
         assert max(Counter(n.onset for n in pitched).values()) == (1 if mono else 3)
-        assert stat['history_view'] == ('mono' if mono else 'poly')
+        assert stat['history_view'] == 'poly' and stat['input_mono'] is False
 
 
 def test_drum_preparation_and_roundtrip(tmp_path):
@@ -315,11 +315,11 @@ def test_reordered_pipeline_with_poly_input_and_midi_reference(tmp_path, monkeyp
     write_midi_notes([Note(*n) for n in record['notes']], source)
     monkeypatch.setattr(sys, 'argv', ['melody_inference', '--model', str(checkpoint),
         '--input', str(source), '--output', str(output), '--input-view', 'poly',
-        '--pipeline-order', 'harmonize,rhythm,drums', '--style-reference', str(source),
+        '--pipeline-order', 'harmonize,rhythm,stem', '--style-reference', str(source),
         '--device', 'cpu', '--temperature', '0', '--no-progress'])
     main()
     report = json.loads(output.with_suffix('.json').read_text())
-    assert report['task_order'] == ['harmonize', 'rhythm', 'drums']
+    assert report['task_order'] == ['harmonize', 'rhythm', 'stem']
     assert report['style_reference']['id'] == str(source)
     assert report['input_view'] == 'poly'
     assert all(c['total_token_budget'] <= 256 for c in report['chunks'])

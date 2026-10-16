@@ -62,7 +62,7 @@ def initialize_from_ar(model, checkpoint):
             raise ValueError(f'Unexpected pretrained parameter: {key}')
         if key in ('token_emb.weight', 'lm_head.weight'):
             base = MelodyTokenizer().base_vocab_size
-            if value.shape[0] not in (base, base + 3, expected[key].shape[0]) or value.shape[1:] != expected[key].shape[1:]:
+            if value.shape[0] not in (base, base + 3, base + 4, expected[key].shape[0]) or value.shape[1:] != expected[key].shape[1:]:
                 raise ValueError(f'AR vocabulary/width mismatch for {key}: {value.shape}')
             expanded = expected[key].clone()
             expanded[:value.shape[0]].copy_(value)
@@ -79,12 +79,15 @@ def initialize_from_ar(model, checkpoint):
 
 def checkpoint_metadata(model, config):
     index = Path(config.DATA_FILE).with_suffix('.index.json')
-    return dict(version=3, model_kwargs=model.model_kwargs,
+    return dict(version=4, model_kwargs=model.model_kwargs,
                 tokenizer=MelodyTokenizer().signature(), genres=list(config.GENRES),
                 chunk_tokens=config.CHUNK_TOKENS, history_tokens=config.HISTORY_TOKENS,
                 history_prob=config.HISTORY_PROB, harmony_expansion=config.HARMONY_EXPANSION,
                 history_policy='clean_target_view', input_mono_prob=config.INPUT_MONO_PROB,
-                harmony_history_view='poly', drum_history_includes_drums=True,
+                harmony_history_view='poly', stem_history_view='full_mix',
+                stem_grouping='tokenizer_instrument_class', stem_drum_weight=config.STEM_DRUM_WEIGHT,
+                multi_instrument_prob=config.MULTI_INSTRUMENT_PROB,
+                classical_prob=config.CLASSICAL_PROB,
                 harmony_style_prob=config.HARMONY_STYLE_PROB, rhythm_style_prob=config.RHYTHM_STYLE_PROB,
                 style_features=list(STYLE_FEATURES),
                 skyline_tolerance_ms=config.SKYLINE_TOLERANCE_MS,
@@ -96,9 +99,9 @@ def checkpoint_metadata(model, config):
 
 def validate_checkpoint(checkpoint, expected=None):
     meta = checkpoint.get('refinement')
-    if meta and meta.get('version') in (1, 2):
-        raise ValueError('Old refinement protocol: start a fresh four-task run; old weights may initialize it but cannot resume it')
-    if not meta or meta.get('version') != 3:
+    if meta and meta.get('version') in (1, 2, 3):
+        raise ValueError('Old refinement protocol: start a fresh targeted-stem run; old weights may initialize it but cannot resume it')
+    if not meta or meta.get('version') != 4:
         raise ValueError('Expected a melody-refinement checkpoint, not the original AR checkpoint')
     if meta['tokenizer'] != MelodyTokenizer().signature():
         raise ValueError('Tokenizer differs from the checkpoint')

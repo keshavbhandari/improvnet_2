@@ -336,9 +336,9 @@ def test_checkpoint_records_long_chunk_protocol():
     model = MelodyRefinementModel(**tiny_kwargs())
     meta = checkpoint_metadata(model, cfg)
     assert validate_checkpoint({'refinement': meta}) == meta
-    assert (meta['version'], meta['chunk_tokens'], meta['history_tokens'], meta['history_prob']) == (3, 512, 2048, .5)
+    assert (meta['version'], meta['chunk_tokens'], meta['history_tokens'], meta['history_prob']) == (4, 512, 2048, .5)
     assert meta['harmony_history_view'] == 'poly'
-    assert meta['history_policy'] == 'clean_target_view' and meta['drum_history_includes_drums']
+    assert meta['history_policy'] == 'clean_target_view' and meta['stem_history_view'] == 'full_mix'
     assert 'history_mono_prob' not in meta
     with pytest.raises(ValueError, match='Resume settings differ'):
         validate_checkpoint({'refinement': dict(meta, history_policy='independent')}, expected=meta)
@@ -418,7 +418,8 @@ def test_vocabulary_and_timing_mask_endpoints():
     from improvnet.tokenizer.absolute import AbsTokenizer
     base = AbsTokenizer()
     assert tok.vocab[:base.vocab_size] == base.vocab
-    assert tok.vocab_size == base.vocab_size + 4
+    assert tok.vocab_size == base.vocab_size + 5
+    assert tok.vocab[base.vocab_size:] == ('<REFINE>', '<RHYTHM>', '<HARMONIZE>', '<DRUMS>', '<STEM>')
     notes = skyline(performance())[0]
     clean = notes_to_tokens(notes, tok)
     assert mask_timing(notes, 0, random.Random(0), tok) == clean
@@ -512,7 +513,7 @@ def make_data(path):
     with path.open('wb') as handle:
         for split in ('train', 'validation', 'test'):
             for i in range(6):
-                rows.append(dict(offset=handle.tell(), split=split, genre='jazz', source='fixture', has_harmony=True, has_drums=True, sha256=f'{i:064x}'))
+                rows.append(dict(offset=handle.tell(), split=split, genre='jazz', source='fixture', has_harmony=True, has_drums=True, instruments=['Acoustic Piano', 'drum'], has_multi_instrument=True, sha256=f'{i:064x}'))
                 handle.write((json.dumps(row) + '\n').encode())
     path.with_suffix('.index.json').write_text(json.dumps(dict(
         version=3, tokenizer=MelodyTokenizer().signature(), rows=rows)))

@@ -18,7 +18,7 @@
     "ioi_q75_ms": "75th percentile of pitched attack intervals in milliseconds.",
     "ioi_lag1_correlation": "Lag-one correlation of consecutive attack intervals; negative values describe alternation, not a guaranteed swing ratio."
   },
-  "data_index_sha256": "2bc5b17476d950953bca34d30ac12e6d32bf8c9fee02ea70f576bb49a8d2b134",
+  "data_index_sha256": "a4b1dbe2c788f61c57bc0085810d87565856dfbac7c6e83cd8285b9c75700d3f",
   "note": "Aggregate statistics only. Use melody_statistics for mono rhythm and statistics for poly rhythm/harmony.",
   "examples": [
     {

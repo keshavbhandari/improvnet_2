@@ -3,7 +3,15 @@ from pathlib import Path
 from improvnet.utils.melody import MelodyTokenizer
 
 DATA_ROOT = Path('/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data')
-DATA_FILE = DATA_ROOT / 'prepared' / 'performances_v3.jsonl'
+BASE_DATA_FILE = DATA_ROOT / 'prepared' / 'performances_v3.jsonl'
+DATA_FILE = DATA_ROOT / 'prepared' / 'performances_stems_v4.jsonl'
+CLASSICAL_CACHE = DATA_ROOT / 'prepared' / 'performances_classical_v3.jsonl'
+CLASSICAL_INDEX = Path('/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/local_vae_dataset/midi_index_gigamidi_genres.sqlite')
+CLASSICAL_PROB = 2 / 3  # Non-jazz/classical versus jazz+blues: 2:1.
+CLASSICAL_RATIO = 2
+CLASSICAL_MULTI_FRACTION = 0.60  # Prefer this fraction of genuine multi-instrument records.
+MULTI_INSTRUMENT_PROB = 0.75  # Classical task sampling; stem always requires a mixture.
+STEM_DRUM_WEIGHT = 2.0  # Each other eligible instrument has weight 1.
 STYLE_REFERENCES = Path(__file__).resolve().parents[1] / 'inference' / 'style_references.json'
 SAVE_DIR = '/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v1'
 RUN_NAME = 'melody_refinement_v1'
@@ -28,7 +36,7 @@ RHYTHM_STYLE_PROB = 0.5
 HARMONY_EXPANSION = 3.0  # Reserve room for new voices within the 512-token response.
 SKYLINE_TOLERANCE_MS = 50
 MAX_CORRUPTIONS = 3
-TASK_WEIGHTS = (0.30, 0.25, 0.30, 0.15)  # refine, rhythm, harmonize, drums
+TASK_WEIGHTS = (0.30, 0.25, 0.30, 0.15)  # refine, rhythm, harmonize, missing stem
 DATA_SPLIT_SEED = 42
 DATA_SPLIT_RATIOS = {'train': .90, 'validation': .05, 'test': .05}
 
