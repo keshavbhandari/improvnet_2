@@ -33,3 +33,6 @@ include = ["improvnet", "improvnet.*"]
 
 [tool.setuptools.exclude-package-data]
 "improvnet" = ["artifacts/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/melody"]

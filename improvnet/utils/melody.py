@@ -1,16 +1,19 @@
 """Shared note representation, skyline and ImprovNet-style corruptions.
 
-Times are milliseconds; no beat grid is estimated. Corruption names are never
+Times are milliseconds; pulse analysis lives in melody_groove. Corruption names are never
 serialized into a model prompt.
 """
 from dataclasses import dataclass, replace
 import random
+import math
 
 from improvnet.tokenizer.absolute import AbsTokenizer
 from improvnet.tokenizer.midi import MidiDict
+from improvnet.utils.melody_midi import read_midi_dict
 
-TASKS = ("refine", "rhythm", "harmonize", "stem")
-TASK_TOKENS = dict(zip(TASKS, ("<REFINE>", "<RHYTHM>", "<HARMONIZE>", "<STEM>")))
+TASKS = ("refine", "harmonize", "stem")
+# Task IDs are fixed; unused historical vocabulary entries stay reserved.
+TASK_TOKENS = dict(refine="<REFINE>", harmonize="<HARMONIZE>", stem="<ADD_STEM>")
 
 
 class MelodyTokenizer(AbsTokenizer):
@@ -18,7 +21,8 @@ class MelodyTokenizer(AbsTokenizer):
         super().__init__()
         self.base_vocab_size = self.vocab_size
         # Keep every previous vocabulary ID, including the retired drum task.
-        self.add_tokens_to_vocab(["<REFINE>", "<RHYTHM>", "<HARMONIZE>", "<DRUMS>", "<STEM>"])
+        self.add_tokens_to_vocab(["<REFINE>", "<RHYTHM>", "<HARMONIZE>", "<DRUMS>",
+                                  "<STEM>", "<ARRANGE>", "<REORCHESTRATE>", "<ORCHESTRATE>", "<ADD_STEM>"])
 
     def signature(self):
         # JSON-safe and exact: detects even a same-sized reordered vocabulary.
@@ -88,9 +92,9 @@ def tokens_to_notes(tokens, tokenizer=None):
     return ordered(notes)
 
 
-def read_midi_notes(path, tokenizer=None, include_drums=False):
+def read_midi_notes(path, tokenizer=None, include_drums=False, recovery=None):
     tok = tokenizer or MelodyTokenizer()
-    midi = MidiDict.from_midi(str(path))
+    midi = read_midi_dict(path,recovery)
     tokens = tok.tokenize(midi, remove_preceding_silence=False, add_dim_tok=False)
     # Drum examples are not melody/harmony supervision for the piano pilot.
     return [n for n in tokens_to_notes(tokens, tok) if include_drums or n.instrument != "drum"]
@@ -141,90 +145,35 @@ def window(notes, start, end):
 
 
 def sample_strength(rng):
-    # Include exact endpoints, which a continuous uniform draw almost never hits.
-    u = rng.random()
-    return 0.0 if u < .05 else 1.0 if u > .95 else rng.random()
+    """Five percent without extra edits; otherwise equal 10%–100% levels."""
+    return 0. if rng.random() < .05 else rng.randint(1, 10) / 10
 
 
-CORRUPTIONS = ("pitch_velocity_mask", "onset_duration_mask", "whole_mask",
-               "permute_pitch", "permute_pitch_velocity", "fragmentation",
-               "incorrect_transposition", "note_modification")
+def harmonize_strength(rng, strength=None, minimum=.6, full_probability=.25):
+    """Severe timing removal, with explicit fully masked training examples."""
+    if not .5 < minimum <= 1 or not 0 <= full_probability <= 1:
+        raise ValueError('Harmonization masking must stay above 50%')
+    if strength is None:
+        return 1. if rng.random() < full_probability else rng.uniform(minimum, 1.)
+    if not 0 <= strength <= 1:
+        raise ValueError('Mask fraction must be in [0,1]')
+    return max(minimum, strength)
 
 
-def corrupt_melody(notes, strength, rng, tokenizer=None, max_corruptions=3, names=None):
-    """Compose 1–3 paper-inspired edits, scaled by a shared severity in [0, 1]."""
-    if not 0 <= strength <= 1 or not 1 <= max_corruptions <= 3:
-        raise ValueError("strength must be in [0,1]; max_corruptions in [1,3]")
-    tok = tokenizer or MelodyTokenizer()
-    notes = ordered(notes)
-    if strength == 0 or not notes:
-        return notes_to_tokens(notes, tok)
-    choices = list(names) if names is not None else rng.sample(
-        CORRUPTIONS, rng.randint(1, max_corruptions))
-    if len(choices) > 3 or any(name not in CORRUPTIONS for name in choices):
-        raise ValueError("Expected at most three known corruptions")
-    # Apply slot masks last so subsequent note edits cannot invalidate them.
-    choices.sort(key=lambda name: name.endswith("mask"))
-    masks = set()
-    for name in choices:
-        k = min(len(notes), max(1, round(strength * len(notes))))
-        indices = rng.sample(range(len(notes)), k)
-        if name in ("pitch_velocity_mask", "onset_duration_mask", "whole_mask"):
-            attrs = {"pitch_velocity_mask": (1,), "onset_duration_mask": (2, 3),
-                     "whole_mask": (0, 1, 2, 3)}[name]
-            # Store by note object identity until structural edits are complete.
-            masks.update((id(notes[i]), attr) for i in indices for attr in attrs)
-        elif name.startswith("permute"):
-            original = [notes[i] for i in indices]
-            shuffled = original.copy()
-            rng.shuffle(shuffled)
-            for i, source in zip(indices, shuffled):
-                old = notes[i]
-                notes[i] = replace(old, pitch=source.pitch, velocity=(
-                    source.velocity if name == "permute_pitch_velocity" else old.velocity))
-                masks.update((id(notes[i]), a) for a in range(4) if (id(old), a) in masks)
-        elif name == "incorrect_transposition":
-            for i in indices:
-                old = notes[i]
-                notes[i] = replace(old, pitch=max(0, min(127, old.pitch + rng.choice((-5, 5)))))
-                masks.update((id(notes[i]), a) for a in range(4) if (id(old), a) in masks)
-        elif name == "fragmentation":
-            notes = notes[:len(notes) - k]
-        else:  # note_modification: merge omissions and split long notes.
-            selected = set(indices)
-            modified = []
-            for i, n in enumerate(notes):
-                if i in selected and modified and n.onset - modified[-1].onset >= 50:
-                    prev = modified[-1]
-                    modified[-1] = replace(prev, duration=max(prev.duration, n.onset + n.duration - prev.onset))
-                elif i in selected and n.duration > 500:
-                    half = max(10, round(n.duration / 20) * 10)
-                    modified.extend([replace(n, duration=half), replace(n,
-                        onset=n.onset + half, duration=n.duration - half,
-                        pitch=max(0, min(127, n.pitch + rng.choice((-5, -2, 2, 5)))),
-                        velocity=rng.choice((45, 60, 75, 90, 105)))])
-                else:
-                    modified.append(n)
-            notes = modified
-    # Serialize masks without losing the unmasked clock or note boundaries.
-    tokens, segment = ["<S>"], 0
-    for n in ordered(notes):
-        encoded = notes_to_tokens([n], tok)[1:-1]
-        new_segment = n.onset // tok.abs_time_step_ms
-        tokens.extend(["<T>"] * (new_segment - segment))
-        segment = new_segment
-        attrs = encoded[-4:]
-        tokens.extend("<MASK>" if (id(n), a) in masks else t for a, t in enumerate(attrs))
-    return tokens + ["<E>"]
 
 
-def mask_timing(notes, fraction, rng, tokenizer=None):
+
+
+
+
+def mask_timing(notes, fraction, rng, tokenizer=None, *, round_up=False):
     if not 0 <= fraction <= 1:
         raise ValueError("Mask fraction must be in [0,1]")
     tokens = notes_to_tokens(notes, tokenizer)
     # Mask simultaneous notes together, so polyphonic timing edits preserve chords.
     onsets = sorted({n.onset for n in notes})
-    chosen = set(rng.sample(onsets, round(fraction * len(onsets))))
+    count = math.ceil(fraction * len(onsets)) if round_up else round(fraction * len(onsets))
+    chosen = set(rng.sample(onsets, count))
     selected = [n.onset in chosen for n in ordered(notes)]
     note_idx = -1
     for i, token in enumerate(tokens):
@@ -236,12 +185,15 @@ def mask_timing(notes, fraction, rng, tokenizer=None):
 
 
 def make_prompt(task, source_tokens, left=(), target_instrument=None):
+    if task not in TASK_TOKENS:
+        raise ValueError(f'Unknown task: {task}')
     condition = []
-    if task == 'stem':
+    if task == 'stem' and target_instrument is not None:
         if ('instrument', target_instrument) not in MelodyTokenizer().tok_to_id:
             raise ValueError('Stem task requires a supported target instrument')
-        condition = [('instrument', target_instrument)]
-    return ([TASK_TOKENS[task], *condition, *left, "<SEP>", *source_tokens,
+        condition = ['<STEM>', ('instrument', target_instrument)]
+    task_token = TASK_TOKENS[task]
+    return ([task_token, *condition, *left, "<SEP>", *source_tokens,
              "<SEP>", "<S>"])
 
 

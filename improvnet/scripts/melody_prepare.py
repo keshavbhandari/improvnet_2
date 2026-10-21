@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from dataclasses import astuple, replace
 import hashlib
 import json
+import os
 from itertools import islice
 from pathlib import Path
 import re
@@ -62,7 +63,7 @@ def read_score_notes(path, tokenizer):
     from music21 import converter, note, chord, harmony
     score = converter.parse(str(path))
     # Written repeats are performed repeats. A malformed repeat map is a parse
-    # failure recorded in the report, not silently a different arrangement.
+    # failure recorded in the report, not silently a different harmonization.
     score = score.expandRepeats()
     notes = []
     for event in score.flatten().secondsMap:
@@ -115,6 +116,92 @@ def melody_fingerprint(record):
     melody = [record['notes'][i] for i in record['melody_indices']]
     return hashlib.sha256(json.dumps([
         (n[1] - melody[0][1], n[3] - melody[0][3], n[4]) for n in melody]).encode()).hexdigest()
+
+
+def recover_labelled_failures(config=cfg):
+    """Revisit excluded labelled assets; retain originals and report every result."""
+    output=Path(config.RECOVERED_DATA_FILE)
+    if output.exists() and output.with_suffix('.index.json').exists():
+        previous_index=json.loads(output.with_suffix('.index.json').read_text())
+        if previous_index.get('version')==2:
+            return json.loads(output.with_suffix('.report.json').read_text())
+    else:
+        previous_index=dict(rows=[])
+    original_report=Path(config.BASE_DATA_FILE).with_suffix('.report.json')
+    if not original_report.exists():
+        return None
+    jobs={str(job[0]):job for job in discover(config.DATA_ROOT)}
+    rows=json.loads(config.PREPARED_DATA_FILE.with_suffix('.index.json').read_text())['rows']
+    known_hashes={r['sha256'] for r in rows}
+    title_pattern=re.compile(rb'"title"\s*:\s*("(?:[^"\\]|\\.)*")')
+    titles={}
+    with config.PREPARED_DATA_FILE.open('rb') as handle:
+        for row in rows:
+            if row['genre'] not in ('jazz','blues'):
+                continue
+            prefix=os.pread(handle.fileno(),1024,row['offset']).split(b'\n',1)[0]
+            match=title_pattern.search(prefix)
+            key=title_key(json.loads(match[1])) if match else ''
+            if key:
+                titles[key]=row
+    output.parent.mkdir(parents=True,exist_ok=True)
+    recovered=list(previous_index['rows'])
+    previous_report=json.loads(output.with_suffix('.report.json').read_text()) if recovered else {}
+    errors=list(previous_report.get('unrecoverable',[]))
+    duplicates=list(previous_report.get('duplicate_paths',[]))
+    checked={r['path'] for r in recovered}|{r['path'] for r in errors}|set(duplicates)
+    known_hashes.update(r['sha256'] for r in recovered)
+    pending=[jobs[r['path']] for r in json.loads(original_report.read_text()).get('errors',[])
+             if r['path'] in jobs and r['path'] not in checked]
+    indexed={}
+    with sqlite3.connect(Path(config.CLASSICAL_INDEX).resolve().as_uri()+'?mode=ro',uri=True) as db:
+        for path,genre,group,split in db.execute("SELECT path,genre,group_id,split FROM files WHERE collection='gigamidi' AND genre IN ('jazz','blues') ORDER BY group_id,path"):
+            if group in {r['group'] for r in indexed.values()} or '/drums-only/' in path:
+                continue
+            indexed[path]=dict(group=group,split=split)
+            if path not in checked:
+                pending.append((Path(path),genre,'gigamidi',Path(path).stem,False))
+    old_manifest=json.loads(Path(config.DATA_FILE).read_text()) if Path(config.DATA_FILE).exists() else {}
+    previous_training_sources={r.get('raw_path') or r.get('path') for r in old_manifest.get('ar_mixtures',[])+old_manifest.get('raw_train',[])}
+    temporary=output.with_suffix('.tmp')
+    with temporary.open('wb') as handle:
+        if recovered:
+            handle.write(output.read_bytes())
+        for number,job in enumerate(pending):
+            job,digest,notes,error=read_job(job)
+            try:
+                if error:
+                    raise ValueError(error)
+                if digest in known_hashes:
+                    duplicates.append(str(job[0]))
+                    continue
+                record,fingerprint=make_record(job,notes)
+                prior=titles.get(title_key(job[3]))
+                instruments=record_instruments(record)
+                indexed_row=indexed.get(str(job[0]))
+                split=prior['split'] if prior else indexed_row['split'] if indexed_row else 'train'
+                if str(job[0]) in previous_training_sources:
+                    split='train'
+                row=dict(offset=handle.tell(),jsonl=str(output),source=job[2],genre=job[1],
+                         split=split,
+                         group=(prior.get('group') or prior.get('source_group')) if prior else indexed_row['group'] if indexed_row else digest,
+                         sha256=digest,instruments=instruments,has_drums=record['has_drums'],
+                         has_multi_instrument=len(instruments)>=2,fingerprint=fingerprint,path=str(job[0]))
+                handle.write((json.dumps(record,separators=(',',':'))+'\n').encode())
+                recovered.append(row)
+                known_hashes.add(digest)
+            except Exception as exc:
+                errors.append(dict(path=str(job[0]),error=f'{type(exc).__name__}: {exc}'))
+            if (number+1)%25==0:
+                print(f'Checked {number+1}/{len(pending)} additional labelled files.',flush=True)
+    temporary.replace(output)
+    output.with_suffix('.index.json').write_text(json.dumps(dict(version=2,rows=recovered)))
+    report=dict(recovered=len(recovered),recovered_paths=[r['path'] for r in recovered],
+                duplicate_paths=duplicates,unrecoverable=errors,indexed_jazz_blues_candidates=len(indexed),
+                policy='Ignore invalid key metadata/SysEx only; do not infer corrupt notes or ambiguous score repeats.')
+    output.with_suffix('.report.json').write_text(json.dumps(report,indent=2))
+    print(f'Recovered {len(recovered)} labelled performances; {len(errors)} remain unusable.',flush=True)
+    return report
 
 
 def prepare(root=cfg.DATA_ROOT, output=cfg.BASE_DATA_FILE, max_files=0, workers=0):

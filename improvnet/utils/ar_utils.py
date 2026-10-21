@@ -372,6 +372,9 @@ def _epoch_indices(loader: DataLoader, epoch: int) -> list[int]:
     return list(range(dataset_len))
 
 def _loader_from_indices(loader: DataLoader, indices: list[int]) -> DataLoader:
+    options={}
+    if loader.num_workers:
+        options["prefetch_factor"]=loader.prefetch_factor
     return DataLoader(
         loader.dataset,
         batch_size=loader.batch_size,
@@ -381,6 +384,7 @@ def _loader_from_indices(loader: DataLoader, indices: list[int]) -> DataLoader:
         drop_last=loader.drop_last,
         collate_fn=loader.collate_fn,
         generator=loader.generator,
+        **options,
     )
 
 def resume_epoch_loader(

@@ -1,56 +1,81 @@
-"""AR fine-tuning settings. Batch size is per GPU; no beat features are used."""
+"""V5: melody repair, harmony/rhythm and groove-conditioned stem denoising."""
 from pathlib import Path
-from improvnet.utils.melody import MelodyTokenizer
+from improvnet.utils.melody import MelodyTokenizer, TASKS
 
+PROTOCOL_VERSION = 9
+TASK_NAMES = TASKS
+TASK_WEIGHTS = (.20, .40, .40)
 DATA_ROOT = Path('/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data')
+DATA_FILE = DATA_ROOT / 'prepared' / 'melody_manifest_v5.json'
+EXTRA_PERFORMANCE_INDEX = DATA_ROOT / 'prepared' / 'jazz_performance_v5.index.json'
+PREPARED_DATA_FILE = DATA_ROOT / 'prepared' / 'performances_stems_v4.jsonl'
 BASE_DATA_FILE = DATA_ROOT / 'prepared' / 'performances_v3.jsonl'
-DATA_FILE = DATA_ROOT / 'prepared' / 'performances_stems_v4.jsonl'
-CLASSICAL_CACHE = DATA_ROOT / 'prepared' / 'performances_classical_v3.jsonl'
+RECOVERED_DATA_FILE = DATA_ROOT / 'prepared' / 'recovered_labelled.jsonl'
+PARSED_CACHE = DATA_ROOT / 'prepared' / 'round2_lazy_cache'  # Reuse parsed notes; tasks are formed on the fly.
 CLASSICAL_INDEX = Path('/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/local_vae_dataset/midi_index_gigamidi_genres.sqlite')
-CLASSICAL_PROB = 2 / 3  # Non-jazz/classical versus jazz+blues: 2:1.
-CLASSICAL_RATIO = 2
-CLASSICAL_MULTI_FRACTION = 0.60  # Prefer this fraction of genuine multi-instrument records.
-MULTI_INSTRUMENT_PROB = 0.75  # Classical task sampling; stem always requires a mixture.
-STEM_DRUM_WEIGHT = 2.0  # Each other eligible instrument has weight 1.
+CLASSICAL_RATIO = 8  # Non-jazz slots per original jazz/blues file.
+JAZZ_BLUES_REPEATS = 4
+MULTI_INSTRUMENT_PROB = .75
+STEM_DRUM_PROB = .85
+JAZZ_INSTRUMENT_WEIGHT = 3.
+AR_MIXTURE_PROB = .80
+AR_JSONL_FILES = [DATA_ROOT.parent / 'data_old' / name for name in
+                  ('gigamidi_data_tokenized.jsonl', 'misc_data_tokenized.jsonl')]
+AR_MIXTURE_LIMIT = 100000
+AR_MIXTURE_SCAN_PER_FILE = 200000
+AR_MIXTURE_INDEX = DATA_ROOT / 'prepared' / 'ar_mixtures_v3.json'
 STYLE_REFERENCES = Path(__file__).resolve().parents[1] / 'inference' / 'style_references.json'
-SAVE_DIR = '/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v1'
-RUN_NAME = 'melody_refinement_v1'
+SAVE_DIR = '/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v5'
+RUN_NAME = 'melody_refinement_v5'
 INIT_CHECKPOINT = '/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/ar_context_split_instrument/best_model.pt'
-RESUME_TRAINING = True  # Resume this run if present; otherwise load AR weights only.
-
+RESUME_TRAINING = True
 GENRES = ['classical', 'jazz', 'blues', 'unknown']
 VOCAB_SIZE = MelodyTokenizer().vocab_size
 MODEL_KWARGS = dict(vocab_size=VOCAB_SIZE, embed_dim=2048, n_heads=16,
-                    n_kv_heads=4, n_layers=20, num_genres=len(GENRES),
-                    num_instruments=41, dropout=0.1)
-SEQ_LEN = 8192  # Includes prompt + response; two conditioning positions are reserved.
+                    n_kv_heads=4, n_layers=20, num_genres=len(GENRES), num_instruments=41, dropout=.1)
+SEQ_LEN = 8192
+CHUNK_TOKENS = 512
+MIX_RESPONSE_TOKENS = 2048
+HARMONIZE_EXPANSION = 8.
+HARMONIZE_MIN_MASK_RATIO = .60
+HARMONIZE_FULL_MASK_PROB = .25
+HISTORY_TOKENS = 2048
+HISTORY_PROB = .75  # Monophonic refinement history.
+POLY_HISTORY_PROB = .75
+HISTORY_CORRUPTION_PROB = .30  # Conditional on history; training only, other than refinement.
+HISTORY_EDIT_FRACTION = .10
+HISTORY_ADDITION_WEIGHT = 2.
+HISTORY_DELETION_WEIGHT = 1.
+RHYTHM_STYLE_PROB = .75  # Shared controls for harmony/rhythm and missing-stem tasks.
+SKYLINE_TOLERANCE_MS = 50
+MAX_CORRUPTIONS = 1  # Additional edit after mandatory detected-ornament merging.
+GENERIC_MERGE_PROB = .10  # Additional ordinary merge; contour 40%, pitch/timing 25% each.
+PITCH_CORRUPTION_SEMITONES = 7  # Refinement and generated-history pitch errors.
+TIMING_CORRUPTION_MS = 50  # Absolute onset/duration errors, in 10-ms increments.
+STEM_TIMING_JITTER_MS = TIMING_CORRUPTION_MS
+STEM_PITCH_SHIFT_PROB = .05  # Maximum per-example accompaniment corruption rate.
+STEM_PITCH_SHIFT_MIN_PROB = 0.
+STEM_PITCH_CLEAN_PROB = .20  # Explicit pitch-clean inputs; other rates uniform between 0% and 5%.
+STEM_PITCH_SHIFT_SEMITONES = PITCH_CORRUPTION_SEMITONES
+WORKER_RECORD_CACHE = 4
+WORKER_CACHE_NOTES = 100000  # Per worker; large performances remain usable but uncached.
+PREFETCH_FACTOR = 1
+DATA_SPLIT_SEED = 42
+DATA_SPLIT_RATIOS = {'train': .98, 'validation': .01, 'test': .01}
 PAD_ID = 2
 IGNORE_INDEX = -100
-
-CHUNK_TOKENS = 512  # Source and response cap for refine/rhythm/harmony, including wrappers.
-HISTORY_TOKENS = 2048
-HISTORY_PROB = 0.5  # Clean left history during training; never provide right context.
-INPUT_MONO_PROB = 0.5  # History follows the clean target view; harmony is always polyphonic.
-HARMONY_STYLE_PROB = 0.5
-RHYTHM_STYLE_PROB = 0.5
-HARMONY_EXPANSION = 3.0  # Reserve room for new voices within the 512-token response.
-SKYLINE_TOLERANCE_MS = 50
-MAX_CORRUPTIONS = 3
-TASK_WEIGHTS = (0.30, 0.25, 0.30, 0.15)  # refine, rhythm, harmonize, missing stem
-DATA_SPLIT_SEED = 42
-DATA_SPLIT_RATIOS = {'train': .90, 'validation': .05, 'test': .05}
-
 BATCH_SIZE = 24
 ACCUM_STEPS = 1
-NUM_WORKERS = 16
+NUM_WORKERS = 4
 LR = 2e-5
 MIN_LR = 2e-6
-WEIGHT_DECAY = 0.1
-BETAS = (0.9, 0.95)
+WEIGHT_DECAY = .1
+BETAS = (.9, .95)
 WARMUP_STEPS = 500
 DECAY_STEPS = 5000
-N_STEPS = 20000  # Optimizer updates; initial full fine-tuning budget.
-GRAD_CLIP = 1.0
+N_STEPS = 20000
+GRAD_CLIP = 1.
 LOG_EVERY = 1
+DATA_LOG_EVERY = 50
 VAL_EVERY = 500
 CHECKPOINT_EVERY = 500

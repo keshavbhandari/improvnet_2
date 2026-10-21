@@ -107,7 +107,7 @@ class CausalGroupedQueryAttention(nn.Module):
         self.rope = RotaryEmbedding(self.head_dim)
         self.attn_fn = flash_attn_func if HAS_FLASH else sdpa_attn_func
 
-    def forward(self, x, seq_pos, use_cache=False, kv_cache=None):
+    def forward(self, x, seq_pos, use_cache=False, kv_cache=None, cache_lengths=None):
         B, T, C = x.shape
         
         q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim)
@@ -138,7 +138,21 @@ class CausalGroupedQueryAttention(nn.Module):
         is_causal = True if q.size(1) > 1 else False
 
         # attn_out = flash_attn_func(q, k, v, dropout_p=dropout_p, causal=is_causal)
-        attn_out = self.attn_fn(q, k, v, dropout_p=dropout_p, causal=True)
+        if cache_lengths is None:
+            attn_out = self.attn_fn(q, k, v, dropout_p=dropout_p, causal=True)
+        else:
+            # Continuous batching left-pads independent caches. Only real keys
+            # may participate; RoPE positions remain local to each request.
+            if T != 1 or kv_cache is None:
+                raise ValueError('Variable cache lengths require one cached token per row')
+            valid = torch.arange(k.size(1), device=x.device)[None, :] >= (k.size(1)-1-cache_lengths[:, None])
+            kt, vt = k.transpose(1, 2), v.transpose(1, 2)
+            repeats = self.n_heads // self.n_kv_heads
+            if repeats != 1:
+                kt, vt = kt.repeat_interleave(repeats, 1), vt.repeat_interleave(repeats, 1)
+            attn_out = F.scaled_dot_product_attention(
+                q.transpose(1, 2), kt, vt, attn_mask=valid[:, None, None, :],
+                dropout_p=dropout_p).transpose(1, 2).contiguous()
         out = self.o_proj(attn_out.reshape(B, T, C))
         return out, new_kv_cache
 
@@ -151,9 +165,9 @@ class ARTransformerBlock(nn.Module):
         self.attn  = CausalGroupedQueryAttention(embed_dim, n_heads, n_kv_heads, dropout)
         self.ffn = SwiGLU(embed_dim, mult=ffn_mult, dropout=dropout)
 
-    def forward(self, x, seq_pos, use_cache=False, kv_cache=None):
+    def forward(self, x, seq_pos, use_cache=False, kv_cache=None, cache_lengths=None):
         attn_out, new_kv_cache = self.attn(
-            self.norm1(x), seq_pos=seq_pos, use_cache=use_cache, kv_cache=kv_cache
+            self.norm1(x), seq_pos=seq_pos, use_cache=use_cache, kv_cache=kv_cache, cache_lengths=cache_lengths
         )
         x = x + attn_out
         x = x + self.ffn(self.norm2(x))
@@ -199,7 +213,7 @@ class ARContextModel(nn.Module):
     def forward(
         self, target, genre=None, multi_hot=None, 
         seq_offset=0, use_cache=False, past_key_values=None, return_hidden=False,
-        extra_condition=None,
+        extra_condition=None, cache_lengths=None,
     ):
         B, T = target.shape
         device = target.device
@@ -210,6 +224,7 @@ class ARContextModel(nn.Module):
         # If past_key_values exists, the model is in step-by-step inference and the conditions are already cached.
         is_first_step = past_key_values is None
         
+        scalar_offset = seq_offset if not torch.is_tensor(seq_offset) else 0
         if is_first_step:
             if genre is None: genre = torch.zeros(B, dtype=torch.long, device=device)
             if multi_hot is None: multi_hot = torch.zeros((B, self.multihot_proj.in_features), dtype=torch.float32, device=device)
@@ -223,11 +238,13 @@ class ARContextModel(nn.Module):
             x = torch.cat([e_genre, e_mh, x], dim=1) 
             
             # The 2 condition tokens consume the first 2 RoPE indices
-            seq_pos = torch.arange(seq_offset, seq_offset + x.size(1), device=device).unsqueeze(0).expand(B, -1)
+            seq_pos = torch.arange(scalar_offset, scalar_offset + x.size(1), device=device).unsqueeze(0).expand(B, -1)
         else:
             # During inference decoding, just compute the absolute position of the new token
-            seq_pos = torch.arange(seq_offset, seq_offset + T, device=device).unsqueeze(0).expand(B, -1)
+            seq_pos = torch.arange(scalar_offset, scalar_offset + T, device=device).unsqueeze(0).expand(B, -1)
             
+        if torch.is_tensor(seq_offset):
+            seq_pos = seq_offset.to(device=device).reshape(B, 1) + torch.arange(x.size(1), device=device)[None, :]
         h = x
         next_key_values = [] if use_cache else None
         
@@ -237,7 +254,7 @@ class ARContextModel(nn.Module):
             if not use_cache and self.training:
                 layer_out = checkpoint(layer, h, seq_pos, use_cache, current_kv, use_reentrant=False)
             else:
-                layer_out = layer(h, seq_pos=seq_pos, use_cache=use_cache, kv_cache=current_kv)
+                layer_out = layer(h, seq_pos=seq_pos, use_cache=use_cache, kv_cache=current_kv, cache_lengths=cache_lengths)
             
             if use_cache:
                 h, new_kv = layer_out
