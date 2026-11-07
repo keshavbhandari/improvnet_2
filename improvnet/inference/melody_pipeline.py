@@ -17,6 +17,7 @@ from tqdm import tqdm
 
 from improvnet.utils.melody_stems import kit_only_notes
 from improvnet.inference.melody_runtime import INFERENCE_SEED
+from improvnet.inference.melody_outputs import stage_output_names
 from improvnet.model.melody_train import autocast
 from improvnet.utils.melody import write_midi_notes
 
@@ -50,7 +51,7 @@ def forward_batch(model, requests):
         width = max(lengths)
         ids = torch.cat([F.pad(r.ids, (0, width - n)) for r, n in zip(requests, lengths)])
         kwargs = dict(use_cache=True)
-        for name in ('genre', 'multi_hot', 'strength', 'style_values', 'style_mask'):
+        for name in ('genre', 'multi_hot', 'strength', 'style_embedding', 'style_mask', 'beat_embedding', 'beat_mask'):
             values = [r.kwargs.get(name) for r in requests]
             if any(v is not None for v in values):
                 exemplar = next(v for v in values if v is not None)
@@ -191,10 +192,10 @@ class NoteStream:
 
 
 def run_pipeline(infer, original, tasks, args, requested, original_instruments,
-                 reference, guide, output_directory, stem_targets):
+                 reference, output_directory, stem_targets):
     original = kit_only_notes(original)
-    if infer.meta.get('version', 0) != 9:
-        raise ValueError('Inference requires a V5 checkpoint (protocol 9)')
+    if infer.meta.get('version', 0) != 11:
+        raise ValueError('Inference requires a dual style/beat checkpoint (protocol 11)')
     output_directory = Path(output_directory)
     output_directory.mkdir(parents=True, exist_ok=True)
     missing_tasks = set(tasks) - set(infer.meta.get('tasks', ()))
@@ -208,6 +209,7 @@ def run_pipeline(infer, original, tasks, args, requested, original_instruments,
     workers = []
     targets = iter(stem_targets)
     planned = []
+    stage_names = stage_output_names(tasks, stem_targets)
     current_instruments = {n.instrument for n in original}
     for task in tasks:
         target = None
@@ -250,9 +252,9 @@ def run_pipeline(infer, original, tasks, args, requested, original_instruments,
                 random.Random(INFERENCE_SEED+index*1009), args.temperature,
                 instruments=selected, style_reference=reference,
                 monophonic=True if task == 'harmonize' and 'refine' in tasks[:index] else None,
-                target_instrument=target, groove_guide=guide, source_stream=stream, on_chunk=publish)
+                target_instrument=target, source_stream=stream, on_chunk=publish)
             results[index], chunk_logs[index] = notes, logs
-            write_midi_notes(notes, output_directory / f'{task}.mid', infer.tokenizer)
+            write_midi_notes(notes, output_directory / f'{stage_names[index]}.mid', infer.tokenizer)
             if publish:
                 publish(None)
             coordinator.finish(index)
@@ -287,7 +289,9 @@ def run_pipeline(infer, original, tasks, args, requested, original_instruments,
                  decode_forward_calls=forwards, decode_token_requests=requests,
                  decode_batch_sizes=dict(histogram), prefill_batch_sizes=dict(coordinator.prefill_batch_sizes),
                  per_task_seed=[INFERENCE_SEED+i*1009 for i in range(len(tasks))],
-                 stage_timing=[dict(task=task, first_forward_seconds=coordinator.first_forward.get(i, started)-started,
+                 stage_order=stage_names,
+                 stage_timing=[dict(task=task, stage=stage_names[i], target_instrument=planned[i][1],
+                                    first_forward_seconds=coordinator.first_forward.get(i, started)-started,
                                     finished_seconds=coordinator.finished_at[i]-started)
                                for i, task in enumerate(tasks)])
     tqdm.write(f'Pipeline finished in {elapsed:.1f}s; mean decode batch {stats["mean_decode_batch_size"]:.2f}, '

@@ -14,7 +14,6 @@ from improvnet.model.melody_model import MelodyRefinementModel, checkpoint_metad
 from improvnet.scripts.melody_manifest import build_manifest
 from improvnet.utils.melody import Note, MelodyTokenizer, notes_to_tokens, ordered, tokens_to_notes, write_midi_notes, TASKS
 from improvnet.utils.melody_corruptions import corrupt_history
-from improvnet.utils.melody_style import STYLE_FEATURES as RHYTHM_FEATURES, style_tensors as rhythm_tensors
 from improvnet.utils.melody_data import MelodyDataset, prepare_example, NoStemWindow, stem_source
 from melody_test_helpers import settings, mix, response, corpus
 
@@ -44,7 +43,8 @@ def test_harmonization_is_mono_to_clean_pitched_mix_with_poly_history(history, c
                         for n in rec['notes'] if ex['start_ms'] <= n[3] < ex['end_ms']])
     assert response(ex) == expected  # Corrupted history never changes labels.
     assert ex['multi_hot'].sum() == 2
-    assert ex['style_values'].shape == ex['style_mask'].shape == (len(RHYTHM_FEATURES),)
+    assert len(ex['style_ids']) <= 512
+    assert bool(ex['style_present']) == bool(len(ex['style_ids']))
     assert ex['source_length'] <= 512 and ex['response_length'] < cfg.MIX_RESPONSE_TOKENS
     assert ex['history_length'] <= 2048 and len(ex['input']) + 3 <= 8192
 
@@ -72,12 +72,9 @@ def test_history_addition_bias_and_drum_pitch_safety():
 
 
 def test_no_harmony_features_or_parameters_enter_new_model():
-    values, mask = rhythm_tensors({'accompaniment_attacks_per_second': 1000.,
-                                  'accompaniment_voicing_density': 1000., 'ioi_mean_ms': 500.})
-    assert len(RHYTHM_FEATURES)==20 and mask.sum()==1 and mask[0]==1
     model = MelodyRefinementModel(embed_dim=32, n_heads=4, n_kv_heads=2, n_layers=1,
                                    num_genres=4, num_instruments=41, dropout=0.)
-    assert model.style_proj[0].in_features == 2*len(RHYTHM_FEATURES)
+    assert model.style_proj[0].in_features == 257
 
 
 def test_original_ar_initialization_retains_backbone_and_initializes_new_conditions():
@@ -105,10 +102,11 @@ def test_validation_separates_missing_stem_from_copied_notes():
             return torch.tensor([[[4.,0.,0.],[0.,4.,0.],[4.,0.,0.],[4.,0.,0.]]]).expand(2,-1,-1)
     batch = dict(input=torch.zeros(2,4,dtype=torch.long),target=torch.tensor([[0,1,2,-100]]*2),
         task=torch.tensor([2,2]),genre=torch.tensor([1,1]),multi_hot=torch.zeros(2,41),strength=torch.ones(2),
-        style_values=torch.zeros(2,5),style_mask=torch.zeros(2,5),
+        style_embedding=torch.zeros(2,256),style_mask=torch.zeros(2),
         stem_mask=torch.tensor([[False,False,True,False],[False]*4]),
         stem_instrument=torch.tensor([ProcessData().INSTRUMENT_CLASSES.index('drum'),-1]))
-    metrics = evaluate_validation(FixedModel(),[batch],torch.device('cpu'))
+    from types import SimpleNamespace
+    metrics = evaluate_validation(FixedModel(),[batch],torch.device('cpu'), reference_encoder=SimpleNamespace(condition_batch=lambda b:b))
     assert metrics['stem_target/drum'] == metrics['stem_target']
     assert metrics['stem_target'] > metrics['stem']+2
 
@@ -229,7 +227,7 @@ def test_tiny_training_resume_and_checkpoint_protocol(tmp_path):
     train(config,n_steps=2)
     checkpoint=torch.load(Path(config.SAVE_DIR)/'latest_checkpoint.pt',weights_only=False)
     assert checkpoint['step']==2 and checkpoint['refinement']['tasks']==['refine','harmonize','stem']
-    assert checkpoint['refinement']['data_policy_revision']==10
+    assert checkpoint['refinement']['data_policy_revision']==12
     assert checkpoint['scheduler_state_dict']['last_epoch']==2
     assert all(state['step']==2 for state in checkpoint['optimizer_state_dict']['state'].values())
     progress=(Path(config.SAVE_DIR)/'training.log').read_text()
@@ -239,7 +237,7 @@ def test_tiny_training_resume_and_checkpoint_protocol(tmp_path):
     assert 'Data (train): retries=' in progress and '% of attempts' in progress
     from improvnet.inference.melody_inference import MelodyInference
     loaded=MelodyInference(Path(config.SAVE_DIR)/'latest_checkpoint.pt')
-    assert loaded.model.style_proj[0].in_features==2*len(RHYTHM_FEATURES) and loaded.checkpoint_step==2
+    assert loaded.model.style_proj[0].in_features==257 and loaded.checkpoint_step==2
 
 
 def test_joint_inference_uses_generated_full_mix_history_and_generates_new_timing():
@@ -255,7 +253,7 @@ def test_joint_inference_uses_generated_full_mix_history_and_generates_new_timin
         prompts.append(prompt)
         assert kw['stop_at_window_end'] and not kw['monophonic']
         assert instruments==['Acoustic Bass','Acoustic Piano']
-        assert kw['style_values'].shape==(len(RHYTHM_FEATURES),)
+        assert kw['style_embedding'] is None
         source=tokens_to_notes(prompt[prompt.index('<SEP>')+1:-2],tok)
         infer.last_decode_stats=dict(duplicate_attacks_removed=0,end_reason='window_boundary')
         return ([replace(n,onset=n.onset+10) for n in source]
@@ -479,7 +477,7 @@ def test_new_protocol_rejects_old_resume_and_changed_training_controls(tmp_path)
  for key,value in [('jazz_blues_repeats',3),('task_weights',[.3,.4,.3]),('data_policy_revision',4)]:
   with pytest.raises(ValueError,match='Resume settings differ'):
    validate_checkpoint(dict(refinement=dict(meta,**{key:value})),meta,allow_data_policy_update=True)
- with pytest.raises(ValueError,match='older branch'):
+ with pytest.raises(ValueError,match='dual style/beat'):
   validate_checkpoint(dict(refinement=dict(meta,version=7)))
 
 

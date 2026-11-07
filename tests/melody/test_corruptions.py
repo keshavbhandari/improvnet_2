@@ -12,11 +12,11 @@ from improvnet.utils.melody_ornaments import merge_nonornaments, ornament_spans,
 from collections import Counter
 
 
-def test_v5_has_three_tasks_fresh_path_and_original_ar_initialization():
+def test_v6_has_three_tasks_fresh_path_and_original_ar_initialization():
     assert TASKS == ('refine', 'harmonize', 'stem')
-    assert cfg.TASK_WEIGHTS == (.20, .40, .40) and cfg.PROTOCOL_VERSION == 9
-    assert cfg.SAVE_DIR.endswith('/melody_refinement_v5')
-    assert cfg.DATA_FILE.name == 'melody_manifest_v5.json'
+    assert cfg.TASK_WEIGHTS == (.20, .40, .40) and cfg.PROTOCOL_VERSION == 11
+    assert cfg.SAVE_DIR.endswith('/melody_refinement_v8')
+    assert cfg.DATA_FILE.name == 'melody_manifest_v7.json'
     assert '/ar_context_split_instrument/' in cfg.INIT_CHECKPOINT
     assert cfg.BATCH_SIZE == 24 and cfg.CHUNK_TOKENS == 512 and cfg.MIX_RESPONSE_TOKENS == 2048
     assert cfg.HISTORY_TOKENS == 2048 and cfg.SEQ_LEN == 8192
@@ -87,20 +87,20 @@ def test_stem_pitch_shifts_cannot_reorder_retained_chord_anchors_across_instrume
 
 def test_stem_source_is_corrupted_but_full_mix_and_history_labels_are_clean():
     rec = mix(200)
-    ex = prepare_example(rec,random.Random(17),settings(POLY_HISTORY_PROB=1.,RHYTHM_STYLE_PROB=1.),
+    ex = prepare_example(rec,random.Random(17),settings(POLY_HISTORY_PROB=1.,REFERENCE_PROB=1.),
                          task='stem',target_instrument='drum')
     clean = response(ex); noisy = tokens_to_notes(prompt_source(ex))
     retained = [n for n in clean if n.instrument!='drum']
     assert len(noisy) == len(retained) and noisy != retained
     assert ex['stem_name']=='drum' and ex['stem_mask'].any()
     assert ex['history_length'] and not ex['history_mono'] and not ex['history_corrupted']
-    assert ex['style_mask'].sum() > 0 and ex['exposure'].shape == (7,)
+    assert ex['style_present'] and ex['exposure'].shape == (7,)
     expected = ordered([replace(Note(*n),onset=n[3]-ex['start_ms']) for n in rec['notes']+rec['drums']
                         if ex['start_ms']<=n[3]<ex['end_ms']])
     assert clean == expected
     assert ex['source_length']<=512 and ex['response_length']+1<=2048
     # Validation denoising remains task-realistic but exactly reproducible.
-    same = prepare_example(rec,random.Random(17),settings(POLY_HISTORY_PROB=1.,RHYTHM_STYLE_PROB=1.),
+    same = prepare_example(rec,random.Random(17),settings(POLY_HISTORY_PROB=1.,REFERENCE_PROB=1.),
                            task='stem',target_instrument='drum')
     assert torch.equal(ex['input'],same['input']) and torch.equal(ex['target'],same['target'])
 
@@ -346,7 +346,8 @@ def test_training_condition_reflects_mandatory_merge_and_target_stays_clean():
     assert len(example['input'])+3<=8192
 
 
-def test_inference_uses_same_merge_strength_instead_of_bypassing_zero_request(monkeypatch):
+@pytest.mark.parametrize('requested', [.1, .9])
+def test_positive_inference_strength_still_accounts_for_mandatory_merges(monkeypatch, requested):
     infer,_=scripted_inference([])
     infer.meta.update(version=9,tasks=list(TASKS),seq_len=512,chunk_tokens=64,history_tokens=64,
                       mix_response_tokens=128,skyline_tolerance_ms=50)
@@ -357,9 +358,26 @@ def test_inference_uses_same_merge_strength_instead_of_bypassing_zero_request(mo
         infer.last_decode_stats={}
         return [replace(n,onset=n.onset-notes[0].onset) for n in notes]
     monkeypatch.setattr(infer,'generate',generate)
-    result,logs=infer.transform(notes,'refine','jazz',0.,PickEdit('pitch'),monophonic=True)
-    assert result==notes and seen==[.75]
-    assert logs[0]['requested_strength']==0. and logs[0]['strength']==.75
+    result,logs=infer.transform(notes,'refine','jazz',requested,PickEdit('pitch'),monophonic=True)
+    assert result==notes and seen==[max(requested,.75)]
+    assert logs[0]['requested_strength']==requested and logs[0]['strength']==max(requested,.75)
+
+
+def test_zero_inference_strength_preserves_ornaments_without_corruption_or_generation(monkeypatch):
+    infer,calls=scripted_inference([])
+    infer.meta.update(version=11,tasks=list(TASKS),seq_len=512,chunk_tokens=64,history_tokens=64,
+                      mix_response_tokens=128,skyline_tolerance_ms=50)
+    infer.options=cfg
+    def fail(*args,**kwargs):
+        raise AssertionError('Zero refinement must bypass corruption and model generation')
+    monkeypatch.setattr(infer,'generate',fail)
+    monkeypatch.setattr('improvnet.inference.melody_inference.refinement_source',fail)
+    monkeypatch.setattr('improvnet.inference.melody_inference.refinement_strength',fail)
+    notes=trill()
+    result,logs=infer.transform(notes,'refine','jazz',0.,random.Random(42),monophonic=True)
+    assert result==notes and not calls
+    assert all(log['strength']==log['requested_strength']==0. for log in logs)
+    assert all(log['decoding']==dict(end_reason='zero_strength_passthrough',model_bypassed=True) for log in logs)
 
 
 @pytest.mark.parametrize('pitches',([60,61,60,61,60],[60,62,60,59,60],[60,61,62,63,64]))

@@ -10,7 +10,7 @@ from improvnet.utils.melody_stems import DRUM_KIT_PITCHES
 def generate_notes(self, prompt, genre, strength, instruments, window_ms,
              temperature=0.9, fixed_notes=None, monophonic=False,
              max_new_tokens=None, progress_desc='Decoding tokens',
-             style_values=None, style_mask=None, stop_at_window_end=False,
+             style_embedding=None, style_mask=None,beat_embedding=None,beat_mask=None,stop_at_window_end=False,
              target_instrument=None, stem_add=False,
              protected_pitches=None):
     """Generate notes while retaining every source anchor in stem addition."""
@@ -45,8 +45,10 @@ def generate_notes(self, prompt, genre, strength, instruments, window_ms,
         with self.model_autocast():
             logits, cache = self.model(ids, genre=torch.tensor([self.meta['genres'].index(genre)], device=device),
                                        multi_hot=conditions, strength=torch.tensor([strength], device=device),
-                                       style_values=style_values.unsqueeze(0).to(device) if style_values is not None else None,
-                                       style_mask=style_mask.unsqueeze(0).to(device) if style_mask is not None else None,
+                                       style_embedding=style_embedding.unsqueeze(0).to(device) if style_embedding is not None else None,
+                                       style_mask=style_mask.reshape(1).to(device) if style_mask is not None else None,
+                                       beat_embedding=beat_embedding.unsqueeze(0).to(device) if beat_embedding is not None else None,
+                                       beat_mask=beat_mask.reshape(1).to(device) if beat_mask is not None else None,
                                        use_cache=True)
         token_progress.set_postfix_str('decoding')
         offset = len(prompt) + 2

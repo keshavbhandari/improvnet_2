@@ -1,359 +1,357 @@
-# V5: melody refinement, rhythm/harmony and stem addition
+# Style and beat contrastive conditioning
 
-V5 has three active tasks and uses protocol 9. It starts from the original
-`ar_context_split_instrument/best_model.pt` weights with a fresh optimizer and
-scheduler. V4 checkpoints and data indexes are preserved; a V4 training state
-cannot resume as V5. Tokenizer IDs remain fixed for AR initialization. This branch now runs V5
-inference only; use the older branch for older checkpoints.
+Current worktree and branch: `improvnet_melody_contrastive`.
+Absolute worktree: `/e/home/jusers/bhandari1/jupiter/improvnet_melody_contrastive`.
+The previous `improvnet_melody_v6` worktree was renamed in place, preserving
+uncommitted changes and generated MIDI examples. No training job was submitted
+for this change. The current finetuning protocol is **11**, with new outputs in
+`artifacts/melody_refinement_v8/`; previous V6/V7 outputs are retained.
 
-## Task sequences
+## Two encoders
 
-| Task | Source sequence | Clean response | Requested share | Left history when available |
-| --- | --- | --- | ---: | --- |
-| `refine` | Corrupted monophonic skyline melody | Original monophonic melody | 20% | Monophonic target history, 75% chance |
-| `harmonize` | Monophonic melody with 60–100% of onset/duration groups masked | Original pitched mix, including harmony and performed rhythm | 40% | Pitched polyphonic target history, 75% chance |
-| `stem` | Original mix minus one instrument class, with mild timing/duration and accompaniment-pitch errors | Original complete mix, including the missing stem | 40% | Full polyphonic target history, 75% chance |
+| Name | Learns from | Positive views | Negatives |
+|---|---|---|---|
+| `style` | Existing solo and mixture corpus | Solo instrument versus another view of the same piece; same or different excerpts | Different canonical pieces |
+| `beat` | Multi-instrument files only | Disjoint nonempty instrument groups from exactly the same time interval | Other pieces and separated regions of the same recording |
 
-The serialized example is a task token, optional stem-class tokens, optional
-left history, `<SEP>`, the source event sequence, `<SEP>`, `<S>`, and the clean
-response ending in `<E>`. Genre and the target instrument mix are continuous
-conditions; strength and visible rhythm statistics enter the condition encoder.
-Only clean response tokens carry next-token prediction loss. No right-hand
-melody/history prompt is supplied. Harmony density/attack-rate conditioning and
-the orchestration task remain absent from V5.
+The existing trained style weights are retained. Their artifact directory is
+now `/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/style/`; the old
+`melody_reference_encoder_v6` path is a compatibility symlink. The loader accepts
+that checkpoint's legacy format. Its best checkpoint remains step 26,500.
+The new beat encoder writes to the sibling `beat/` directory. It has not been
+trained yet. An original style checkpoint cannot be substituted for a beat
+checkpoint: each frozen loader checks its model kind and tokenizer fingerprint.
 
-Whole-example training transposition still shifts source and target together;
-it is separate from source-only pitch corruption.
+Both models share the previous configuration: width 768, 8 bidirectional layers,
+12 query heads / 4 KV heads, 256-value unit-normalized embedding, dropout 0.1,
+at most 512 tokens per view, 64 anchor pairs/GPU, four GPUs, temperature 0.1,
+AdamW (0.9, 0.95), weight decay 0.01, gradient clip 1.0, and 30,000 updates.
+Both encoder configs are standalone: they neither import one another nor the
+melody config. Each setting has an inline explanation, as does the melody config.
+Both encoders specify a complete training schedule: 500 warmup steps
+to 0.00015, cosine decay to 0.00001 at step 20,000, then cosine decay to 0.000005
+at step 30,000. `DECAY_STEPS=20000` marks the end of the main cosine decay;
+`TAIL_END_LR=5e-6` is the final learning rate. Either config can train from scratch
+or resume its latest checkpoint. Historical style checkpoint schedule names are
+translated when loading without changing the curve or saved weights.
+Validate/save every 500 updates.
 
-Skyline uses anchored groups of attacks within 50 ms to account for performed
-chords. Chunking itself preserves complete exact-onset groups. The model still
-uses the shared instrument/note/onset/duration representation at 10-ms precision.
+Independent span masking is unchanged: a 90% chance per view of masking a
+uniformly sampled 15–45% of interior tokens; 10% of views remain clean. Spans
+cover 4–16 tokens. Pitch/velocity, instrument, onset, duration and `<T>` tokens
+are eligible; S/E and padding remain. Validation uses deterministic clean views.
+Each pitched view is independently transposed within ±7 semitones and valid MIDI
+bounds; drum pitches and timing are unchanged. Beat pairs prefer different
+transpositions for the two views, with at least one nonzero shift wherever MIDI
+bounds permit. A mixture is transposed consistently across its pitched notes.
+This discourages key matching; it does not prove the absence of every shortcut.
 
-## Refinement corruptions in detail
+Code is shared under `improvnet/model/encoders/`: `style.py`, `beat.py`, their
+respective configs, the beat objective, frozen runtime and reference selector.
+The shared encoder trainer/backbone are reused, including autograd-enabled
+global negatives, AMP, checkpoint/resume, per-rank RNG and data-position restore.
 
-The clean skyline melody is copied before any source-only corruption. First,
-all detected ornament spans are merged into one held note per span, regardless
-of the requested strength. This pass is mandatory even when requested strength
-is zero. If there are no candidates, it leaves the source alone.
+## Beat pairs and temporal negatives
 
-Next, one additional edit is sampled independently of ornament presence. Its
-default weights are below. An edit can do nothing when its selected span is
-ineligible or no note passes its probability gate. A zero-strength example with
-no ornaments remains clean. The clean target always retains its original notes.
+Only candidate headers declaring at least two instrument stems are selected.
+Parsed notes must actually support both views; there is no fallback to a solo
+piece. The current eligible pool is 109,164 training records and 187 validation
+records, with existing composition folds/copy protection retained. ARIA solo
+piano records are excluded from this encoder. MIDI instruments are the existing
+tokenizer's instrument stems; tracks sharing one instrument class are combined
+by that representation.
 
-| Additional edit | Weight | What happens to the source |
-| --- | ---: | --- |
-| Contour inversion | 40% | Reflect a short pitch contour around its first note |
-| Ordinary merge | 10% | Merge one eligible 2–4-note nonornament run |
-| Pitch errors | 25% | Shift a small subset of melody notes by a nonzero amount up to ±7 semitones |
-| Timing errors | 25% | Nudge a small subset of melody onsets and durations by up to ±50 ms |
+For each example, randomly partition audible instrument stems into two disjoint,
+nonempty groups. All stems can participate. This includes piano versus drums,
+piano+drums+violin versus sax, and piano+drums versus violin+guitar+sax. Half the
+partition draws favor placing piano and drums on opposite sides when available;
+the rest permit them on the same side. Existing piano/drum file preference and
+jazz/blues preference match the style sampler.
 
-For each chunk, conditioned strength is the maximum of requested strength and
-the fraction of original note attacks removed by mandatory ornament merging.
-For example, merging four notes into one removes three of four attacks and
-sets a minimum strength of 0.75. The additional edit uses the requested strength, independently of this floor.
-Training and inference calculate the same value, recalculating it after any
-chunk shrink. Inference reports both requested and effective strength. Thus an
-ornament-heavy source is never labelled as uncorrupted simply because requested
-strength was low. This is a severity floor, not a complete error-distance metric.
+The two groups share one window start **and** end. Offbeats retain their original
+relative positions; views are never independently rebased. Whole onset groups
+fit within each view's 512-token cap, and releases are clipped to the common
+window end. Both views need at least two attack groups; sparse stems can be
+shorter than 512 tokens.
 
-**Ornaments.** `ornament_spans` scans a single voice for runs of up to 12 notes,
-using a fast-onset threshold of `1.25 * median IOI`, clamped to 90–220 ms.
-Successive notes must keep the same instrument, move by at most two semitones,
-and start no later than 60 ms after the preceding release. Candidates satisfy
-one of these rules: a returning neighbour figure with at least three notes,
-within four semitones, and a direction change; a chromatic run of at least three
-notes with one-semitone steps and net movement at most seven semitones; or a
-short grace-like lead-in whose final note lasts at least twice the first note.
-These are conservative MIDI heuristics, not theoretical ornament annotations.
-Every detected candidate is merged. Its first note's pitch/onset are kept and its duration extends to the latest release in the span.
-For example, fast `C–D–C–D` becomes one held `C`; the target retains the figure.
+Each anchor pair also samples two views from another window of the same file,
+separated by at least 1,000 ms. If no such window exists, a different canonical
+piece from the same fold supplies the explicit negative. Other files in the
+global GPU batch supply additional negatives. Temporal eligibility is computed
+per candidate: overlapping/nearby same-recording windows are blocked, and alternate
+recordings of the same canonical piece are not compared using incompatible
+absolute clocks. Same-piece distant-window negatives are genuine negatives in
+this objective; they are not accidentally removed by the style loss's piece mask.
 
-**Contour inversion.** Attempts cover 3–10 consecutive notes, with roughly
-`max(1, round(strength * note_count / 8))` attempts. Pitch is reflected as
-`new_pitch = 2 * first_pitch - original_pitch`: `C4–D4–E4` becomes
-`C4–Bb3–Ab3`. Onsets, durations and velocities stay intact. Overlapping attempts,
-instrument changes, IOIs over one second, release gaps over 150 ms and
-out-of-range reflected pitches cause an attempt to be skipped.
+A beat example encodes four excerpts (two positive views and two explicit-negative
+views), while a style example encodes two. Backbone and anchor batch size are
+unchanged; the explicit negatives add work. The objective is symmetric in both
+positive directions and differentiates through global candidate gathers.
 
-**Ordinary merging.** With a strength-dependent gate, choose one 2–4-note run
-outside detected ornament spans. Notes must keep the same instrument, have
-positive IOIs no greater than 800 ms, have no release gap greater than 150 ms,
-and avoid leaps over an octave. Merge into the first pitch held through the
-latest release. For example, a connected `C–E–G` can become a held `C` even when
-it is not classified as an ornament. The clean target teaches restoration.
+A same-piece negative can repeat a legitimate groove, so inspect held-out
+same-window versus different-window retrieval as well as listening results.
+Contrastive compatibility does not impose a hard beat grid on generated MIDI.
 
-**Pitch errors.** When selected, sample `round(requested_strength * eligible_notes)`
-notes without replacement, with at least one note for a positive request. Each
-selected note moves by a nonzero integer offset from −7 to +7 semitones. Only valid MIDI pitches are sampled; there is no boundary clipping.
-These intentional *refinement* errors are separate from the stem task's
-accompaniment-only ±7-semitone policy.
+## Finetuning: both fixed, target excluded
 
-**Timing errors.** Sample the requested fraction of exact attack groups without
-replacement, rounded to a whole group, with at least one for a positive request. Selected onsets and note durations receive independent,
-absolute offsets from −50 to +50 ms in 10-ms steps. This replaces proportional
-duration scaling, which could exceed 50 ms on held notes. Simultaneous attacks
-move together; distinct attack order, nonnegative onsets and positive durations
-are preserved. Boundary constraints can reduce an onset offset to zero; selected notes still
-receive a duration change when needed to avoid a complete no-op.
+The one existing `improvnet/model/melody_config.py` remains the finetuning config.
+It uses the previous 2× non-jazz candidate budget, four jazz/blues passes,
+original AR initialization, 24 examples/GPU, accumulation 1, and 20,000 updates.
+Three tasks remain: `refine` (20%), `harmonize` (40%), `stem` (40%). Source windows
+are capped at 512 tokens; responses at 512 for refinement and 2048 for mix tasks;
+left history at 2048; total AR context including conditions stays within 8192.
 
-The weights describe edit choices, not percentages of notes or guaranteed
-changed examples. The default is one extra edit; if increased, extra edit types
-are sampled without replacement, so local pitch/timing errors cannot compound
-through repeated selection. Current V5 does not split notes or mask the whole
-melody in refinement. The source may lose attacks while the full clean target
-remains, subject to the source/response token budgets. The retired probabilistic ornament selector and V2–V4 inference paths have been
-removed from this branch.
+`STYLE_ENCODER` and `BEAT_ENCODER` are independent frozen checkpoints. Each is
+copied to an immutable, content-hashed snapshot inside the finetuning run.
+Both run in evaluation mode, without masking or gradients, outside the AR
+optimizer. Two separate trainable, initially neutral projections connect their
+256-value embeddings to the AR model. Presence masks gate absent conditions to
+zero. Resume/inference require the exact pinned encoder identities.
 
-## Balanced corruption levels and measurement
+For harmonize and stem, each condition independently has probability
+`REFERENCE_PROB=0.75` of being attempted. Its reference is a different neighboring
+excerpt, within 30 seconds and at least 250 ms away from the target's complete
+sounding interval. That interval includes releases beyond the nominal target
+window, across all instruments. Crossing held notes are excluded. No safe
+neighbor means no condition; target tokens are never used as a fallback.
 
-Refinement samples no additional edit in 5% of requests. The other 95% choose
-10%, 20%, …, 100% with equal probability, so each nonzero level has 9.5% expected
-exposure. Pitch and timing edits now act directly on that fraction of the
-remaining notes/attack groups; they no longer multiply strength by 0.15.
-Contour edits and ordinary merging retain their musical span constraints.
+The style reference matches the clean target's instrument set: a piano target
+gets piano, a mixture gets its corresponding mixture. The beat reference uses
+neighboring full-context notes, including drums when available; its cross-track
+embedding space supports individual instruments too, so solo target pieces can
+still supply piano-only beat context. The two references may overlap each other,
+but neither may overlap the target. References are separate encoder inputs and
+do not consume the AR token budget.
 
-These are balanced **additional edit requests**, not a guarantee of uniformly
-changed total sequences: compulsory ornament merging can raise the total, small
-chunks require rounding, and structural edits may be ineligible. Mandatory
-ornament merging still applies to the 5% without additional edits. Example
-metadata includes `requested_strength`, effective `strength` and
-`refinement_changed_fraction`. The latter counts clean notes whose serialized
-instrument, pitch/velocity, onset or duration no longer match the source,
-including removed notes; it is a note-level edit metric rather than a musical
-distance score.
+Refinement receives neither embedding. For all tasks, left history is shown 75%
+of the time. Refinement history is monophonic; other tasks use polyphonic target
+history. Thirty percent of shown non-refinement histories get small training-only
+errors. The previous ornament-first melody corruption, at least 60% harmonization
+timing masks, ±50 ms stem timing jitter, skyline-protected 0–5% accompaniment pitch
+corruptions within ±7 semitones, and kit-only drum restrictions remain.
 
-Training logs and TensorBoard report requested/effective means, actual changed
-note fraction, and proportions of low-change (≤20%) and high-change (≥80%)
-refinement examples. Harmonize intentionally stays at 60–100% timing masking;
-stem pitch errors intentionally stay at 0–5%. These task-specific limits remain
-as configured rather than receiving refinement's 10–100% rule.
+A trained beat checkpoint is required before finetuning can start. The trainer
+fails clearly if it is absent. Previous protocol-10 fine-tuned checkpoints require
+their previous code; new protocol-11 weights are needed for dual conditioning.
 
-## Stem denoising and melody protection
+## Inference: same or different reference regions
 
-Drums are restricted to a drum-set subset of the
-[General MIDI drum mapping](https://midi.org/midi-ci-profile-for-default-drum-note-map).
-The policy is defined once in `melody_stems.py` and includes 21 sound IDs:
+One canonical implementation (`melody_inference.py`) and the thin
+`parallel_inference.py` entrypoint share batched refinement → harmonization →
+stem addition. The reference MIDI is read once. `--reference-regions same`
+(default) uses exactly the same excerpt for both encoders;
+`--reference-regions different` uses non-overlapping excerpts of that file,
+including release/guard protection. A file too short for different regions
+raises a clear error rather than silently reusing the same region.
 
-| Family | MIDI note IDs |
-| --- | --- |
-| Kick | 35, 36 |
-| Snare variants and side-stick | 37, 38, 40 |
-| Toms | 41, 43, 45, 47, 48, 50 |
-| Closed, pedal and open hi-hat | 42, 44, 46 |
-| Crash, ride, Chinese/splash cymbals and ride bell | 49, 51, 52, 53, 55, 57, 59 |
+Style uses the solo-piano view for harmonization and the piano+drums view for
+stem addition. Beat uses the chosen piano/drum context embedding for both stages.
+Both embeddings are computed once per reference selection and reused across
+chunks. Refinement remains unconditioned. Other reference instruments are
+excluded, preserving the piano-to-jazz-with-drums focus. Auto-selection uses
+training-fold jazz/blues references and prioritizes piano/drum examples.
 
-Handclaps, tambourines, cowbells, congas, bongos, shakers, whistles and other
-auxiliary percussion are excluded. No auxiliary hit is remapped into a kick or snare. Extended electronic hi-hat
-edge articulations are normalized first: 22→42 (closed) and 26→46 (open),
-following the documented [Groove MIDI mapping](https://magenta.withgoogle.com/datasets/groove#drum-mapping).
-This is an explicit ingestion policy for those two note IDs, not a claim that
-JazzSAMBA documentation identifies the recording hardware. Coincident normalized
-hi-hat/bow attacks collapse to one hit using the stronger velocity; onset timing
-is unchanged. Other drum variants already inside the kit remain intact. Filtering happens before stem selection, local rhythm statistics,
-chunking and prompt-history construction. Raw MIDI and parsing caches retain
-the original data; task examples are filtered on the fly without an offline
-corpus rebuild. Auxiliary-only drum tracks do not count as an eligible missing
-drum stem: piano-only results route to refinement/harmonization without a parse
-retry, while remaining multi-instrument mixtures can target another instrument.
-
-Inference filters input and reference auxiliary percussion and masks unsupported
-drum pitches before sampling; masking applies only to the `drum` instrument,
-so pitched instrument ranges remain intact. Retained drum anchors use the same
-policy. MIDI export continues to select program 0 on zero-based channel 9
-(Standard Kit on channel 10). The model still predicts when and how strongly
-to strike each allowed sound; drum rests remain legal. The policy and allowed
-IDs are recorded in checkpoint metadata (data-policy revision 10).
-
-The missing class is chosen from the clean mixture. When drums are available,
-they are selected with 85% probability; other choices prefer supported jazz
-instruments. Eligible windows contain both the target part and retained pitched
-music. Piano-plus-drums is valid supervision; a piano-only source is useful for
-refinement/harmonization and is routed there instead of causing a parse retry.
-
-Retained source notes are corrupted before tokenization:
-
-- Exact-onset chord groups receive a shared offset of at most ±50 ms. Distinct
-  groups retain their order and remain inside the owned window.
-- Each retained duration receives an independent change of at most ±50 ms,
-  with a positive duration. Held notes can continue across a window boundary.
-- Each example samples an accompaniment pitch-error probability between 0%
-  and 5%. Twenty percent of examples explicitly use 0%; the other 80% sample
-  uniformly in that interval. Selected notes shift by a nonzero amount of up
-  to ±7 semitones, subject to chord-order and collision guards. Eligibility is
-  computed with 50-ms skyline before timing corruption.
-  Skyline melody pitches and percussion pitch IDs are protected. Changes avoid
-  duplicate attacks and preserve retained pitch ordering within a chord.
-- Instrument labels, velocity and retained note count stay unchanged.
-
-The response is the original full mix, with clean source timings/pitches and the
-missing part. The model therefore learns to correct the retained accompaniment
-while adding drums, rather than learning only to copy its input.
-
-Inference permits the same bounded timing/duration repairs. Each retained note
-and instrument must survive; exact chord groups stay together, and owned chunk
-boundaries remain intact. Melody pitches use the global input skyline and are
-protected across chunk boundaries. Accompaniment pitch changes are limited to
-±7 semitones, favor keeping the existing pitch, and have a conservative cap of
-`floor(0.05 * eligible accompaniment notes)` per chunk.
-
-Drum rests remain legal. If no requested stem is produced anywhere, the retained
-mix is still saved and the pipeline completes; the console and `report.json`
-show `missing_instruments` and `stem_summary`. Genuine decoding failures such as
-losing a retained note still fail. Track `stem_target/drum` validation loss in
-addition to full-response loss, which includes many retained notes.
-
-## Prompt history
-
-History always comes from the clean target domain before the current window:
-monophonic for refinement, pitched polyphonic for harmonization, and the complete
-mix for stem addition. A stem example can therefore include preceding drums in
-history while its current source lacks drums. This models continuation of an
-already generated part.
-
-All three tasks show history with 75% probability when preceding music exists.
-For 30% of shown training mix histories, about 10% of notes receive mild pitch,
-addition, deletion or timing edits. Additions have twice deletion's weight.
-History pitch edits and added pitched notes use valid nonzero offsets up to
-±7 semitones. History onset/duration edits use absolute offsets up to ±50 ms
-in 10-ms steps. Repeated edits are bounded against the original note rather
-than accumulating larger errors. Percussion pitch IDs stay unchanged and onsets
-stay before the current window. This history augmentation is separate from the
-accompaniment-only stem source corruption. Refinement histories and all validation histories remain
-clean. The history token cap is 2,048, retaining complete attack groups.
-
-At generation, every task starts without history. Later chunks use only that
-task's previous generated output: a refined melody for `refine`, the generated
-pitched mix for `harmonize`, and the generated complete mix for `stem`. Classical
-input is never inserted as an initial clean history prompt.
-
-## Harmonize timing masks
-
-The second task is named `harmonize` in data, logs, checkpoint metadata, CLI,
-prompts and output filenames (`harmonize.mid`). It uses the already-reserved
-`<HARMONIZE>` token, preserving every vocabulary ID. Unused historical tokens stay reserved so initialization never renumbers the
-vocabulary; obsolete task paths are removed.
-
-Training explicitly uses 100% timing masking in 25% of examples; otherwise it
-samples uniformly between 60% and 100%. Both onset and duration attributes are
-masked together for selected attack groups. Rounding is upward, so even tiny
-chunks mask strictly more than half of their timings. Small chunks can become
-fully masked more often due to this rounding. Pitch, velocity, instrument and
-coarse five-second time-bin structure remain available; targets stay clean.
-
-Inference enforces the same 60% minimum. `--rhythm-strength 1` masks all note
-onsets/durations; the default is 0.8, and smaller values are clamped to the
-checkpoint's minimum. Actual mask coverage is recorded as
-`timing_mask_fraction` in example diagnostics and inference chunk reports.
-
-## Shared rhythm guidance
-
-Both harmonization and stem examples expose the same 20-feature rhythm schema in
-75% of training examples. Features come from the clean local melody and an
-inferred pulse: five IOI summaries, beat duration, bar-phase sine/cosine, swing
-subdivision, expressive offset/spread, pulse confidence and eight beat-phase
-histogram bins. They contain no pitches or exact note sequence.
-
-During inference, one selected jazz reference and the source pulse/origin guide
-both stages. Local windows follow the same clock and scale timing summaries to
-the source pulse. Automatic references use training entries only, including the
-existing PiJAMA bank. `--style-reference` supplies a MIDI instead;
-`--no-rhythm-conditioning` disables both numeric controls and the soft onset
-phase bias. Beat inference can have half/double-tempo ambiguity and assumes
-four beats per bar; low-confidence phase bias is disabled.
-
-## Data and on-the-fly preparation
-
-`melody_manifest_v5.json` extends the existing composition-group index without
-reprocessing the expanded original corpus. The original V4 manifest remains
-unchanged. Existing MIDI parsing caches are reused. Skyline selection, task
-choice, windowing, corruption, history selection and token budgeting happen in
-the DataLoader. Only newly acquired performances are parsed once into additional
-base records, not expanded into fixed task examples.
-
-Every main traversal keeps all admitted jazz/blues files: four jazz/blues passes
-plus eight rotating non-jazz slots per original jazz/blues record. With the
-three-task weights, main refinement/harmonization slots account for 60% of requests
-and separate eligible stem draws account for 40%. Thus the effective main-stream
-exposure is 8:4 non-jazz:jazz/blues, while the non-jazz candidate multiplier stays
-8. Within non-jazz stem draws, 80% prefer the original AR mixture pool. Batch
-size stays 24/GPU, accumulation 1, with four workers/GPU and prefetch 1.
-
-V5 adds 658 unique performance records (627 training, 15 validation, 16 test),
-including 80 additional recorded piano/drum pairs in the training stem pool.
-
-New data acquisition is recorded in `raw/acquisition_manifest.json`, including
-source URLs, raw file inventories, licenses and author split information.
-[New performance MIDI details](jazz_performance_v5.md) records which files are
-admitted after overlap checks. Recorded JazzSAMBA piano/drum MIDI is used as
-clean paired supervision; its derived bass/wind estimates are kept separate.
-Jazz Trio Database MIDI is automatically transcribed performed piano, not
-recorded keyboard MIDI and not a complete piano/bass/drum note mix.
-
-Official JazzSAMBA song splits are locked, including alternate takes. Additional
-copies of existing prepared performances are excluded by hashes/full-melody
-fingerprints. Recording metadata is also checked for JTD overlap because
-independent transcriptions need not have identical note timings. No author
-validation/test song is promoted into training.
-
-## Budgets and inference modules
-
-Sources and refinement responses are capped at 512 tokens. Mix responses and
-history are capped at 2,048 tokens. Separators and the two continuous condition
-positions fit inside 8,192 positions. Oversized windows shrink by complete onset
-groups. Addition/removal corruptions are checked against the resulting source
-and clean target budgets rather than assumed to preserve length.
-
-The canonical command is now `improvnet.inference.melody_inference`, with ready
-tasks batched automatically on one GPU/model. V5 runs
-`refine -> harmonize -> stem`; a missing-stem stage is omitted when not requested.
-The old `parallel_inference` module is a thin compatibility alias. The main
-class handles chunk/history preparation; focused helpers own the CLI, grammar,
-batch scheduler, bounded stem repairs and output paths. Retired register reconstruction and instrument relabelling are removed. Active
-stem-selection helpers live in `melody_stems.py`; missing-stem supervision is
-preserved.
-
-Batching preserves each stage's ordering and generated history. Variable-length
-caches have independent positions and attention masks. The scheduler starts a
-downstream task once its source chunk and safe lookahead are available. Up to
-three V5 stages can normally overlap; startup, drain and short pieces offer
-less overlap. One persistent inference autocast context reuses weight casts.
-Per-task fixed random streams make scheduling independent of random draws;
-batched floating-point kernels can still differ slightly by batch shape.
-
-Progress always appears. GPU is used when available, otherwise CPU; seed 42 and
-top-k 50 stay internal. With `--output clair.mid`, intermediate files are
-`clair/melody.mid`, `clair/refine.mid`, `clair/harmonize.mid`, `clair/stem.mid` and
-`clair/report.json`. The final MIDI remains `clair.mid`. The report includes
-budgets, rhythm controls, repair counts, missing stems and observed batch sizes.
-
-## Run paths and review status
-
-- Checkpoints: `/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v5`.
-- Data manifest: `/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/melody_manifest_v5.json`.
-- Logs: `/e/home/jusers/bhandari1/jupiter/run_scripts/improvnet/melody_run_logs_v5`.
-- Launcher: `/e/home/jusers/bhandari1/jupiter/run_scripts/improvnet/melody_single_node_launch.sh`.
-
-Pre-kit job `2431554` was cancelled and its run directory archived as
-`melody_refinement_v5_pre_kit_2431554`. Fresh kit-only job `2432602` was submitted
-on 2026-10-21 from the original AR checkpoint, with automatic continuation enabled. Prior runs/checkpoints are retained. V5
-musical quality still needs evaluation after training; tests validate the data,
-masking, budgets, decoding constraints and resume/initialization behavior.
-
-After training:
+After training the beat encoder **and then the V8 fine-tuned model**:
 
 ```bash
-cd /e/home/jusers/bhandari1/jupiter/improvnet_melody
-python -m improvnet.inference.melody_inference \
-  --model /e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v5/best_model.pt \
+cd /e/home/jusers/bhandari1/jupiter/improvnet_melody_contrastive
+python -m improvnet.inference.parallel_inference \
+  --model /e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v8/best_model.pt \
   --input improvnet/inference/examples/debussy-clair-de-lune_original.mid \
   --output improvnet/inference/clair.mid \
-  --task pipeline --genre jazz --melody-strength .2 --rhythm-strength .9 \
-  --instruments "Acoustic Piano" drum
+  --genre jazz --task pipeline --instruments "Acoustic Piano" drum \
+  --melody-strength .2 --rhythm-strength .9 \
+  --style-reference /path/to/jazz_piano_and_drums.mid \
+  --reference-regions same
 ```
 
-Current V5 tests: `python -m pytest -q` (defaults to `tests/melody`). Six
-feature-based modules cover training/resume, data/splits, corruption, MIDI
-decoding, groove/memory bounds and batched inference. Shared fixtures live in
-`melody_test_helpers.py`; obsolete orchestration and old-protocol tests are
-removed. Tests for other models remain outside the V5 default suite.
+Replace `same` with `different` to compare regions. Progress is always shown.
+Output names remain short, and JSON records both reference intervals, encoder
+identities and each chunk's conditioning flags. Requesting drums runs the stem
+stage even when the source MIDI originally contained drums.
+
+## Launchers (prepared, not submitted)
+
+The current scripts follow the supplied single-node launcher structure: one node,
+four GPUs, synchronized checkpoint before timeout, optional automatic continuation,
+and explicit per-job out/err log folders. To start the **new beat encoder** later:
+
+```bash
+sbatch /e/home/jusers/bhandari1/jupiter/improvnet_melody_contrastive/run_scripts/beat_launch.sh
+```
+
+- Beat settings: `improvnet/model/encoders/beat/config.py`; artifacts `artifacts/beat/`.
+- Existing style settings: `improvnet/model/encoders/style/config.py`; artifacts `artifacts/style/`.
+- Finetuning: `run_scripts/melody_launch.sh`; artifacts `artifacts/melody_refinement_v8/`.
+- Style training/resume: `run_scripts/style_launch.sh`.
+- Slurm out/err: `run_scripts/{beat,style,melody}_logs/slurm-JOBID.{out,err}`.
+- TensorBoard: encoder artifact `tensorboard/`; finetuning `runs/melody_refinement_v8/`.
+
+Older versioned launcher copies are retained as historical files; use the three
+short current names above. No training or successor job was submitted by these
+changes. CPU tests use temporary artifacts only.
+
+## Verification
+
+`python -m pytest -q` runs melody/reference tests including the new beat cases.
+Also run `python -m pytest -q tests/test_continuity.py tests/test_continuity_distributed.py
+tests/test_continuity_continuation.py tests/test_beat_distributed.py` for the shared
+trainer, continuation, and distributed gradient checks. Tests cover aligned clocks,
+disjoint stem partitions, key/masking augmentation, explicit temporal negatives,
+false-negative masking, frozen gradients, AR initialization/resume, independent
+condition gates, batched decoding and both reference-region CLI modes.
+
+The real-corpus CPU audit sampled 32 valid beat pairs (33 attempts), all with
+separated same-piece negatives and views within 512 tokens. A tiny new beat model
+trained, checkpointed, resumed and loaded through this exact data path. The
+renamed existing style weights loaded with the same SHA256 as before the rename.
+No GPU/Slurm training was run as part of verification.
+
+Final checks passed: 247 distinct tests plus 3 distributed subtests, including
+an end-to-end two-rank beat-encoder training/checkpoint/resume check with the
+four-view forward path. Launcher syntax, CLI help, branch/worktree paths and
+legacy style-checkpoint resume compatibility were also verified. Production
+beat/V8 checkpoints remain absent, consistent with the instruction not to run jobs.
+
+## Encoder source layout and dataset manifests
+
+Each encoder has a dedicated package under `improvnet/model/encoders/`:
+
+```text
+encoders/
+  style/
+    config.py    # Standalone style settings, each setting explained
+    data.py      # Piece-level style-pair dataset
+    model.py     # StyleEncoder with independently trained parameters
+    train.py     # Style training/resume entry point
+  beat/
+    config.py    # Standalone beat settings, each setting explained
+    data.py      # Aligned disjoint-track pairs and temporal negatives
+    model.py     # BeatEncoder with independently trained parameters
+    train.py     # Beat training/resume entry point
+  model.py       # Shared bidirectional transformer backbone
+  train.py       # Shared optimizer, validation, distributed and checkpoint engine
+  data.py        # Shared piece sampling, masking and pitch augmentation
+  objective.py   # Beat contrastive objective
+  runtime.py     # Frozen checkpoint loading for finetuning and inference
+  reference.py   # Safe reference-window selection
+```
+
+Run `python -m improvnet.model.encoders.style.train` or
+`python -m improvnet.model.encoders.beat.train`; the existing launchers use these
+entry points automatically. The original continuity metric imports remain small
+compatibility entry points to the shared model/trainer. Existing checkpoint
+parameter names are preserved and historical dataset paths are normalized when
+checking resume settings. Artifact paths and batch sizes are unchanged.
+
+`MANIFEST` is the path to a JSON **dataset catalogue**, not a MIDI or checkpoint.
+It records source locations/indices, training/validation/test piece assignments,
+composition-group and duplicate information, and sampling metadata. Notes are
+loaded from the referenced source records, then pairs and augmentations are
+constructed dynamically. Both encoders intentionally use `melody_manifest_v5.json`
+to preserve the original encoder cohort; melody finetuning uses its own manifest.
+The filename is historical and does not select the model version. Beat training
+further selects eligible multitrack pieces from that cohort. Keep this catalogue
+and its referenced corpus available when reproducing encoder training; it is not
+needed to run inference with a trained encoder checkpoint.
+
+## Jazz/blues reference catalogue and trio inference
+
+`improvnet/inference/reference_catalog.json` contains 40 training-fold examples:
+8 blues and 32 jazz from Aria, GigaMIDI, Doug McKenzie, JazzSamba, JTD, PiJAMA,
+Weimar and Wikifonia. Selection is balanced per genre/source, with solo-piano
+and piano/drum mixtures where available. Genre labels are inherited from the
+training data; the catalogue is not a manually annotated groove dataset.
+
+Every entry records a readable title (or original filename), original MIDI path,
+source, genre, instruments and note counts, plus an exact reproducible reference
+excerpt (milliseconds, token count, instruments and selection seed). The record
+locator points to the original prepared JSONL row. Automatic selection uses this
+catalogue, balances source datasets, and prefers drum-containing excerpts within
+a source when available. It never selects held-out validation or test pieces.
+If the catalogue is absent and no catalogue selector was requested, the previous
+training-manifest selection remains available.
+
+The `rhythm` object describes the selected excerpt: estimated BPM and pulse
+confidence, offbeat fraction/evidence, timing spread, piano attack density,
+median onset interval/variation, and drum-hit density. Timing summaries group
+performed chord attacks within 50 ms. These are browsing estimates, not model
+conditions or certified swing/shuffle classifications. Tempo may be half/double
+the perceived pulse and low-evidence feel estimates are marked `uncertain`.
+
+`style_bucket` and `beat_bucket` each use four deterministic cosine/spherical
+k-means groups from the frozen encoders. Style groups use solo-piano embeddings;
+beat groups use the corresponding piano/drum excerpt (or piano alone for solo
+recordings). Bucket membership denotes embedding similarity, not an annotated
+groove. Instrument content, tempo and source can influence it. Bucket summaries
+list their members, genres, sources and estimated tempo range. Checkpoint hashes
+ensure the catalogue is not silently reused with different encoder weights.
+`--reference-regions different` changes the beat excerpt at generation time;
+the saved beat bucket still describes the catalogue's original excerpt.
+
+For pipeline inference, the default requested mix is the input's pitched
+instruments plus drums and **Acoustic Bass** (the tokenizer's jazz double-bass
+class; MIDI program 32). Explicit `--instruments` overrides that default, so
+`--instruments "Acoustic Piano" drum` still produces a duo. The trio stages are:
+
+1. Monophonic melody refinement.
+2. Piano rhythm and harmony, excluding instruments scheduled as missing stems.
+3. Drum stem addition against the piano mix.
+4. Acoustic-bass stem addition against the generated piano/drum mix.
+
+At inference, `--melody-strength 0` bypasses both ornament simplification and
+autoregressive refinement. It passes the extracted skyline melody through with
+its pitches, onsets, durations and velocities intact, so `refine.mid` matches
+`melody.mid`. Positive strengths retain ornament-first corruption and learned
+refinement. Training corruption is unchanged: training examples with zero extra
+corruption can still contain mandatory ornament merges. Subsequent harmonization
+and stem stages still run; a nonzero `--rhythm-strength` changes the final mix's
+timing even when melody refinement was bypassed. Chunk reports identify the
+bypass with `decoding.end_reason=zero_strength_passthrough`.
+
+The same shared GPU model continuously batches available requests across all
+four stages. Bass can start on completed drum chunks before drums finish the
+whole piece. Each stage keeps its own generated polyphonic history. Stem stages
+retain source notes with the existing bounded timing/accompaniment corrections;
+if a drum window produces no hits, its retained piano still flows to bass.
+The reference's solo-piano style embedding conditions harmonization; the same
+mixture style embedding and beat embedding condition both missing-stem stages.
+Existing checkpoints already support Acoustic Bass via the missing-stem task;
+no new training protocol or task token is introduced.
+
+Trio outputs use `refine.mid`, `harmonize.mid`, `drums.mid`, `bass.mid`, plus
+`final.mid` and `report.json`, all inside the same run folder. For example,
+`--output /path/claire_v8.mid` writes the final mix to
+`/path/claire_v8/final.mid`; it no longer creates a MIDI alongside that folder.
+A single-stem invocation retains its
+existing `stem.mid` name. The report distinguishes `stage_order`, individual
+stem counts/missing instruments, selected reference ID/buckets and batching
+statistics. Adding a requested instrument is learned generation; inspect its
+reported count and listen to the result rather than assuming musical quality.
+
+Example with a blues reference from the catalogue:
+
+```bash
+python -m improvnet.inference.parallel_inference \
+  --model /e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v8/best_model.pt \
+  --input /e/home/jusers/bhandari1/jupiter/improvnet_melody_contrastive/improvnet/inference/examples/debussy-clair-de-lune_original.mid \
+  --output /e/home/jusers/bhandari1/jupiter/improvnet_melody_contrastive/improvnet/inference/clair_trio.mid \
+  --genre blues --instruments "Acoustic Piano" drum "Acoustic Bass" \
+  --melody-strength .1 --rhythm-strength .9 \
+  --reference-id blues-gigamidi-7769fe584d
+```
+
+Replace `--reference-id` with `--reference-bucket beat_0` to sample a matching
+bucket, or omit both to sample from the catalogue. Use `--genre jazz` with a
+jazz entry. `--style-reference /path/to/performance.mid` still accepts a custom
+MIDI and is mutually exclusive with catalogue ID/bucket selection. No extra
+orchestration stage is used.
+
+Rebuild the small catalogue after changing the corpus or encoder weights with:
+
+```bash
+python -m improvnet.scripts.melody_style_references --per-source 4 --buckets 4
+```
+
+The earlier `style_references.json` contains historical numerical-condition
+summaries and is not used by this embedding-based catalogue or inference path.

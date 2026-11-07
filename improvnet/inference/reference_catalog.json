@@ -1,0 +1,2108 @@
+{
+  "format": "melody_reference_catalog_v1",
+  "manifest": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/melody_manifest_v7.json",
+  "seed": 42,
+  "selection": "Training-fold piano references, balanced per genre/source with solo and drum mixtures.",
+  "encoder_buckets": {
+    "style": "Cosine clustering of frozen solo-piano style embeddings.",
+    "beat": "Cosine clustering of frozen piano/drum (or solo-piano) beat embeddings.",
+    "caveat": "Exploratory similarities; instrument content and tempo may affect groups. No annotated swing/shuffle labels."
+  },
+  "encoders": {
+    "style": {
+      "checkpoint": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/style/best_checkpoint.pt",
+      "sha256": "2e22bf7cac00b0b8a99d4f4bfc96a23ff17ccca38a187ecb22436b9d136da2a5",
+      "trained_step": 26500
+    },
+    "beat": {
+      "checkpoint": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/beat/best_checkpoint.pt",
+      "sha256": "f7295ef2b13a70fad7b6340707e3925ab317f9917ab8b21d33e9652d0698d644",
+      "trained_step": 25500
+    }
+  },
+  "coverage": {
+    "entries": 40,
+    "genre": {
+      "blues": 8,
+      "jazz": 32
+    },
+    "source": {
+      "aria": 8,
+      "gigamidi": 8,
+      "doug": 4,
+      "jazzsamba": 4,
+      "jtd": 4,
+      "pijama": 4,
+      "weimar": 4,
+      "wikifonia": 4
+    }
+  },
+  "buckets": {
+    "style": [
+      {
+        "id": "style_0",
+        "members": [
+          "blues-aria-28eb2164d0",
+          "blues-gigamidi-d3a47476c5",
+          "jazz-doug-293939a566",
+          "jazz-gigamidi-e1d798c9c7",
+          "jazz-wikifonia-fd7240e947"
+        ],
+        "genres": {
+          "blues": 2,
+          "jazz": 3
+        },
+        "sources": {
+          "aria": 1,
+          "gigamidi": 2,
+          "doug": 1,
+          "wikifonia": 1
+        },
+        "estimated_bpm_range": [
+          115.38,
+          157.89
+        ],
+        "note": "Embedding similarity group, not an annotated groove/genre class."
+      },
+      {
+        "id": "style_1",
+        "members": [
+          "blues-aria-a2474c9cee",
+          "blues-aria-6f55ab29e2",
+          "blues-aria-7b12339d35",
+          "jazz-aria-2827fd2ea0",
+          "jazz-aria-bb1bdc1d58",
+          "jazz-aria-b37583344c",
+          "jazz-aria-dd6a94564e",
+          "jazz-jazzsamba-f118b3d72f",
+          "jazz-jtd-e66b5e1521",
+          "jazz-jtd-12b81f3d59",
+          "jazz-jtd-ad790cddb4",
+          "jazz-jtd-e7c271f8c6",
+          "jazz-pijama-9c0cc699dc",
+          "jazz-pijama-6e51030bc4",
+          "jazz-pijama-c4156107b9",
+          "jazz-pijama-d10ecc0baf"
+        ],
+        "genres": {
+          "blues": 3,
+          "jazz": 13
+        },
+        "sources": {
+          "aria": 7,
+          "jazzsamba": 1,
+          "jtd": 4,
+          "pijama": 4
+        },
+        "estimated_bpm_range": [
+          73.17,
+          200.0
+        ],
+        "note": "Embedding similarity group, not an annotated groove/genre class."
+      },
+      {
+        "id": "style_2",
+        "members": [
+          "blues-gigamidi-7769fe584d",
+          "blues-gigamidi-fa8829c24a",
+          "jazz-doug-c2bc12f05b",
+          "jazz-doug-1e3dd4d75e",
+          "jazz-gigamidi-65ebad1947",
+          "jazz-gigamidi-9bf326eeaf",
+          "jazz-gigamidi-a482e7a920",
+          "jazz-jazzsamba-58b525a8e8",
+          "jazz-jazzsamba-7dbe7385ef",
+          "jazz-jazzsamba-618e9caf20",
+          "jazz-wikifonia-6b29ee5752",
+          "jazz-wikifonia-fd9a8080e5",
+          "jazz-wikifonia-f9498b089e"
+        ],
+        "genres": {
+          "blues": 2,
+          "jazz": 11
+        },
+        "sources": {
+          "gigamidi": 5,
+          "doug": 2,
+          "jazzsamba": 3,
+          "wikifonia": 3
+        },
+        "estimated_bpm_range": [
+          60.0,
+          176.47
+        ],
+        "note": "Embedding similarity group, not an annotated groove/genre class."
+      },
+      {
+        "id": "style_3",
+        "members": [
+          "blues-gigamidi-741c7f8cb8",
+          "jazz-doug-0d7fd52d86",
+          "jazz-weimar-0504368a23",
+          "jazz-weimar-bb1f64b947",
+          "jazz-weimar-bf2892c0ec",
+          "jazz-weimar-ee347aca1c"
+        ],
+        "genres": {
+          "blues": 1,
+          "jazz": 5
+        },
+        "sources": {
+          "gigamidi": 1,
+          "doug": 1,
+          "weimar": 4
+        },
+        "estimated_bpm_range": [
+          120.0,
+          187.5
+        ],
+        "note": "Embedding similarity group, not an annotated groove/genre class."
+      }
+    ],
+    "beat": [
+      {
+        "id": "beat_0",
+        "members": [
+          "blues-aria-6f55ab29e2",
+          "blues-aria-7b12339d35",
+          "blues-aria-28eb2164d0",
+          "blues-gigamidi-fa8829c24a",
+          "jazz-aria-2827fd2ea0",
+          "jazz-aria-bb1bdc1d58",
+          "jazz-aria-b37583344c",
+          "jazz-aria-dd6a94564e",
+          "jazz-doug-0d7fd52d86",
+          "jazz-gigamidi-9bf326eeaf",
+          "jazz-pijama-9c0cc699dc",
+          "jazz-pijama-6e51030bc4",
+          "jazz-pijama-c4156107b9",
+          "jazz-pijama-d10ecc0baf",
+          "jazz-weimar-0504368a23",
+          "jazz-weimar-bb1f64b947",
+          "jazz-weimar-bf2892c0ec",
+          "jazz-weimar-ee347aca1c"
+        ],
+        "genres": {
+          "blues": 4,
+          "jazz": 14
+        },
+        "sources": {
+          "aria": 7,
+          "gigamidi": 2,
+          "doug": 1,
+          "pijama": 4,
+          "weimar": 4
+        },
+        "estimated_bpm_range": [
+          73.17,
+          200.0
+        ],
+        "note": "Embedding similarity group, not an annotated groove/genre class."
+      },
+      {
+        "id": "beat_1",
+        "members": [
+          "blues-aria-a2474c9cee",
+          "blues-gigamidi-d3a47476c5",
+          "blues-gigamidi-741c7f8cb8",
+          "jazz-doug-293939a566",
+          "jazz-doug-c2bc12f05b",
+          "jazz-doug-1e3dd4d75e",
+          "jazz-gigamidi-e1d798c9c7",
+          "jazz-gigamidi-a482e7a920",
+          "jazz-jazzsamba-58b525a8e8",
+          "jazz-jazzsamba-f118b3d72f",
+          "jazz-jazzsamba-7dbe7385ef",
+          "jazz-jtd-e66b5e1521",
+          "jazz-jtd-12b81f3d59",
+          "jazz-jtd-ad790cddb4",
+          "jazz-jtd-e7c271f8c6"
+        ],
+        "genres": {
+          "blues": 3,
+          "jazz": 12
+        },
+        "sources": {
+          "aria": 1,
+          "gigamidi": 4,
+          "doug": 3,
+          "jazzsamba": 3,
+          "jtd": 4
+        },
+        "estimated_bpm_range": [
+          71.43,
+          176.47
+        ],
+        "note": "Embedding similarity group, not an annotated groove/genre class."
+      },
+      {
+        "id": "beat_2",
+        "members": [
+          "blues-gigamidi-7769fe584d",
+          "jazz-gigamidi-65ebad1947",
+          "jazz-jazzsamba-618e9caf20"
+        ],
+        "genres": {
+          "blues": 1,
+          "jazz": 2
+        },
+        "sources": {
+          "gigamidi": 2,
+          "jazzsamba": 1
+        },
+        "estimated_bpm_range": [
+          60.0,
+          130.43
+        ],
+        "note": "Embedding similarity group, not an annotated groove/genre class."
+      },
+      {
+        "id": "beat_3",
+        "members": [
+          "jazz-wikifonia-6b29ee5752",
+          "jazz-wikifonia-fd9a8080e5",
+          "jazz-wikifonia-fd7240e947",
+          "jazz-wikifonia-f9498b089e"
+        ],
+        "genres": {
+          "jazz": 4
+        },
+        "sources": {
+          "wikifonia": 4
+        },
+        "estimated_bpm_range": [
+          60.0,
+          120.0
+        ],
+        "note": "Embedding similarity group, not an annotated groove/genre class."
+      }
+    ]
+  },
+  "rejected_candidates": [
+    {
+      "genre": "jazz",
+      "source": "jazzsamba",
+      "reason": "Reference excerpt is too short or sparse"
+    },
+    {
+      "genre": "jazz",
+      "source": "wikifonia",
+      "reason": "Reference excerpt is too short or sparse"
+    }
+  ],
+  "examples": [
+    {
+      "id": "blues-aria-a2474c9cee",
+      "title": "342350_0",
+      "genre": "blues",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/gp/342350_0.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 820545530
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 1130
+      },
+      "excerpt": {
+        "start_ms": 4350,
+        "end_ms": 22770,
+        "tokens": 509,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 3104448235
+      },
+      "rhythm": {
+        "estimated_bpm": 120.0,
+        "pulse_confidence": 0.2092,
+        "estimated_offbeat_fraction": 0.6479,
+        "offbeat_attack_count": 21,
+        "timing_spread_ms": 20.55,
+        "piano_attacks_per_second": 3.529,
+        "piano_ioi_median_ms": 220.0,
+        "piano_ioi_variation": 0.479,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "uncertain",
+        "description": "moderate estimated pulse; uncertain",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_1",
+      "beat_bucket": "beat_1"
+    },
+    {
+      "id": "blues-aria-6f55ab29e2",
+      "title": "388399_0",
+      "genre": "blues",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/hm/388399_0.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 627811966
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 2605
+      },
+      "excerpt": {
+        "start_ms": 137330,
+        "end_ms": 145570,
+        "tokens": 511,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 3119292672
+      },
+      "rhythm": {
+        "estimated_bpm": 130.43,
+        "pulse_confidence": 0.4297,
+        "estimated_offbeat_fraction": 0.6274,
+        "offbeat_attack_count": 20,
+        "timing_spread_ms": 19.85,
+        "piano_attacks_per_second": 7.767,
+        "piano_ioi_median_ms": 100.0,
+        "piano_ioi_variation": 0.5547,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "unequal_eighth_candidate",
+        "description": "moderate estimated pulse; unequal eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_1",
+      "beat_bucket": "beat_0"
+    },
+    {
+      "id": "blues-aria-7b12339d35",
+      "title": "543191_0",
+      "genre": "blues",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/kl/543191_0.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 553298572
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 556
+      },
+      "excerpt": {
+        "start_ms": 101600,
+        "end_ms": 139350,
+        "tokens": 509,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 3047088099
+      },
+      "rhythm": {
+        "estimated_bpm": 85.71,
+        "pulse_confidence": 0.23,
+        "estimated_offbeat_fraction": 0.7041,
+        "offbeat_attack_count": 30,
+        "timing_spread_ms": 27.2,
+        "piano_attacks_per_second": 2.675,
+        "piano_ioi_median_ms": 330.0,
+        "piano_ioi_variation": 0.3965,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "uncertain",
+        "description": "slow estimated pulse; uncertain",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_1",
+      "beat_bucket": "beat_0"
+    },
+    {
+      "id": "blues-aria-28eb2164d0",
+      "title": "222634_0",
+      "genre": "blues",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/eh/222634_0.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 638974076
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 1294
+      },
+      "excerpt": {
+        "start_ms": 70020,
+        "end_ms": 104470,
+        "tokens": 511,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 1305566532
+      },
+      "rhythm": {
+        "estimated_bpm": 136.36,
+        "pulse_confidence": 0.4953,
+        "estimated_offbeat_fraction": 0.6146,
+        "offbeat_attack_count": 17,
+        "timing_spread_ms": 16.98,
+        "piano_attacks_per_second": 2.235,
+        "piano_ioi_median_ms": 430.0,
+        "piano_ioi_variation": 0.2774,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "unequal_eighth_candidate",
+        "description": "moderate estimated pulse; unequal eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_0",
+      "beat_bucket": "beat_0"
+    },
+    {
+      "id": "blues-gigamidi-d3a47476c5",
+      "title": "9cf5496be5891787e57760f4655e631c",
+      "genre": "blues",
+      "source": "gigamidi",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/Final_GigaMIDI_V2.0_Final/Final_GigaMIDI_V1.1_Final/training-V1.1-80%/training-V1.1-80%/no-drums/no-drums/55/9cf5496be5891787e57760f4655e631c.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/recovered_labelled.jsonl",
+        "offset": 17938894
+      },
+      "instruments": [
+        "Acoustic Guitar",
+        "Acoustic Piano",
+        "Choir and Voice",
+        "Chromatic Percussion",
+        "Clean Electric Guitar",
+        "Distorted Electric Guitar",
+        "Electric Bass",
+        "Percussive",
+        "Pipe",
+        "Synth Strings",
+        "drum"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Guitar": 2142,
+        "Acoustic Piano": 648,
+        "Choir and Voice": 208,
+        "Chromatic Percussion": 17,
+        "Clean Electric Guitar": 318,
+        "Distorted Electric Guitar": 140,
+        "Electric Bass": 422,
+        "Percussive": 2,
+        "Pipe": 273,
+        "Synth Strings": 254,
+        "drum": 1530
+      },
+      "excerpt": {
+        "start_ms": 117670,
+        "end_ms": 129500,
+        "tokens": 508,
+        "instruments": [
+          "Acoustic Piano",
+          "drum"
+        ],
+        "seed": 346675764
+      },
+      "rhythm": {
+        "estimated_bpm": 130.43,
+        "pulse_confidence": 0.6183,
+        "estimated_offbeat_fraction": 0.5943,
+        "offbeat_attack_count": 5,
+        "timing_spread_ms": 18.78,
+        "piano_attacks_per_second": 1.099,
+        "piano_ioi_median_ms": 940.0,
+        "piano_ioi_variation": 0.2545,
+        "drum_hits_per_second": 7.523,
+        "feel_estimate": "near_even_eighth_candidate",
+        "description": "moderate estimated pulse; near even eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_0",
+      "beat_bucket": "beat_1"
+    },
+    {
+      "id": "blues-gigamidi-741c7f8cb8",
+      "title": "e988d1d0f4efc3bafa91af1f8728e12e",
+      "genre": "blues",
+      "source": "gigamidi",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/Final_GigaMIDI_V2.0_Final/Final_GigaMIDI_V1.1_Final/training-V1.1-80%/training-V1.1-80%/all-instruments-with-drums/all-instruments-with-drums/1/e988d1d0f4efc3bafa91af1f8728e12e.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/recovered_labelled.jsonl",
+        "offset": 27011767
+      },
+      "instruments": [
+        "Acoustic Piano",
+        "Synth Effect"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 1219,
+        "Synth Effect": 1791
+      },
+      "excerpt": {
+        "start_ms": 163960,
+        "end_ms": 184840,
+        "tokens": 510,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 1891009002
+      },
+      "rhythm": {
+        "estimated_bpm": 166.67,
+        "pulse_confidence": 0.5586,
+        "estimated_offbeat_fraction": 0.6866,
+        "offbeat_attack_count": 24,
+        "timing_spread_ms": 15.89,
+        "piano_attacks_per_second": 3.784,
+        "piano_ioi_median_ms": 205.0,
+        "piano_ioi_variation": 0.3466,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "unequal_eighth_candidate",
+        "description": "fast estimated pulse; unequal eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_3",
+      "beat_bucket": "beat_1"
+    },
+    {
+      "id": "blues-gigamidi-7769fe584d",
+      "title": "2a8b23f87ef3851feb2113c465bba282",
+      "genre": "blues",
+      "source": "gigamidi",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/Final_GigaMIDI_V2.0_Final/Final_GigaMIDI_V1.1_Final/test-V1.1-10%/test-V1.1-10%/no-drums/2/2a8b23f87ef3851feb2113c465bba282.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/recovered_labelled.jsonl",
+        "offset": 6020198
+      },
+      "instruments": [
+        "Acoustic Bass",
+        "Baritone Sax",
+        "Distorted Electric Guitar",
+        "Electric Bass",
+        "Electric Piano",
+        "Organ",
+        "Soprano/Alto Sax",
+        "Sound Effects",
+        "Tenor Sax",
+        "Trombone",
+        "Trumpet",
+        "drum"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Bass": 794,
+        "Baritone Sax": 241,
+        "Distorted Electric Guitar": 297,
+        "Electric Bass": 794,
+        "Electric Piano": 1733,
+        "Organ": 1056,
+        "Soprano/Alto Sax": 436,
+        "Sound Effects": 690,
+        "Tenor Sax": 494,
+        "Trombone": 495,
+        "Trumpet": 513,
+        "drum": 2169
+      },
+      "excerpt": {
+        "start_ms": 173310,
+        "end_ms": 182660,
+        "tokens": 511,
+        "instruments": [
+          "Electric Piano",
+          "drum"
+        ],
+        "seed": 2159615278
+      },
+      "rhythm": {
+        "estimated_bpm": 130.43,
+        "pulse_confidence": 0.6367,
+        "estimated_offbeat_fraction": 0.75,
+        "offbeat_attack_count": 5,
+        "timing_spread_ms": 23.71,
+        "piano_attacks_per_second": 1.925,
+        "piano_ioi_median_ms": 460.0,
+        "piano_ioi_variation": 0.8811,
+        "drum_hits_per_second": 7.594,
+        "feel_estimate": "unequal_eighth_candidate",
+        "description": "moderate estimated pulse; unequal eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_2",
+      "beat_bucket": "beat_2"
+    },
+    {
+      "id": "blues-gigamidi-fa8829c24a",
+      "title": "4d273126afe52c8e67bcc8cb90d7c8ab",
+      "genre": "blues",
+      "source": "gigamidi",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/Final_GigaMIDI_V2.0_Final/Final_GigaMIDI_V1.1_Final/training-V1.1-80%/training-V1.1-80%/no-drums/no-drums/43/4d273126afe52c8e67bcc8cb90d7c8ab.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/recovered_labelled.jsonl",
+        "offset": 10160884
+      },
+      "instruments": [
+        "Acoustic Guitar",
+        "Acoustic Piano",
+        "Choir and Voice",
+        "Chromatic Percussion",
+        "Clean Electric Guitar",
+        "Electric Bass",
+        "drum"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Guitar": 436,
+        "Acoustic Piano": 136,
+        "Choir and Voice": 36,
+        "Chromatic Percussion": 62,
+        "Clean Electric Guitar": 178,
+        "Electric Bass": 66,
+        "drum": 170
+      },
+      "excerpt": {
+        "start_ms": 16800,
+        "end_ms": 33850,
+        "tokens": 509,
+        "instruments": [
+          "Acoustic Piano",
+          "drum"
+        ],
+        "seed": 3036063975
+      },
+      "rhythm": {
+        "estimated_bpm": 120.0,
+        "pulse_confidence": 0.474,
+        "estimated_offbeat_fraction": 0.5993,
+        "offbeat_attack_count": 11,
+        "timing_spread_ms": 20.64,
+        "piano_attacks_per_second": 1.642,
+        "piano_ioi_median_ms": 260.0,
+        "piano_ioi_variation": 0.0179,
+        "drum_hits_per_second": 4.106,
+        "feel_estimate": "near_even_eighth_candidate",
+        "description": "moderate estimated pulse; near even eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_2",
+      "beat_bucket": "beat_0"
+    },
+    {
+      "id": "jazz-aria-2827fd2ea0",
+      "title": "242666_0",
+      "genre": "jazz",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/er/242666_0.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 1103475465
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 1584
+      },
+      "excerpt": {
+        "start_ms": 91510,
+        "end_ms": 101430,
+        "tokens": 511,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 3631849787
+      },
+      "rhythm": {
+        "estimated_bpm": 200.0,
+        "pulse_confidence": 0.4414,
+        "estimated_offbeat_fraction": 0.75,
+        "offbeat_attack_count": 22,
+        "timing_spread_ms": 12.47,
+        "piano_attacks_per_second": 6.855,
+        "piano_ioi_median_ms": 140.0,
+        "piano_ioi_variation": 0.1586,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "unequal_eighth_candidate",
+        "description": "fast estimated pulse; unequal eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_1",
+      "beat_bucket": "beat_0"
+    },
+    {
+      "id": "jazz-aria-bb1bdc1d58",
+      "title": "377005_0",
+      "genre": "jazz",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/hg/377005_0.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 1062845619
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 998
+      },
+      "excerpt": {
+        "start_ms": 89870,
+        "end_ms": 107330,
+        "tokens": 509,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 1795489396
+      },
+      "rhythm": {
+        "estimated_bpm": 130.43,
+        "pulse_confidence": 0.1839,
+        "estimated_offbeat_fraction": 0.5937,
+        "offbeat_attack_count": 22,
+        "timing_spread_ms": 18.44,
+        "piano_attacks_per_second": 3.036,
+        "piano_ioi_median_ms": 250.0,
+        "piano_ioi_variation": 0.6118,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "uncertain",
+        "description": "moderate estimated pulse; uncertain",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_1",
+      "beat_bucket": "beat_0"
+    },
+    {
+      "id": "jazz-aria-b37583344c",
+      "title": "187338_0",
+      "genre": "jazz",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/dp/187338_0.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 823485083
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 937
+      },
+      "excerpt": {
+        "start_ms": 78830,
+        "end_ms": 103620,
+        "tokens": 510,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 1663796404
+      },
+      "rhythm": {
+        "estimated_bpm": 120.0,
+        "pulse_confidence": 0.2036,
+        "estimated_offbeat_fraction": 0.5807,
+        "offbeat_attack_count": 21,
+        "timing_spread_ms": 21.61,
+        "piano_attacks_per_second": 2.219,
+        "piano_ioi_median_ms": 335.0,
+        "piano_ioi_variation": 0.5871,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "uncertain",
+        "description": "moderate estimated pulse; uncertain",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_1",
+      "beat_bucket": "beat_0"
+    },
+    {
+      "id": "jazz-aria-dd6a94564e",
+      "title": "248330_0",
+      "genre": "jazz",
+      "source": "aria",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/aria_jazz_blues/data/eu/248330_0.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 1133232664
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 1187
+      },
+      "excerpt": {
+        "start_ms": 6210,
+        "end_ms": 34120,
+        "tokens": 511,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 4204734388
+      },
+      "rhythm": {
+        "estimated_bpm": 73.17,
+        "pulse_confidence": 0.1128,
+        "estimated_offbeat_fraction": 0.6565,
+        "offbeat_attack_count": 20,
+        "timing_spread_ms": 31.32,
+        "piano_attacks_per_second": 2.472,
+        "piano_ioi_median_ms": 275.0,
+        "piano_ioi_variation": 0.7836,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "uncertain",
+        "description": "slow estimated pulse; uncertain",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_1",
+      "beat_bucket": "beat_0"
+    },
+    {
+      "id": "jazz-doug-0d7fd52d86",
+      "title": "This Time the Dreams on Me",
+      "genre": "jazz",
+      "source": "doug",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/doug_mcenzie_jazz/This Time the Dreams on Me.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 1536185932
+      },
+      "instruments": [
+        "Acoustic Bass",
+        "Acoustic Piano",
+        "drum"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Bass": 408,
+        "Acoustic Piano": 2157,
+        "drum": 642
+      },
+      "excerpt": {
+        "start_ms": 220650,
+        "end_ms": 236540,
+        "tokens": 501,
+        "instruments": [
+          "Acoustic Piano",
+          "drum"
+        ],
+        "seed": 394762989
+      },
+      "rhythm": {
+        "estimated_bpm": 187.5,
+        "pulse_confidence": 0.1657,
+        "estimated_offbeat_fraction": 0.5683,
+        "offbeat_attack_count": 6,
+        "timing_spread_ms": 10.61,
+        "piano_attacks_per_second": 2.014,
+        "piano_ioi_median_ms": 370.0,
+        "piano_ioi_variation": 0.716,
+        "drum_hits_per_second": 1.322,
+        "feel_estimate": "uncertain",
+        "description": "fast estimated pulse; uncertain",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_3",
+      "beat_bucket": "beat_0"
+    },
+    {
+      "id": "jazz-doug-293939a566",
+      "title": "Alabama",
+      "genre": "jazz",
+      "source": "doug",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/doug_mcenzie_jazz/Alabama.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 1514230200
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 2163
+      },
+      "excerpt": {
+        "start_ms": 192450,
+        "end_ms": 201300,
+        "tokens": 511,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 1012584017
+      },
+      "rhythm": {
+        "estimated_bpm": 157.89,
+        "pulse_confidence": 0.3659,
+        "estimated_offbeat_fraction": 0.7051,
+        "offbeat_attack_count": 5,
+        "timing_spread_ms": 16.01,
+        "piano_attacks_per_second": 4.52,
+        "piano_ioi_median_ms": 290.0,
+        "piano_ioi_variation": 0.6495,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "unequal_eighth_candidate",
+        "description": "fast estimated pulse; unequal eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_0",
+      "beat_bucket": "beat_1"
+    },
+    {
+      "id": "jazz-doug-c2bc12f05b",
+      "title": "broadway",
+      "genre": "jazz",
+      "source": "doug",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/doug_mcenzie_jazz/broadway.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 1539166841
+      },
+      "instruments": [
+        "Acoustic Bass",
+        "Acoustic Piano",
+        "drum"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Bass": 1718,
+        "Acoustic Piano": 2782,
+        "drum": 2426
+      },
+      "excerpt": {
+        "start_ms": 164300,
+        "end_ms": 171100,
+        "tokens": 507,
+        "instruments": [
+          "Acoustic Piano",
+          "drum"
+        ],
+        "seed": 3822736697
+      },
+      "rhythm": {
+        "estimated_bpm": 83.33,
+        "pulse_confidence": 0.43,
+        "estimated_offbeat_fraction": 0.5819,
+        "offbeat_attack_count": 15,
+        "timing_spread_ms": 31.69,
+        "piano_attacks_per_second": 4.706,
+        "piano_ioi_median_ms": 180.0,
+        "piano_ioi_variation": 0.3587,
+        "drum_hits_per_second": 8.676,
+        "feel_estimate": "near_even_eighth_candidate",
+        "description": "slow estimated pulse; near even eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_2",
+      "beat_bucket": "beat_1"
+    },
+    {
+      "id": "jazz-doug-1e3dd4d75e",
+      "title": "I Cover the Waterfront - solo",
+      "genre": "jazz",
+      "source": "doug",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/doug_mcenzie_jazz/I Cover the Waterfront - solo.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 1521924789
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 1708
+      },
+      "excerpt": {
+        "start_ms": 187310,
+        "end_ms": 208050,
+        "tokens": 505,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 844874091
+      },
+      "rhythm": {
+        "estimated_bpm": 176.47,
+        "pulse_confidence": 0.2545,
+        "estimated_offbeat_fraction": 0.5106,
+        "offbeat_attack_count": 15,
+        "timing_spread_ms": 12.5,
+        "piano_attacks_per_second": 2.555,
+        "piano_ioi_median_ms": 320.0,
+        "piano_ioi_variation": 0.5918,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "near_even_eighth_candidate",
+        "description": "fast estimated pulse; near even eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_2",
+      "beat_bucket": "beat_1"
+    },
+    {
+      "id": "jazz-gigamidi-65ebad1947",
+      "title": "a7b17d6a8b23ab2ee9e851e753a28912",
+      "genre": "jazz",
+      "source": "gigamidi",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/Final_GigaMIDI_V2.0_Final/Final_GigaMIDI_V1.1_Final/training-V1.1-80%/training-V1.1-80%/no-drums/no-drums/44/a7b17d6a8b23ab2ee9e851e753a28912.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/recovered_labelled.jsonl",
+        "offset": 18804445
+      },
+      "instruments": [
+        "Acoustic Bass",
+        "Acoustic Piano",
+        "Clean Electric Guitar",
+        "Percussive",
+        "Tenor Sax",
+        "drum"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Bass": 28,
+        "Acoustic Piano": 143,
+        "Clean Electric Guitar": 51,
+        "Percussive": 1,
+        "Tenor Sax": 14,
+        "drum": 85
+      },
+      "excerpt": {
+        "start_ms": 12970,
+        "end_ms": 34990,
+        "tokens": 502,
+        "instruments": [
+          "Acoustic Piano",
+          "drum"
+        ],
+        "seed": 639184550
+      },
+      "rhythm": {
+        "estimated_bpm": 60.0,
+        "pulse_confidence": 0.4303,
+        "estimated_offbeat_fraction": 0.5803,
+        "offbeat_attack_count": 21,
+        "timing_spread_ms": 42.64,
+        "piano_attacks_per_second": 2.271,
+        "piano_ioi_median_ms": 340.0,
+        "piano_ioi_variation": 0.8056,
+        "drum_hits_per_second": 2.18,
+        "feel_estimate": "near_even_eighth_candidate",
+        "description": "slow estimated pulse; near even eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_2",
+      "beat_bucket": "beat_2"
+    },
+    {
+      "id": "jazz-gigamidi-9bf326eeaf",
+      "title": "6e41b37c245d8e3725a844d50ef149cc",
+      "genre": "jazz",
+      "source": "gigamidi",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/Final_GigaMIDI_V2.0_Final/Final_GigaMIDI_V1.1_Final/validation-V1.1-10%/validation-V1.1-10%/no-drums/5/6e41b37c245d8e3725a844d50ef149cc.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/recovered_labelled.jsonl",
+        "offset": 13235305
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 1503
+      },
+      "excerpt": {
+        "start_ms": 78410,
+        "end_ms": 89350,
+        "tokens": 507,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 1837836427
+      },
+      "rhythm": {
+        "estimated_bpm": 100.0,
+        "pulse_confidence": 0.2575,
+        "estimated_offbeat_fraction": 0.6812,
+        "offbeat_attack_count": 18,
+        "timing_spread_ms": 22.62,
+        "piano_attacks_per_second": 5.21,
+        "piano_ioi_median_ms": 135.0,
+        "piano_ioi_variation": 0.8188,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "unequal_eighth_candidate",
+        "description": "moderate estimated pulse; unequal eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_2",
+      "beat_bucket": "beat_0"
+    },
+    {
+      "id": "jazz-gigamidi-e1d798c9c7",
+      "title": "9fce0eeea2c310275540a3ecfb4d132d",
+      "genre": "jazz",
+      "source": "gigamidi",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/Final_GigaMIDI_V2.0_Final/Final_GigaMIDI_V1.1_Final/training-V1.1-80%/training-V1.1-80%/no-drums/no-drums/47/9fce0eeea2c310275540a3ecfb4d132d.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/recovered_labelled.jsonl",
+        "offset": 18218125
+      },
+      "instruments": [
+        "Acoustic Bass",
+        "Acoustic Piano",
+        "Chromatic Percussion"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Bass": 602,
+        "Acoustic Piano": 2607,
+        "Chromatic Percussion": 516
+      },
+      "excerpt": {
+        "start_ms": 193330,
+        "end_ms": 200370,
+        "tokens": 511,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 2367659657
+      },
+      "rhythm": {
+        "estimated_bpm": 115.38,
+        "pulse_confidence": 0.2586,
+        "estimated_offbeat_fraction": 0.6921,
+        "offbeat_attack_count": 16,
+        "timing_spread_ms": 20.29,
+        "piano_attacks_per_second": 6.534,
+        "piano_ioi_median_ms": 150.0,
+        "piano_ioi_variation": 0.5859,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "unequal_eighth_candidate",
+        "description": "moderate estimated pulse; unequal eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_0",
+      "beat_bucket": "beat_1"
+    },
+    {
+      "id": "jazz-gigamidi-a482e7a920",
+      "title": "0f0d9afda725fbe41b66ca6b03f30497",
+      "genre": "jazz",
+      "source": "gigamidi",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/data/Final_GigaMIDI_V2.0_Final/Final_GigaMIDI_V1.1_Final/training-V1.1-80%/training-V1.1-80%/no-drums/no-drums/50/0f0d9afda725fbe41b66ca6b03f30497.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/recovered_labelled.jsonl",
+        "offset": 2321296
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 1672
+      },
+      "excerpt": {
+        "start_ms": 161820,
+        "end_ms": 176050,
+        "tokens": 504,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 2205884914
+      },
+      "rhythm": {
+        "estimated_bpm": 120.0,
+        "pulse_confidence": 0.351,
+        "estimated_offbeat_fraction": 0.75,
+        "offbeat_attack_count": 14,
+        "timing_spread_ms": 21.27,
+        "piano_attacks_per_second": 3.443,
+        "piano_ioi_median_ms": 275.0,
+        "piano_ioi_variation": 0.5988,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "unequal_eighth_candidate",
+        "description": "moderate estimated pulse; unequal eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_2",
+      "beat_bucket": "beat_1"
+    },
+    {
+      "id": "jazz-jazzsamba-58b525a8e8",
+      "title": "Song for My Father",
+      "genre": "jazz",
+      "source": "jazzsamba",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/raw/jazzsamba/training_midi/async/37-song_for_my_father/preferred.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/jazz_performance_v5.jsonl",
+        "offset": 13836844
+      },
+      "instruments": [
+        "Acoustic Piano",
+        "drum"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 2486,
+        "drum": 2649
+      },
+      "excerpt": {
+        "start_ms": 210380,
+        "end_ms": 216630,
+        "tokens": 511,
+        "instruments": [
+          "Acoustic Piano",
+          "drum"
+        ],
+        "seed": 3509411958
+      },
+      "rhythm": {
+        "estimated_bpm": 71.43,
+        "pulse_confidence": 0.2448,
+        "estimated_offbeat_fraction": 0.6401,
+        "offbeat_attack_count": 14,
+        "timing_spread_ms": 40.2,
+        "piano_attacks_per_second": 5.12,
+        "piano_ioi_median_ms": 230.0,
+        "piano_ioi_variation": 0.3242,
+        "drum_hits_per_second": 6.88,
+        "feel_estimate": "uncertain",
+        "description": "slow estimated pulse; uncertain",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_2",
+      "beat_bucket": "beat_1"
+    },
+    {
+      "id": "jazz-jazzsamba-f118b3d72f",
+      "title": "Boplicity (Be Bop Lives)",
+      "genre": "jazz",
+      "source": "jazzsamba",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/raw/jazzsamba/training_midi/sync/54-boplicity/alternate.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/jazz_performance_v5.jsonl",
+        "offset": 18915713
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 2726
+      },
+      "excerpt": {
+        "start_ms": 45940,
+        "end_ms": 65020,
+        "tokens": 509,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 1223051899
+      },
+      "rhythm": {
+        "estimated_bpm": 107.14,
+        "pulse_confidence": 0.1404,
+        "estimated_offbeat_fraction": 0.6498,
+        "offbeat_attack_count": 11,
+        "timing_spread_ms": 18.01,
+        "piano_attacks_per_second": 2.621,
+        "piano_ioi_median_ms": 350.0,
+        "piano_ioi_variation": 0.7388,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "uncertain",
+        "description": "moderate estimated pulse; uncertain",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_1",
+      "beat_bucket": "beat_1"
+    },
+    {
+      "id": "jazz-jazzsamba-7dbe7385ef",
+      "title": "All the Things You Are",
+      "genre": "jazz",
+      "source": "jazzsamba",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/raw/jazzsamba/training_midi/async/04-all_the_things_you_are/alternate.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/jazz_performance_v5.jsonl",
+        "offset": 1670831
+      },
+      "instruments": [
+        "Acoustic Piano",
+        "drum"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 2762,
+        "drum": 3451
+      },
+      "excerpt": {
+        "start_ms": 75890,
+        "end_ms": 84810,
+        "tokens": 511,
+        "instruments": [
+          "Acoustic Piano",
+          "drum"
+        ],
+        "seed": 2277185236
+      },
+      "rhythm": {
+        "estimated_bpm": 150.0,
+        "pulse_confidence": 0.4087,
+        "estimated_offbeat_fraction": 0.75,
+        "offbeat_attack_count": 3,
+        "timing_spread_ms": 13.78,
+        "piano_attacks_per_second": 2.242,
+        "piano_ioi_median_ms": 400.0,
+        "piano_ioi_variation": 0.7024,
+        "drum_hits_per_second": 7.623,
+        "feel_estimate": "unequal_eighth_candidate",
+        "description": "fast estimated pulse; unequal eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_2",
+      "beat_bucket": "beat_1"
+    },
+    {
+      "id": "jazz-jazzsamba-618e9caf20",
+      "title": "St. Thomas",
+      "genre": "jazz",
+      "source": "jazzsamba",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/raw/jazzsamba/training_midi/async/39-st_thomas/preferred.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/jazz_performance_v5.jsonl",
+        "offset": 14596849
+      },
+      "instruments": [
+        "Acoustic Piano",
+        "drum"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 2048,
+        "drum": 2496
+      },
+      "excerpt": {
+        "start_ms": 44500,
+        "end_ms": 53910,
+        "tokens": 511,
+        "instruments": [
+          "Acoustic Piano",
+          "drum"
+        ],
+        "seed": 4150593782
+      },
+      "rhythm": {
+        "estimated_bpm": 103.45,
+        "pulse_confidence": 0.3101,
+        "estimated_offbeat_fraction": 0.6575,
+        "offbeat_attack_count": 3,
+        "timing_spread_ms": 24.24,
+        "piano_attacks_per_second": 2.019,
+        "piano_ioi_median_ms": 425.0,
+        "piano_ioi_variation": 0.8184,
+        "drum_hits_per_second": 7.651,
+        "feel_estimate": "unequal_eighth_candidate",
+        "description": "moderate estimated pulse; unequal eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_2",
+      "beat_bucket": "beat_2"
+    },
+    {
+      "id": "jazz-jtd-e66b5e1521",
+      "title": "Ugetsu",
+      "genre": "jazz",
+      "source": "jtd",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/raw/jazz_trio_database/jazz-trio-database-v02/waltonc-ugetsu-williamsdcobbj-2005-5872ae60/piano_midi.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/jazz_performance_v5.jsonl",
+        "offset": 58633669
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 2625
+      },
+      "excerpt": {
+        "start_ms": 162960,
+        "end_ms": 174200,
+        "tokens": 512,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 2889210146
+      },
+      "rhythm": {
+        "estimated_bpm": 157.89,
+        "pulse_confidence": 0.2698,
+        "estimated_offbeat_fraction": 0.539,
+        "offbeat_attack_count": 16,
+        "timing_spread_ms": 12.79,
+        "piano_attacks_per_second": 4.804,
+        "piano_ioi_median_ms": 230.0,
+        "piano_ioi_variation": 0.5005,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "near_even_eighth_candidate",
+        "description": "fast estimated pulse; near even eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_1",
+      "beat_bucket": "beat_1"
+    },
+    {
+      "id": "jazz-jtd-12b81f3d59",
+      "title": "The Gig",
+      "genre": "jazz",
+      "source": "jtd",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/raw/jazz_trio_database/jazz-trio-database-v02/nicholsh-thegig-mckibbonaroachm-1956-ad28e74d/piano_midi.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/jazz_performance_v5.jsonl",
+        "offset": 47160654
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 1109
+      },
+      "excerpt": {
+        "start_ms": 19780,
+        "end_ms": 31090,
+        "tokens": 512,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 569429740
+      },
+      "rhythm": {
+        "estimated_bpm": 142.86,
+        "pulse_confidence": 0.2607,
+        "estimated_offbeat_fraction": 0.5683,
+        "offbeat_attack_count": 26,
+        "timing_spread_ms": 16.82,
+        "piano_attacks_per_second": 6.101,
+        "piano_ioi_median_ms": 105.0,
+        "piano_ioi_variation": 1.0155,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "near_even_eighth_candidate",
+        "description": "fast estimated pulse; near even eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_1",
+      "beat_bucket": "beat_1"
+    },
+    {
+      "id": "jazz-jtd-ad790cddb4",
+      "title": "Beyond Recall",
+      "genre": "jazz",
+      "source": "jtd",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/raw/jazz_trio_database/jazz-trio-database-v02/nicholsh-beyondrecall-duviviergrichmondd-1957-a6f608f2/piano_midi.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/jazz_performance_v5.jsonl",
+        "offset": 45885751
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 1356
+      },
+      "excerpt": {
+        "start_ms": 46060,
+        "end_ms": 54740,
+        "tokens": 499,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 2246042236
+      },
+      "rhythm": {
+        "estimated_bpm": 103.45,
+        "pulse_confidence": 0.2075,
+        "estimated_offbeat_fraction": 0.6274,
+        "offbeat_attack_count": 16,
+        "timing_spread_ms": 28.89,
+        "piano_attacks_per_second": 4.724,
+        "piano_ioi_median_ms": 180.0,
+        "piano_ioi_variation": 0.7033,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "uncertain",
+        "description": "moderate estimated pulse; uncertain",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_1",
+      "beat_bucket": "beat_1"
+    },
+    {
+      "id": "jazz-jtd-e7c271f8c6",
+      "title": "Someday My Prince Will Come",
+      "genre": "jazz",
+      "source": "jtd",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/raw/jazz_trio_database/jazz-trio-database-v02/barronk-somedaymyprincewillcome-williamsbrileyb-1982-709cf40e/piano_midi.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/jazz_performance_v5.jsonl",
+        "offset": 26004887
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 2479
+      },
+      "excerpt": {
+        "start_ms": 110440,
+        "end_ms": 118210,
+        "tokens": 511,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 3506354722
+      },
+      "rhythm": {
+        "estimated_bpm": 120.0,
+        "pulse_confidence": 0.3405,
+        "estimated_offbeat_fraction": 0.6382,
+        "offbeat_attack_count": 21,
+        "timing_spread_ms": 20.97,
+        "piano_attacks_per_second": 8.108,
+        "piano_ioi_median_ms": 90.0,
+        "piano_ioi_variation": 0.775,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "unequal_eighth_candidate",
+        "description": "moderate estimated pulse; unequal eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_1",
+      "beat_bucket": "beat_1"
+    },
+    {
+      "id": "jazz-pijama-9c0cc699dc",
+      "title": "I Never Knew - Live At Maybeck Recital Hall, Berkeley, CA  November 14-16, 1994_0",
+      "genre": "jazz",
+      "source": "pijama",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/pijama-retranscribed/pijama-retranscribed/data/live/John Colianni/The Maybeck Recital Series, Vol. 37/I Never Knew - Live At Maybeck Recital Hall, Berkeley, CA  November 14-16, 1994_0.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 1317187826
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 1934
+      },
+      "excerpt": {
+        "start_ms": 165910,
+        "end_ms": 177330,
+        "tokens": 512,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 2926141072
+      },
+      "rhythm": {
+        "estimated_bpm": 111.11,
+        "pulse_confidence": 0.3885,
+        "estimated_offbeat_fraction": 0.5831,
+        "offbeat_attack_count": 35,
+        "timing_spread_ms": 21.39,
+        "piano_attacks_per_second": 8.144,
+        "piano_ioi_median_ms": 90.0,
+        "piano_ioi_variation": 0.6572,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "near_even_eighth_candidate",
+        "description": "moderate estimated pulse; near even eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_1",
+      "beat_bucket": "beat_0"
+    },
+    {
+      "id": "jazz-pijama-6e51030bc4",
+      "title": "I Get A Kick Out Of You - Live At Maybeck Recital Hall, Berkeley, CA  June 12, 1994_0",
+      "genre": "jazz",
+      "source": "pijama",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/pijama-retranscribed/pijama-retranscribed/data/live/Allen Farnham/The Maybeck Recital Series, Vol. 41/I Get A Kick Out Of You - Live At Maybeck Recital Hall, Berkeley, CA  June 12, 1994_0.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 1262224513
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 4643
+      },
+      "excerpt": {
+        "start_ms": 334160,
+        "end_ms": 347210,
+        "tokens": 504,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 249005900
+      },
+      "rhythm": {
+        "estimated_bpm": 100.0,
+        "pulse_confidence": 0.2058,
+        "estimated_offbeat_fraction": 0.5871,
+        "offbeat_attack_count": 14,
+        "timing_spread_ms": 26.48,
+        "piano_attacks_per_second": 2.529,
+        "piano_ioi_median_ms": 370.0,
+        "piano_ioi_variation": 0.4271,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "uncertain",
+        "description": "moderate estimated pulse; uncertain",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_1",
+      "beat_bucket": "beat_0"
+    },
+    {
+      "id": "jazz-pijama-c4156107b9",
+      "title": "Goodbye_0",
+      "genre": "jazz",
+      "source": "pijama",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/pijama-retranscribed/pijama-retranscribed/data/studio/Beegie Adair/By Myself/Goodbye_0.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 1382010837
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 943
+      },
+      "excerpt": {
+        "start_ms": 17420,
+        "end_ms": 48790,
+        "tokens": 511,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 102550256
+      },
+      "rhythm": {
+        "estimated_bpm": 75.0,
+        "pulse_confidence": 0.1314,
+        "estimated_offbeat_fraction": 0.691,
+        "offbeat_attack_count": 28,
+        "timing_spread_ms": 34.17,
+        "piano_attacks_per_second": 2.168,
+        "piano_ioi_median_ms": 330.0,
+        "piano_ioi_variation": 0.7642,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "uncertain",
+        "description": "slow estimated pulse; uncertain",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_1",
+      "beat_bucket": "beat_0"
+    },
+    {
+      "id": "jazz-pijama-d10ecc0baf",
+      "title": "Strollin' - Live At Maybeck Recital Hall  Berkeley, CA_0",
+      "genre": "jazz",
+      "source": "pijama",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/pijama-retranscribed/pijama-retranscribed/data/live/Alan Broadbent/The Maybeck Recital Series, Vol. 14/Strollin' - Live At Maybeck Recital Hall  Berkeley, CA_0.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 1261672044
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 2640
+      },
+      "excerpt": {
+        "start_ms": 86140,
+        "end_ms": 100560,
+        "tokens": 512,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 4160386371
+      },
+      "rhythm": {
+        "estimated_bpm": 136.36,
+        "pulse_confidence": 0.3247,
+        "estimated_offbeat_fraction": 0.5966,
+        "offbeat_attack_count": 28,
+        "timing_spread_ms": 18.56,
+        "piano_attacks_per_second": 5.964,
+        "piano_ioi_median_ms": 130.0,
+        "piano_ioi_variation": 0.6748,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "near_even_eighth_candidate",
+        "description": "moderate estimated pulse; near even eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_1",
+      "beat_bucket": "beat_0"
+    },
+    {
+      "id": "jazz-weimar-0504368a23",
+      "title": "Blue Mode",
+      "genre": "jazz",
+      "source": "weimar",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/weimar/raw/SonnyStitt_BlueMode_FINAL.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 1258281922
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 353
+      },
+      "excerpt": {
+        "start_ms": 39890,
+        "end_ms": 78320,
+        "tokens": 509,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 1681584505
+      },
+      "rhythm": {
+        "estimated_bpm": 120.0,
+        "pulse_confidence": 0.1771,
+        "estimated_offbeat_fraction": 0.584,
+        "offbeat_attack_count": 45,
+        "timing_spread_ms": 19.43,
+        "piano_attacks_per_second": 3.253,
+        "piano_ioi_median_ms": 210.0,
+        "piano_ioi_variation": 1.1829,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "uncertain",
+        "description": "moderate estimated pulse; uncertain",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_3",
+      "beat_bucket": "beat_0"
+    },
+    {
+      "id": "jazz-weimar-bb1f64b947",
+      "title": "My Ideal",
+      "genre": "jazz",
+      "source": "weimar",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/weimar/raw/BenWebster_MyIdeal_FINAL.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 1251506935
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 308
+      },
+      "excerpt": {
+        "start_ms": 90890,
+        "end_ms": 102920,
+        "tokens": 159,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 2523129335
+      },
+      "rhythm": {
+        "estimated_bpm": 142.86,
+        "pulse_confidence": 0.206,
+        "estimated_offbeat_fraction": 0.6261,
+        "offbeat_attack_count": 13,
+        "timing_spread_ms": 17.0,
+        "piano_attacks_per_second": 3.242,
+        "piano_ioi_median_ms": 200.0,
+        "piano_ioi_variation": 0.9625,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "uncertain",
+        "description": "fast estimated pulse; uncertain",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_3",
+      "beat_bucket": "beat_0"
+    },
+    {
+      "id": "jazz-weimar-bf2892c0ec",
+      "title": "Avalon",
+      "genre": "jazz",
+      "source": "weimar",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/weimar/raw/BennyGoodman_Avalon_FINAL.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 1251650896
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 162
+      },
+      "excerpt": {
+        "start_ms": 6330,
+        "end_ms": 30850,
+        "tokens": 510,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 1909583799
+      },
+      "rhythm": {
+        "estimated_bpm": 120.0,
+        "pulse_confidence": 0.2667,
+        "estimated_offbeat_fraction": 0.5872,
+        "offbeat_attack_count": 49,
+        "timing_spread_ms": 18.48,
+        "piano_attacks_per_second": 5.139,
+        "piano_ioi_median_ms": 130.0,
+        "piano_ioi_variation": 0.9436,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "near_even_eighth_candidate",
+        "description": "moderate estimated pulse; near even eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_3",
+      "beat_bucket": "beat_0"
+    },
+    {
+      "id": "jazz-weimar-ee347aca1c",
+      "title": "Dextivity",
+      "genre": "jazz",
+      "source": "weimar",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/weimar/raw/DexterGordon_Dextivity_FINAL.mid",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 1253560008
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 348
+      },
+      "excerpt": {
+        "start_ms": 19010,
+        "end_ms": 48210,
+        "tokens": 511,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 3154255017
+      },
+      "rhythm": {
+        "estimated_bpm": 187.5,
+        "pulse_confidence": 0.2939,
+        "estimated_offbeat_fraction": 0.5668,
+        "offbeat_attack_count": 50,
+        "timing_spread_ms": 11.52,
+        "piano_attacks_per_second": 4.281,
+        "piano_ioi_median_ms": 160.0,
+        "piano_ioi_variation": 1.1206,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "near_even_eighth_candidate",
+        "description": "fast estimated pulse; near even eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_3",
+      "beat_bucket": "beat_0"
+    },
+    {
+      "id": "jazz-wikifonia-6b29ee5752",
+      "title": "Speak No Evil",
+      "genre": "jazz",
+      "source": "wikifonia",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/wikifonia/wikimt_subset/raw/wikifonia/Speak No Evil.mxl",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 1547916510
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 142
+      },
+      "excerpt": {
+        "start_ms": 45500,
+        "end_ms": 116750,
+        "tokens": 384,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 228817223
+      },
+      "rhythm": {
+        "estimated_bpm": 60.0,
+        "pulse_confidence": 0.4839,
+        "estimated_offbeat_fraction": 0.5512,
+        "offbeat_attack_count": 18,
+        "timing_spread_ms": 20.31,
+        "piano_attacks_per_second": 1.291,
+        "piano_ioi_median_ms": 250.0,
+        "piano_ioi_variation": 0.9148,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "near_even_eighth_candidate",
+        "description": "slow estimated pulse; near even eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_2",
+      "beat_bucket": "beat_3"
+    },
+    {
+      "id": "jazz-wikifonia-fd9a8080e5",
+      "title": "We're All Alone",
+      "genre": "jazz",
+      "source": "wikifonia",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/wikifonia/wikimt_subset/raw/wikifonia/We're All Alone.mxl",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 1548144600
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 158
+      },
+      "excerpt": {
+        "start_ms": 1250,
+        "end_ms": 56750,
+        "tokens": 509,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 321744615
+      },
+      "rhythm": {
+        "estimated_bpm": 60.0,
+        "pulse_confidence": 0.5831,
+        "estimated_offbeat_fraction": 0.5747,
+        "offbeat_attack_count": 23,
+        "timing_spread_ms": 19.54,
+        "piano_attacks_per_second": 2.234,
+        "piano_ioi_median_ms": 250.0,
+        "piano_ioi_variation": 1.089,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "near_even_eighth_candidate",
+        "description": "slow estimated pulse; near even eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_2",
+      "beat_bucket": "beat_3"
+    },
+    {
+      "id": "jazz-wikifonia-fd7240e947",
+      "title": "Everybody Loves My Baby",
+      "genre": "jazz",
+      "source": "wikifonia",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/wikifonia/wikimt_subset/raw/wikifonia/Everybody Loves My Baby.mxl",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 1547302526
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 209
+      },
+      "excerpt": {
+        "start_ms": 32500,
+        "end_ms": 107500,
+        "tokens": 512,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 3522865761
+      },
+      "rhythm": {
+        "estimated_bpm": 120.0,
+        "pulse_confidence": 1.0,
+        "estimated_offbeat_fraction": 0.5,
+        "offbeat_attack_count": 8,
+        "timing_spread_ms": 10.0,
+        "piano_attacks_per_second": 1.653,
+        "piano_ioi_median_ms": 500.0,
+        "piano_ioi_variation": 0.9662,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "near_even_eighth_candidate",
+        "description": "moderate estimated pulse; near even eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_0",
+      "beat_bucket": "beat_3"
+    },
+    {
+      "id": "jazz-wikifonia-f9498b089e",
+      "title": "Day Dream",
+      "genre": "jazz",
+      "source": "wikifonia",
+      "split": "train",
+      "path": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/wikifonia/wikimt_subset/raw/wikifonia/Day Dream.mxl",
+      "record": {
+        "jsonl": "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/performances_stems_v4.jsonl",
+        "offset": 1547229557
+      },
+      "instruments": [
+        "Acoustic Piano"
+      ],
+      "instrument_note_counts": {
+        "Acoustic Piano": 214
+      },
+      "excerpt": {
+        "start_ms": 128000,
+        "end_ms": 143000,
+        "tokens": 100,
+        "instruments": [
+          "Acoustic Piano"
+        ],
+        "seed": 57377222
+      },
+      "rhythm": {
+        "estimated_bpm": 60.0,
+        "pulse_confidence": 0.424,
+        "estimated_offbeat_fraction": 0.5816,
+        "offbeat_attack_count": 8,
+        "timing_spread_ms": 28.98,
+        "piano_attacks_per_second": 1.6,
+        "piano_ioi_median_ms": 340.0,
+        "piano_ioi_variation": 0.8549,
+        "drum_hits_per_second": 0.0,
+        "feel_estimate": "near_even_eighth_candidate",
+        "description": "slow estimated pulse; near even eighth candidate",
+        "caveat": "Heuristic estimates: half/double tempo, meter, swing and expressive timing can be ambiguous."
+      },
+      "style_bucket": "style_2",
+      "beat_bucket": "beat_3"
+    }
+  ]
+}

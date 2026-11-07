@@ -15,8 +15,7 @@ from improvnet.utils.melody import (MelodyTokenizer, TASKS, make_prompt, mask_ti
 from improvnet.utils.melody_chunks import (chunk_bounds, chunk_end, group_end,
                                           history_tokens, stem_bounds, shorten_chunk)
 from improvnet.utils.melody_corruptions import refinement_source, refinement_strength
-from improvnet.utils.melody_style import style_tensors
-from improvnet.utils.melody_groove import GrooveGuide
+from improvnet.model.encoders.runtime import FrozenConditioners
 from improvnet.utils.melody_stems import kit_only_notes
 
 from improvnet.inference.melody_runtime import INFERENCE_SEED, TOP_K
@@ -40,7 +39,9 @@ class MelodyInference:
         self.checkpoint_step = checkpoint.get('step')
         self.tokenizer = MelodyTokenizer()
         self.options = SimpleNamespace(**{k.upper(): v for k, v in self.meta.items()})
-        self.model = MelodyRefinementModel(**dict(self.meta['model_kwargs'], style_feature_count=len(self.meta['style_features'])))
+        self.encoders=FrozenConditioners(self.meta['style_encoder'],self.meta['beat_encoder'],self.device,
+            style_sha256=self.meta['style_encoder_sha256'],beat_sha256=self.meta['beat_encoder_sha256'])
+        self.model = MelodyRefinementModel(**self.meta['model_kwargs'])
         self.model.load_state_dict(checkpoint['model_state_dict'])
         del checkpoint
         self.model.to(self.device).eval()
@@ -56,11 +57,17 @@ class MelodyInference:
         return generate_notes(self, *args, **kwargs)
 
     def transform(self, notes, task, genre, strength, rng, temperature=1.,
-                  instruments=None, style_reference=None, monophonic=None, target_instrument=None, groove_guide=None, *, source_stream=None, on_chunk=None):
+                  instruments=None, style_reference=None, monophonic=None, target_instrument=None, *, source_stream=None, on_chunk=None):
+        stage_label = ('Drums' if target_instrument == 'drum' else
+                       'Bass' if target_instrument == 'Acoustic Bass' else
+                       f'Stem {target_instrument}' if task == 'stem' else task.capitalize())
         if task not in self.meta.get('tasks', TASKS):
             raise ValueError(f'This checkpoint was not trained for {task}')
         if task == 'harmonize' and self.meta.get('version', 0) >= 9:
             strength = harmonize_strength(rng, strength, self.meta.get('harmonize_min_mask_ratio', .6))
+        # Inference strength zero means an exact skyline pass-through, rather
+        # than training's "ornament merges but no additional corruption" case.
+        bypass_refinement = task == 'refine' and strength == 0
         tok = self.tokenizer
         def prepare_source(raw):
             pitched = [n for n in raw if n.instrument != 'drum']
@@ -103,14 +110,14 @@ class MelodyInference:
         if task=='stem' and target_instrument is None:
             raise ValueError('Stem addition requires --target-instrument (pipeline defaults to missing drums)')
         reference = style_reference or {}
-        if groove_guide is None and reference:
-            groove_guide=GrooveGuide(notes,reference,rng)
-        statistics = reference.get('melody_statistics', reference.get('statistics', reference)) if task in ('harmonize','stem') else {}
-        values, mask = style_tensors(statistics, task,**({'feature_names':self.meta['style_features']} if 'style_features' in self.meta else {}))
+        embedding = reference.get('style_solo_embedding' if task=='harmonize' else 'style_mixture_embedding') if task in ('harmonize', 'stem') else None
+        style_mask = torch.tensor(float(embedding is not None)) if embedding is not None else None
+        beat_embedding=reference.get('beat_embedding') if task in ('harmonize','stem') else None
+        beat_mask=torch.tensor(1.) if beat_embedding is not None else None
 
         result, logs, begin = [], [], 0
         onsets = [n.onset for n in source_notes]
-        with tqdm(total=len(source_notes), desc=task.capitalize(), unit='input note', dynamic_ncols=True,
+        with tqdm(total=len(source_notes), desc=stage_label, unit='input note', dynamic_ncols=True,
                   position=getattr(self, 'progress_position', None)) as progress:
             while begin < len(source_notes) or source_stream is not None and not source_stream.done:
                 left = history_tokens(result, self.meta['history_tokens'], tok)
@@ -153,8 +160,11 @@ class MelodyInference:
                     bounds=stem_bounds if task=='stem' else chunk_bounds
                     start, end = bounds(source_notes, begin, stop)
                     core = window(source_notes, start, end)
-                    chunk_strength = refinement_strength(core, strength, self.options) if task == 'refine' else strength
-                    if task == 'refine':
+                    chunk_strength = (refinement_strength(core, strength, self.options)
+                                      if task == 'refine' and not bypass_refinement else strength)
+                    if bypass_refinement:
+                        source = notes_to_tokens(core, tok)
+                    elif task == 'refine':
                         source = refinement_source(core, strength, rng, tok, self.options, bounded)
                     elif task == 'harmonize':
                         source = mask_timing(core, strength, rng, tok, round_up=True)
@@ -173,9 +183,6 @@ class MelodyInference:
                 prompt = make_prompt(task, source, left, target_instrument)
                 budget = min(response_cap - 1, available - len(source))
                 output_instruments = selected if task in ('harmonize', 'stem') else sorted({n.instrument for n in core})
-                if groove_guide is not None and task in ('harmonize','stem'):
-                    statistics=groove_guide.statistics(start,end)
-                    values,mask=style_tensors(statistics,task,**({'feature_names':self.meta['style_features']} if 'style_features' in self.meta else {}))
                 self.last_decode_stats = {}
                 protected_pitches = None
                 if task == 'stem' and self.meta.get('version', 0) >= 9:
@@ -186,13 +193,17 @@ class MelodyInference:
                     protected = set(melody)
                     protected_pitches = [replace(n, onset=n.onset+start) in protected for n in ordered(core)]
                 progress.set_postfix(chunk=len(logs) + 1, source=len(source), history=len(left))
-                generated = self.generate(prompt, genre, chunk_strength, output_instruments, end - start,
-                    temperature=temperature, monophonic=task == 'refine', max_new_tokens=budget,
-                    style_values=values, style_mask=mask, stop_at_window_end=task in ('harmonize', 'stem'),
-                    fixed_notes=ordered(core) if task in ('stem',) else None,
-                    stem_add=task=='stem', target_instrument=target_instrument,
-                    protected_pitches=protected_pitches,
-                    progress_desc=f'{task.capitalize()} chunk {len(logs) + 1}')
+                if bypass_refinement:
+                    generated = list(core)
+                    self.last_decode_stats = dict(end_reason='zero_strength_passthrough', model_bypassed=True)
+                else:
+                    generated = self.generate(prompt, genre, chunk_strength, output_instruments, end - start,
+                        temperature=temperature, monophonic=task == 'refine', max_new_tokens=budget,
+                        style_embedding=embedding, style_mask=style_mask,beat_embedding=beat_embedding,beat_mask=beat_mask, stop_at_window_end=task in ('harmonize', 'stem'),
+                        fixed_notes=ordered(core) if task in ('stem',) else None,
+                        stem_add=task=='stem', target_instrument=target_instrument,
+                        protected_pitches=protected_pitches,
+                        progress_desc=f'{stage_label} chunk {len(logs) + 1}')
                 if not generated:
                     raise RuntimeError(f'Empty {task} output; refusing to skip the source melody')
                 consumed = stop
@@ -213,7 +224,7 @@ class MelodyInference:
                     consumed_input_notes=consumed - begin, strength=chunk_strength, requested_strength=strength, early_end=consumed < stop,
                     timing_mask_fraction=source.count('<MASK>')/(2*len(core)) if task == 'harmonize' else None,
                     target_instrument=target_instrument, added_stem_notes=sum(n.instrument == target_instrument for n in generated) if task in ('stem',) else None,
-                    style_statistics=statistics, style_mask=mask.tolist(), decoding=dict(self.last_decode_stats)))
+                    style_conditioned=embedding is not None,beat_conditioned=beat_embedding is not None, decoding=dict(self.last_decode_stats)))
                 progress.update(consumed - begin)
                 begin = consumed
         result=deduplicate_attacks(result,tok.time_step_ms)

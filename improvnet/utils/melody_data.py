@@ -19,8 +19,7 @@ from improvnet.utils.melody import (Note, MelodyTokenizer, TASKS, make_prompt, m
 from improvnet.utils.melody_chunks import (chunk_bounds, chunk_end, chunk_starts,
                                           history_tokens, stem_bounds, shorten_chunk, validate_lengths)
 from improvnet.utils.melody_corruptions import corrupt_history, corrupt_stem_source, sample_stem_pitch_probability, refinement_source, refinement_strength
-from improvnet.utils.melody_style import performance_statistics, style_tensors
-from improvnet.utils.melody_groove import infer_clock, groove_statistics
+from improvnet.utils.melody_reference import neighboring_reference, reference_ids
 from improvnet.utils.melody_stems import choose_missing_stem, instrument_weight, DRUM_KIT_PITCHES, DRUM_KIT_ALIASES, kit_only_notes
 
 
@@ -188,14 +187,22 @@ def prepare_example(record, rng, config=cfg, task=None, strength=None, target_in
             if task != 'refine' or bounded or len(target) + 1 > cap:
                 raise ValueError('Complete onset group exceeds the training token budget')
             bounded = True
-    visible = task in ('harmonize','stem') and rng.random() < config.RHYTHM_STYLE_PROB
-    statistics={}
-    if visible:
-        clock=infer_clock(full_mix)
-        rhythm_notes=[n for n in melody if start<=n.onset<end]
-        statistics=performance_statistics(rhythm_notes)
-        statistics.update(groove_statistics(rhythm_notes,clock,start))
-    values, mask = style_tensors(statistics, task, visible)
+    reference = None
+    beat_reference = None
+    if task in ('harmonize', 'stem') and rng.random() < config.REFERENCE_PROB:
+        # Exclude all sounds owned by this target, including releases after end.
+        protected_end = max([end]+[n.onset+n.duration for n in full_mix if start<=n.onset<end])
+        reference = neighboring_reference(full_mix, start, protected_end, rng,
+            max_tokens=config.REFERENCE_TOKENS, guard_ms=config.REFERENCE_GUARD_MS,
+            max_distance_ms=config.REFERENCE_MAX_DISTANCE_MS,
+            instruments={n.instrument for n in target_notes})
+    if task in ('harmonize','stem') and rng.random()<config.REFERENCE_PROB:
+        protected_end=max([end]+[n.onset+n.duration for n in full_mix if start<=n.onset<end])
+        beat_reference=neighboring_reference(full_mix,start,protected_end,rng,
+            max_tokens=config.REFERENCE_TOKENS,guard_ms=config.REFERENCE_GUARD_MS,
+            max_distance_ms=config.REFERENCE_MAX_DISTANCE_MS)
+    beat_ids=reference_ids(beat_reference,tok)
+    ref_ids = reference_ids(reference, tok)
     ids = [tok.tok_to_id[t] for t in prompt + target]
     labels = [config.IGNORE_INDEX] * len(prompt) + [tok.tok_to_id[t] for t in target]
     stem_mask, current = [False] * len(prompt), None
@@ -218,7 +225,12 @@ def prepare_example(record, rng, config=cfg, task=None, strength=None, target_in
                 genre=torch.tensor(config.GENRES.index(genre)),
                 multi_hot=ProcessData().get_instrument_multihot(notes_to_tokens(target_notes, tok)),
                 strength=torch.tensor(condition_strength, dtype=torch.float32), requested_strength=strength, task=TASKS.index(task),
-                style_values=values, style_mask=mask, exposure=exposure, history_length=len(left), history_corrupted=history_corrupted,
+                beat_ids=torch.tensor(beat_ids,dtype=torch.long),beat_present=torch.tensor(bool(beat_ids)),
+                beat_bounds=None if beat_reference is None else (beat_reference['start_ms'],beat_reference['end_ms']),
+                style_ids=torch.tensor(ref_ids, dtype=torch.long),
+                style_present=torch.tensor(bool(ref_ids)),
+                style_bounds=None if reference is None else (reference['start_ms'], reference['end_ms']),
+                style_view=None if reference is None else reference['view'], exposure=exposure, history_length=len(left), history_corrupted=history_corrupted,
                 input_mono=task in ('refine', 'harmonize'), history_mono=task == 'refine',
                 refinement_changed_fraction=changed_fraction,
                 nonkit_drum_notes_filtered=nonkit_drums,
@@ -495,9 +507,15 @@ def collate_examples(batch):
         if actual is not None:
             corruption += torch.tensor([1., example['requested_strength'], float(example['strength']),
                                         actual, float(actual <= .2), float(actual >= .8)], dtype=torch.float64)
-    return dict(input=inputs, target=targets, task=torch.tensor([x['task'] for x in batch]), data_stats=data_stats, corruption_summary=corruption, **masks,
-                **{k: torch.stack([x[k] for x in batch]) for k in
-                   ('genre', 'multi_hot', 'strength', 'style_values', 'style_mask', 'stem_instrument', 'exposure')})
+    references={}
+    for name in ('style','beat'):
+        length=max(1,max(len(x[name+'_ids']) for x in batch))
+        ids=torch.full((len(batch),length),cfg.PAD_ID,dtype=torch.long)
+        for i,x in enumerate(batch):ids[i,:len(x[name+'_ids'])]=x[name+'_ids']
+        references[name+'_ids']=ids
+        references[name+'_attention_mask']=ids.ne(cfg.PAD_ID)
+    return dict(**references,input=inputs,target=targets,task=torch.tensor([x['task'] for x in batch]),data_stats=data_stats,corruption_summary=corruption,**masks,
+        **{k:torch.stack([x[k] for x in batch]) for k in ('genre','multi_hot','strength','style_present','beat_present','stem_instrument','exposure')})
 
 
 def build_dataloader(split, batch_size, distributed=False, config=cfg):

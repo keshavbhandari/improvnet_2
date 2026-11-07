@@ -28,6 +28,20 @@ def response(example):
     return tokens_to_notes([tok.id_to_tok[i] for i in example['target'].tolist() if i >= 0], tok)
 
 
+def reference_checkpoint(tmp_path,kind='style'):
+    from dataclasses import asdict
+    import hashlib
+    from improvnet.metrics.continuity.continuity_model import ContinuityConfig, ContinuityEncoder
+    tok = MelodyTokenizer()
+    enc_config = ContinuityConfig(vocab_size=tok.vocab_size, pad_id=tok.pad_id, embed_dim=32,
+        n_heads=4, n_kv_heads=2, n_layers=1, projection_dim=256, max_length=512, dropout=0.)
+    path = tmp_path/(kind+'.pt')
+    torch.save(dict(format='style_v1' if kind=='style' else 'beat_v1', config=asdict(enc_config),
+        model_state_dict=ContinuityEncoder(enc_config).state_dict(), trained_steps=2,
+        vocabulary_digest=hashlib.sha256(json.dumps(tok.signature()).encode()).hexdigest()), path)
+    return str(path)
+
+
 def corpus(tmp_path, ratio=8, raw_count=12):
     data = tmp_path / 'prepared.jsonl'
     rows = []
@@ -51,7 +65,7 @@ def corpus(tmp_path, ratio=8, raw_count=12):
     config = settings(DATA_FILE=tmp_path/'manifest.json', PREPARED_DATA_FILE=data,
                       CLASSICAL_INDEX=index, PARSED_CACHE=tmp_path/'cache', CLASSICAL_RATIO=ratio, AR_JSONL_FILES=[],
                       RECOVERED_DATA_FILE=tmp_path/'recovered.jsonl', EXTRA_PERFORMANCE_INDEX=None,
-                      DATA_SPLIT_RATIOS={'train':1/3,'validation':1/3,'test':1/3})
+                      DATA_SPLIT_RATIOS={'train':1/3,'validation':1/3,'test':1/3}, STYLE_ENCODER=reference_checkpoint(tmp_path), STYLE_ENCODER_SHA256="fixture", BEAT_ENCODER=reference_checkpoint(tmp_path,kind="beat"), BEAT_ENCODER_SHA256="beat-fixture")
     manifest = build_manifest(config)
     return config, manifest
 

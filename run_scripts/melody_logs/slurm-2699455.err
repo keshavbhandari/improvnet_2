@@ -1,0 +1,130 @@
++ '[' -z '' ']'
++ case "$-" in
++ __lmod_vx=x
++ '[' -n x ']'
++ set +x
+Shell debugging temporarily silenced: export LMOD_SH_DBG_ON=1 for this output (/e/software/default/lmod/8.7.64/init/bash)
+Shell debugging restarted
++ unset __lmod_vx
++ source /e/project1/e-dev-2026d09-047/software/miniforge3/etc/profile.d/conda.sh
+++ export CONDA_EXE=/e/project1/e-dev-2026d09-047/software/miniforge3/bin/conda
+++ CONDA_EXE=/e/project1/e-dev-2026d09-047/software/miniforge3/bin/conda
+++ export _CONDA_EXE=/e/project1/e-dev-2026d09-047/software/miniforge3/bin/conda
+++ _CONDA_EXE=/e/project1/e-dev-2026d09-047/software/miniforge3/bin/conda
+++ export _CE_M=
+++ _CE_M=
+++ export _CE_CONDA=
+++ _CE_CONDA=
+++ export CONDA_PYTHON_EXE=/e/project1/e-dev-2026d09-047/software/miniforge3/bin/python
+++ CONDA_PYTHON_EXE=/e/project1/e-dev-2026d09-047/software/miniforge3/bin/python
+++ export _CONDA_ROOT=/e/project1/e-dev-2026d09-047/software/miniforge3
+++ _CONDA_ROOT=/e/project1/e-dev-2026d09-047/software/miniforge3
+++ '[' -z x ']'
++ conda activate improvnet
++ local cmd=activate
++ case "$cmd" in
++ __conda_activate activate improvnet
++ '[' -n '' ']'
++ local ask_conda
+++ PS1=
+++ __conda_exe shell.posix activate improvnet
+++ '[' -n '' ']'
+++ /e/project1/e-dev-2026d09-047/software/miniforge3/bin/conda shell.posix activate improvnet
++ ask_conda='export _CE_M='\'''\''
+export _CE_CONDA='\'''\''
+PS1='\''(improvnet) '\''
+export PATH='\''/e/project1/e-dev-2026d09-047/envs/improvnet/bin:/e/home/jusers/bhandari1/jupiter/.local/bin:/e/home/jusers/bhandari1/jupiter/.codex/packages/standalone/releases/0.159.0-aarch64-unknown-linux-musl/codex-path:/e/home/jusers/bhandari1/jupiter/.codex/tmp/arg0/codex-arg0nAHj8c:/e/home/jusers/bhandari1/jupiter/.local/bin:/e/home/jusers/bhandari1/jupiter/.local/bin:/e/home/jusers/bhandari1/jupiter/.local/bin:/e/project1/e-dev-2026d09-047/software/miniforge3/condabin:/e/software/default/stages/2026/software/make/4.4.1-GCCcore-14.3.0/bin:/e/software/default/stages/2026/software/binutils/2.44-GCCcore-14.3.0/bin:/e/software/default/stages/2026/software/GCCcore/14.3.0/bin:/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/opt/jsc/bin:/usr/local/jsc/bin:/opt/parastation/bin:/e/software/default/bin:/opt/jsc/bin:/usr/local/jsc/bin:/opt/parastation/bin:/e/software/default/bin:/opt/jsc/bin:/usr/local/jsc/bin:/opt/parastation/bin:/e/software/default/bin'\''
+export CONDA_PREFIX='\''/e/project1/e-dev-2026d09-047/envs/improvnet'\''
+export CONDA_SHLVL='\''1'\''
+export CONDA_DEFAULT_ENV='\''improvnet'\''
+export CONDA_PROMPT_MODIFIER='\''(improvnet) '\''
+export CONDA_EXE='\''/e/project1/e-dev-2026d09-047/software/miniforge3/bin/conda'\''
+export _CONDA_EXE='\''/e/project1/e-dev-2026d09-047/software/miniforge3/bin/conda'\''
+export CONDA_PYTHON_EXE='\''/e/project1/e-dev-2026d09-047/software/miniforge3/bin/python'\''
+export _CONDA_ROOT='\''/e/project1/e-dev-2026d09-047/software/miniforge3'\'''
++ eval 'export _CE_M='\'''\''
+export _CE_CONDA='\'''\''
+PS1='\''(improvnet) '\''
+export PATH='\''/e/project1/e-dev-2026d09-047/envs/improvnet/bin:/e/home/jusers/bhandari1/jupiter/.local/bin:/e/home/jusers/bhandari1/jupiter/.codex/packages/standalone/releases/0.159.0-aarch64-unknown-linux-musl/codex-path:/e/home/jusers/bhandari1/jupiter/.codex/tmp/arg0/codex-arg0nAHj8c:/e/home/jusers/bhandari1/jupiter/.local/bin:/e/home/jusers/bhandari1/jupiter/.local/bin:/e/home/jusers/bhandari1/jupiter/.local/bin:/e/project1/e-dev-2026d09-047/software/miniforge3/condabin:/e/software/default/stages/2026/software/make/4.4.1-GCCcore-14.3.0/bin:/e/software/default/stages/2026/software/binutils/2.44-GCCcore-14.3.0/bin:/e/software/default/stages/2026/software/GCCcore/14.3.0/bin:/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/opt/jsc/bin:/usr/local/jsc/bin:/opt/parastation/bin:/e/software/default/bin:/opt/jsc/bin:/usr/local/jsc/bin:/opt/parastation/bin:/e/software/default/bin:/opt/jsc/bin:/usr/local/jsc/bin:/opt/parastation/bin:/e/software/default/bin'\''
+export CONDA_PREFIX='\''/e/project1/e-dev-2026d09-047/envs/improvnet'\''
+export CONDA_SHLVL='\''1'\''
+export CONDA_DEFAULT_ENV='\''improvnet'\''
+export CONDA_PROMPT_MODIFIER='\''(improvnet) '\''
+export CONDA_EXE='\''/e/project1/e-dev-2026d09-047/software/miniforge3/bin/conda'\''
+export _CONDA_EXE='\''/e/project1/e-dev-2026d09-047/software/miniforge3/bin/conda'\''
+export CONDA_PYTHON_EXE='\''/e/project1/e-dev-2026d09-047/software/miniforge3/bin/python'\''
+export _CONDA_ROOT='\''/e/project1/e-dev-2026d09-047/software/miniforge3'\'''
+++ export _CE_M=
+++ _CE_M=
+++ export _CE_CONDA=
+++ _CE_CONDA=
+++ PS1='(improvnet) '
+++ export PATH=/e/project1/e-dev-2026d09-047/envs/improvnet/bin:/e/home/jusers/bhandari1/jupiter/.local/bin:/e/home/jusers/bhandari1/jupiter/.codex/packages/standalone/releases/0.159.0-aarch64-unknown-linux-musl/codex-path:/e/home/jusers/bhandari1/jupiter/.codex/tmp/arg0/codex-arg0nAHj8c:/e/home/jusers/bhandari1/jupiter/.local/bin:/e/home/jusers/bhandari1/jupiter/.local/bin:/e/home/jusers/bhandari1/jupiter/.local/bin:/e/project1/e-dev-2026d09-047/software/miniforge3/condabin:/e/software/default/stages/2026/software/make/4.4.1-GCCcore-14.3.0/bin:/e/software/default/stages/2026/software/binutils/2.44-GCCcore-14.3.0/bin:/e/software/default/stages/2026/software/GCCcore/14.3.0/bin:/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/opt/jsc/bin:/usr/local/jsc/bin:/opt/parastation/bin:/e/software/default/bin:/opt/jsc/bin:/usr/local/jsc/bin:/opt/parastation/bin:/e/software/default/bin:/opt/jsc/bin:/usr/local/jsc/bin:/opt/parastation/bin:/e/software/default/bin
+++ PATH=/e/project1/e-dev-2026d09-047/envs/improvnet/bin:/e/home/jusers/bhandari1/jupiter/.local/bin:/e/home/jusers/bhandari1/jupiter/.codex/packages/standalone/releases/0.159.0-aarch64-unknown-linux-musl/codex-path:/e/home/jusers/bhandari1/jupiter/.codex/tmp/arg0/codex-arg0nAHj8c:/e/home/jusers/bhandari1/jupiter/.local/bin:/e/home/jusers/bhandari1/jupiter/.local/bin:/e/home/jusers/bhandari1/jupiter/.local/bin:/e/project1/e-dev-2026d09-047/software/miniforge3/condabin:/e/software/default/stages/2026/software/make/4.4.1-GCCcore-14.3.0/bin:/e/software/default/stages/2026/software/binutils/2.44-GCCcore-14.3.0/bin:/e/software/default/stages/2026/software/GCCcore/14.3.0/bin:/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/opt/jsc/bin:/usr/local/jsc/bin:/opt/parastation/bin:/e/software/default/bin:/opt/jsc/bin:/usr/local/jsc/bin:/opt/parastation/bin:/e/software/default/bin:/opt/jsc/bin:/usr/local/jsc/bin:/opt/parastation/bin:/e/software/default/bin
+++ export CONDA_PREFIX=/e/project1/e-dev-2026d09-047/envs/improvnet
+++ CONDA_PREFIX=/e/project1/e-dev-2026d09-047/envs/improvnet
+++ export CONDA_SHLVL=1
+++ CONDA_SHLVL=1
+++ export CONDA_DEFAULT_ENV=improvnet
+++ CONDA_DEFAULT_ENV=improvnet
+++ export 'CONDA_PROMPT_MODIFIER=(improvnet) '
+++ CONDA_PROMPT_MODIFIER='(improvnet) '
+++ export CONDA_EXE=/e/project1/e-dev-2026d09-047/software/miniforge3/bin/conda
+++ CONDA_EXE=/e/project1/e-dev-2026d09-047/software/miniforge3/bin/conda
+++ export _CONDA_EXE=/e/project1/e-dev-2026d09-047/software/miniforge3/bin/conda
+++ _CONDA_EXE=/e/project1/e-dev-2026d09-047/software/miniforge3/bin/conda
+++ export CONDA_PYTHON_EXE=/e/project1/e-dev-2026d09-047/software/miniforge3/bin/python
+++ CONDA_PYTHON_EXE=/e/project1/e-dev-2026d09-047/software/miniforge3/bin/python
+++ export _CONDA_ROOT=/e/project1/e-dev-2026d09-047/software/miniforge3
+++ _CONDA_ROOT=/e/project1/e-dev-2026d09-047/software/miniforge3
++ __conda_hashr
++ '[' -n '' ']'
++ '[' -n '' ']'
++ hash -r
++ cd /e/home/jusers/bhandari1/jupiter/improvnet_melody_contrastive
++ export PYTHONPATH=/e/home/jusers/bhandari1/jupiter/improvnet_melody_contrastive
++ PYTHONPATH=/e/home/jusers/bhandari1/jupiter/improvnet_melody_contrastive
++ export PYTHONUNBUFFERED=1
++ PYTHONUNBUFFERED=1
++ export OMP_NUM_THREADS=1
++ OMP_NUM_THREADS=1
++ export AUTO_RESUBMIT=1
++ AUTO_RESUBMIT=1
++ command -v git
++ CHECKPOINT_REQUEST_FILE=/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v8/.checkpoint-request-2699455
++ export CHECKPOINT_REQUEST_FILE
+++ dirname /e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v8/.checkpoint-request-2699455
++ mkdir -p /e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v8
++ rm -f /e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v8/.checkpoint-request-2699455
++ TRAINING_STEP_PID=
++ trap submit_successor_after_checkpoint USR1
+++ scontrol show hostnames jpbo-059-16
+++ head -n 1
++ MASTER_ADDR=jpbo-059-16
++ MASTER_PORT=39455
++ export MASTER_ADDR MASTER_PORT
++ TRAINING_STEP_PID=1972146
++ wait 1972146
++ srun --unbuffered --ntasks=1 --ntasks-per-node=1 torchrun --nnodes=1 --nproc-per-node=4 --rdzv-id=2699455 --rdzv-backend=c10d --rdzv-endpoint=jpbo-059-16:39455 --module improvnet.model.melody_train
+[W1105 20:17:45.427751525 socket.cpp:764] [c10d] The client socket cannot be initialized to connect to [r59-nod46.jupiter.internal]:39455 (errno: 97 - Address family not supported by protocol).
+[W1105 20:17:45.612391441 socket.cpp:764] [c10d] The client socket cannot be initialized to connect to [r59-nod46.jupiter.internal]:46411 (errno: 97 - Address family not supported by protocol).
+[W1105 20:17:51.967040096 socket.cpp:764] [c10d] The client socket cannot be initialized to connect to [jpbo-059-16.jupiter.internal]:46411 (errno: 97 - Address family not supported by protocol).
+[W1105 20:17:51.967093503 socket.cpp:764] [c10d] The client socket cannot be initialized to connect to [jpbo-059-16.jupiter.internal]:46411 (errno: 97 - Address family not supported by protocol).
+[W1105 20:17:51.967139550 socket.cpp:764] [c10d] The client socket cannot be initialized to connect to [jpbo-059-16-interconnect-1.jupiter.internal]:46411 (errno: 97 - Address family not supported by protocol).
+[W1105 20:17:51.969164398 socket.cpp:764] [c10d] The client socket cannot be initialized to connect to [r59-nod46.jupiter.internal]:46411 (errno: 97 - Address family not supported by protocol).
+/e/project1/e-dev-2026d09-047/envs/improvnet/lib/python3.11/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+[rank2]:[W1106 00:27:33.571277854 CUDACachingAllocator.cpp:3934] memory allocation failed with OOM on device 2 while trying to allocate 1220542464 bytes (free: 246677504, total: 102005473280).
+++ submit_successor_after_checkpoint
+++ trap - USR1
+++ echo 'Slurm time limit is approaching; requesting a synchronized checkpoint.'
+++ touch /e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v8/.checkpoint-request-2699455
+++ [[ -n 1972146 ]]
+++ wait 1972146
+++ rm -f /e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v8/.checkpoint-request-2699455
+++ [[ 1 != 1 ]]
+++ echo 'Checkpoint complete; submitting a successor to job 2699455.'
++++ /usr/bin/sbatch --dependency=afterany:2699455 /e/home/jusers/bhandari1/jupiter/improvnet_melody_contrastive/run_scripts/melody_launch.sh
+++ SUCCESSOR_SUBMISSION='Submitted batch job 2715055'
+++ echo 'Submitted batch job 2715055'
+++ exit 0

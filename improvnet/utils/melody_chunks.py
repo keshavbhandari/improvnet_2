@@ -99,7 +99,7 @@ def validate_lengths(config):
         raise ValueError('Invalid history token cap or probability')
     if not math.isfinite(config.HARMONIZE_EXPANSION) or config.HARMONIZE_EXPANSION < 1:
         raise ValueError('HARMONIZE_EXPANSION must be at least 1')
-    for name in ('POLY_HISTORY_PROB', 'HISTORY_CORRUPTION_PROB', 'RHYTHM_STYLE_PROB',
+    for name in ('POLY_HISTORY_PROB', 'HISTORY_CORRUPTION_PROB', 'REFERENCE_PROB',
                  'STEM_DRUM_PROB', 'AR_MIXTURE_PROB', 'STEM_PITCH_SHIFT_PROB', 'GENERIC_MERGE_PROB',
                  'STEM_PITCH_SHIFT_MIN_PROB', 'STEM_PITCH_CLEAN_PROB', 'HARMONIZE_FULL_MASK_PROB'):
         if not 0 <= getattr(config, name) <= 1:

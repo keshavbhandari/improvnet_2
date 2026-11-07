@@ -25,6 +25,7 @@ from improvnet.utils.ar_utils import (ProcessData, build_optimizer, collect_rng_
                                     load_checkpoint, resume_epoch_loader, save_checkpoint)
 from improvnet.utils.melody_data import build_dataloader,DATA_STAT_NAMES
 from improvnet.utils.melody import TASKS
+from improvnet.model.encoders.runtime import FrozenConditioners, pin_checkpoint
 
 
 def autocast(device):
@@ -37,7 +38,7 @@ def autocast(device):
 def loss_for_batch(model, batch, ignore_index=-100):
     logits = model(target=batch['input'], genre=batch['genre'],
                    multi_hot=batch['multi_hot'], strength=batch['strength'],
-                   style_values=batch['style_values'], style_mask=batch['style_mask'])
+                   style_embedding=batch['style_embedding'], style_mask=batch['style_mask'],beat_embedding=batch.get('beat_embedding'),beat_mask=batch.get('beat_mask'))
     return F.cross_entropy(logits.flatten(0, 1), batch['target'].flatten(), ignore_index=ignore_index)
 
 
@@ -78,7 +79,7 @@ def report_data_stats(stats,split,report):
 
 
 @torch.no_grad()
-def evaluate_validation(model, loader, device, config=cfg, max_batches=100, report=None):
+def evaluate_validation(model, loader, device, config=cfg, max_batches=100, report=None, reference_encoder=None):
     model.eval()
     tasks = getattr(config, 'TASK_NAMES', TASKS)
     # Sums/counts per task avoid comparing losses with different token counts.
@@ -88,12 +89,13 @@ def evaluate_validation(model, loader, device, config=cfg, max_batches=100, repo
     data_stats=torch.zeros(len(DATA_STAT_NAMES),dtype=torch.long,device=device)
     for i, batch in enumerate(islice(loader,max_batches)):
         batch = {k: v.to(device) for k, v in batch.items()}
+        reference_encoder.condition_batch(batch)
         if 'data_stats' in batch:
             data_stats+=batch['data_stats']
         with autocast(device):
             logits = model(target=batch['input'], genre=batch['genre'],
                            multi_hot=batch['multi_hot'], strength=batch['strength'],
-                           style_values=batch['style_values'], style_mask=batch['style_mask'])
+                           style_embedding=batch['style_embedding'], style_mask=batch['style_mask'],beat_embedding=batch.get('beat_embedding'),beat_mask=batch.get('beat_mask'))
             losses = F.cross_entropy(logits.transpose(1, 2), batch['target'],
                                      ignore_index=config.IGNORE_INDEX, reduction='none')
         for task in range(len(tasks)):
@@ -155,14 +157,31 @@ def train(config=cfg, n_steps=None):
         config.RESUME_TRAINING and latest.exists()) else None
     if checkpoint is not None:
         validate_checkpoint(checkpoint)  # Reject incompatible protocols before allocating the model.
+    paths={}
+    for name in ('style','beat'):
+        key=name.upper()+'_ENCODER'
+        path=checkpoint['refinement'][name+'_encoder'] if checkpoint is not None else getattr(config,key)
+        if not Path(path).is_file():raise FileNotFoundError(f'Train the {name} encoder first: {path}')
+        paths[name]=path
+    for name,path in paths.items():
+        pinned=path if checkpoint is not None else pin_checkpoint(path,Path(config.SAVE_DIR)/'encoders'/name)
+        setattr(config,name.upper()+'_ENCODER',pinned)
+    reference_encoder=FrozenConditioners(config.STYLE_ENCODER,config.BEAT_ENCODER,device,
+        style_sha256=checkpoint['refinement']['style_encoder_sha256'] if checkpoint is not None else None,
+        beat_sha256=checkpoint['refinement']['beat_encoder_sha256'] if checkpoint is not None else None)
+    for name in ('style','beat'):
+        encoder=getattr(reference_encoder,name)
+        if encoder.dim!=getattr(config,name.upper()+'_DIM'):raise ValueError(f'{name} encoder dimension differs')
+        setattr(config,name.upper()+'_ENCODER_SHA256',encoder.sha256)
+        if rank==0:report(f'{name} encoder: frozen=True; step={encoder.step}; sha256={encoder.sha256}; checkpoint={encoder.path}')
     train_loader = build_dataloader('train', config.BATCH_SIZE, distributed, config)
     val_loader = build_dataloader('validation', config.BATCH_SIZE, distributed, config)
     if rank == 0:
         report(f'Data: {config.DATA_FILE}; training candidate slots/epoch={len(train_loader.dataset)}, '
               f'validation files={len(val_loader.dataset)}; requested task weights={dict(zip(tasks, config.TASK_WEIGHTS))}')
-        report(f'V5 tasks={tasks}; jazz/blues full file passes={config.JAZZ_BLUES_REPEATS}; '
+        report(f'{config.RUN_NAME} tasks={tasks}; jazz/blues full file passes={config.JAZZ_BLUES_REPEATS}; '
                f'non-jazz candidate pool={config.CLASSICAL_RATIO}x; eligible mixture tasks sampled separately; '
-               f'drum priority={config.STEM_DRUM_PROB:.0%}; kit-only drum sounds={len(DRUM_KIT_PITCHES)}; shared groove controls={config.RHYTHM_STYLE_PROB:.0%}; '
+               f'drum priority={config.STEM_DRUM_PROB:.0%}; kit-only drum sounds={len(DRUM_KIT_PITCHES)}; neighbor-reference visibility={config.REFERENCE_PROB:.0%}; '
                f'history refine/mix={config.HISTORY_PROB:.0%}/{config.POLY_HISTORY_PROB:.0%}; history corruption={config.HISTORY_CORRUPTION_PROB:.0%}; '
                f'refinement=ornaments first + balanced 10%-100% independent edits (5% none); '
                f'pitch error range=+/-{config.PITCH_CORRUPTION_SEMITONES} semitones; '
@@ -187,7 +206,7 @@ def train(config=cfg, n_steps=None):
         initialize_from_ar(model, initial)
         del initial
         if rank == 0:
-            report('Loaded pretrained weights; initialized missing task/style parameters; fresh optimizer.')
+            report('Loaded pretrained weights; initialized missing task/reference parameters; fresh optimizer.')
     model.to(device)
     if distributed:
         model = DDP(model, device_ids=[local_rank] if device.type == 'cuda' else None)
@@ -243,6 +262,7 @@ def train(config=cfg, n_steps=None):
         for batch_idx, batch in enumerate(loader):
             global_sample = consumed + batch_idx * config.BATCH_SIZE * world
             batch = {k: v.to(device) for k, v in batch.items()}
+            reference_encoder.condition_batch(batch)
             data_stats+=batch['data_stats']
             exposures+=batch['exposure'].sum(0)
             corruption_summary+=batch['corruption_summary']
@@ -289,7 +309,7 @@ def train(config=cfg, n_steps=None):
             if validation_due:
                 report(f'Validation starting at step {step}: {len(val_loader.dataset)} files, '
                        f'up to {min(100,len(val_loader))} batches per rank.')
-                metrics = evaluate_validation(model, val_loader, device, config,report=report)
+                metrics = evaluate_validation(model, val_loader, device, config,report=report, reference_encoder=reference_encoder)
                 is_best = metrics['loss'] < best
                 best = min(best, metrics['loss'])
                 if rank == 0:
@@ -337,7 +357,7 @@ if __name__ == '__main__':
     parser.add_argument('--data', type=Path, default=cfg.DATA_FILE)
     parser.add_argument('--save-dir', default=cfg.SAVE_DIR)
     parser.add_argument('--init-checkpoint', type=Path, default=cfg.INIT_CHECKPOINT,
-                        help='Load AR/earlier-refiner weights only when starting a fresh run')
+                        help='Load AR weights only when starting a fresh run')
     parser.add_argument('--steps', type=int, default=cfg.N_STEPS,
                         help='Stop at this update; scheduler horizon remains config N_STEPS')
     args = parser.parse_args()
