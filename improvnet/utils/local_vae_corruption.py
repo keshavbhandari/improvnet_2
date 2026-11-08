@@ -37,7 +37,16 @@ def render_bin(rows, index, frames_per_bin, valid_frames):
     return torch.from_numpy(result)
 
 
-def corrupt_roll_bin(piece, index, config, rng, *, notes=None):
+def semantic_probability(config, step=0, *, training=True):
+    """Rate follows completed optimizer updates; validation always uses the maximum."""
+    maximum = config.SEMANTIC_NOTE_PROB
+    warmup = getattr(config, "SEMANTIC_CORRUPTION_WARMUP_STEPS", 0)
+    if not training or not warmup:
+        return maximum
+    return maximum * min(1., max(0., step / warmup))
+
+
+def corrupt_roll_bin(piece, index, config, rng, *, notes=None, probability=None):
     """Bernoulli-select notes; never force corruption in a sparse/silent bin.
 
     Each eligible note has SEMANTIC_NOTE_PROB chance of one proposed operation,
@@ -55,12 +64,25 @@ def corrupt_roll_bin(piece, index, config, rng, *, notes=None):
     # Include neighbouring attacks that can enter this bin, plus complete carries.
     selected = (notes[:, 2] < stop + max_shift) & (notes[:, 3] > max(0, start - max_shift))
     nearby, outside = notes[selected], notes[~selected]
+    probability = config.SEMANTIC_NOTE_PROB if probability is None else probability
+    if not math.isfinite(probability) or not 0 <= probability <= 1:
+        raise ValueError("Corruption probability must be in [0,1]")
+    cap = getattr(config, "SEMANTIC_MAX_NOTE_FRACTION", None)
+    budget = None
+    order = list(range(len(nearby)))
+    if cap is not None:
+        if not math.isfinite(cap) or not 0 <= cap <= 1:
+            raise ValueError("SEMANTIC_MAX_NOTE_FRACTION must be in [0,1]")
+        visible = int(((nearby[:, 2] < stop) & (nearby[:, 3] > start)).sum())
+        budget = math.floor(cap * visible)
+        # Randomize before imposing the cap, avoiding chronological selection bias.
+        rng.shuffle(order)
     rows = [row.copy() for row in nearby]
     attacks = int(((nearby[:, 2] >= start) & (nearby[:, 2] < stop)).sum())
     operations = tuple(config.SEMANTIC_OPERATION_WEIGHTS)
     weights = tuple(config.SEMANTIC_OPERATION_WEIGHTS.values())
     is_drum = bool(piece.metadata.get("target_is_drum", piece.metadata["target_channel"] == 9))
-    deleted = 0
+    deleted = changed = 0
 
     def overlaps(candidate, except_index=None):
         if np.any((outside[:, 0] == candidate[0]) & (candidate[2] < outside[:, 3]) & (outside[:, 2] < candidate[3])):
@@ -69,8 +91,11 @@ def corrupt_roll_bin(piece, index, config, rng, *, notes=None):
                    other[0] == candidate[0] and candidate[2] < other[3] and other[2] < candidate[3]
                    for j, other in enumerate(rows))
 
-    for i, original in enumerate(nearby):
-        if rng.random() >= config.SEMANTIC_NOTE_PROB:
+    for i in order:
+        if budget is not None and changed >= budget:
+            break
+        original = nearby[i]
+        if rng.random() >= probability:
             continue
         operation = rng.choices(operations, weights=weights)[0]
         if is_drum and operation in ("pitch", "addition"):
@@ -101,6 +126,7 @@ def corrupt_roll_bin(piece, index, config, rng, *, notes=None):
                     continue
                 rows[i] = None
                 deleted += 1
+                changed += 1
                 continue
         elif operation == "addition":
             # The original event survives, so even isolated-note bins retain it.
@@ -113,6 +139,7 @@ def corrupt_roll_bin(piece, index, config, rng, *, notes=None):
             rows.append(candidate)
         else:
             rows[i] = candidate
+        changed += 1
     return render_bin([row for row in rows if row is not None], index, frames, stop - start)
 
 

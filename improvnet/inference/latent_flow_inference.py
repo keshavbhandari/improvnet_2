@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from improvnet.inference.local_vae_inference import Scores, inputs, load_model as load_vae, note_decoding_options, resolve_thresholds, write_report
+from improvnet.inference.local_vae_inference import Scores, inputs, load_model as load_vae, note_decoding_options, resolve_thresholds
 from improvnet.model import latent_flow_config as defaults
 from improvnet.model.latent_flow_model import LatentFlowConfig, LatentFlowModel
 from improvnet.model.local_vae_train import amp_context
@@ -18,6 +18,35 @@ from improvnet.tokenizer.hierarchical import TempoMap, read_performance
 from improvnet.utils.latent_flow import LatentNormalizer, checkpoint_digest, encode_windows, sample
 from improvnet.utils.latent_flow_data import collate_windows, window_tensors
 from improvnet.utils.note_decoding import NoteDecoding, apply_note_decoding, confidence_arrays
+
+
+def configure_note_decoding(vae, vae_sha256, profile_path=None):
+    """Use saved settings or a validated, hash-bound profile without rewriting weights."""
+    calibration = dict(getattr(vae, "decoder_calibration", None) or {})
+    if calibration.get("note_decoding"):
+        vae.note_decoding = NoteDecoding(**calibration["note_decoding"])
+        return "VAE checkpoint"
+    path = Path(profile_path) if profile_path is not None else Path(__file__).with_name("latent_flow_note_decoding.json")
+    profile = None
+    if path.exists():
+        profiles = json.loads(path.read_text())
+        if profiles.get("format") != "latent_flow_note_decoding_v1":
+            raise ValueError("Unknown flow note-decoding profile format")
+        profile = profiles["profiles"].get(vae_sha256)
+    if profile is None:
+        # Missing metadata must not silently re-enable activity-triggered attacks.
+        # Zero gap allowance preserves releases until this VAE is calibrated.
+        activity = calibration.get("activity_threshold", .5)
+        vae.note_decoding = NoteDecoding("held", min(.5, activity), 0)
+        return "held-note fallback (uncalibrated; no gap bridging)"
+    activity, onset = (profile[k] for k in ("activity_threshold", "onset_threshold"))
+    options = NoteDecoding(**profile["note_decoding"])
+    if (not 0 < activity < 1 or not 0 < onset < 1 or options.mode != "held"
+            or options.continuation_threshold > activity):
+        raise ValueError("Invalid calibrated flow note-decoding profile")
+    calibration.update(activity_threshold=activity, onset_threshold=onset, note_decoding=vars(options))
+    vae.decoder_calibration, vae.note_decoding = calibration, options
+    return str(path)
 
 
 def validate_inference_config(model_config, config):
@@ -35,6 +64,10 @@ def validate_inference_config(model_config, config):
     if conflicts:
         raise ValueError("Inference settings differ from the flow matching checkpoint architecture: "
                          + ", ".join(conflicts))
+    if (config.FINE_MS <= 0 or config.COARSE_MS <= 0
+            or config.COARSE_MS % config.FINE_MS
+            or config.COARSE_MS // config.FINE_MS != model_config.frames_per_bin):
+        raise ValueError("Inference COARSE_MS/FINE_MS differ from the flow checkpoint frames_per_bin")
 
 
 def load_model(path, device, *, vae_checkpoint=None, use_ema=True):
@@ -48,13 +81,18 @@ def load_model(path, device, *, vae_checkpoint=None, use_ema=True):
     if checkpoint_digest(vae_path) != state["vae_sha256"]:
         raise ValueError("This stage-2 checkpoint belongs to a different VAE; decoder/latents cannot be mixed")
     vae, tokenizer, vae_step, _ = load_vae(vae_path, device)
+    if (tokenizer.config.coarse_ms, tokenizer.config.fine_ms, tokenizer.config.piano_programs) != (
+            config.COARSE_MS, config.FINE_MS, tuple(config.PIANO_PROGRAMS)):
+        raise ValueError("Flow checkpoint time grid/instrument selection differs from its frozen VAE")
     vae.requires_grad_(False)
+    decoding_source = configure_note_decoding(vae, state["vae_sha256"])
     model = LatentFlowModel(architecture)
     c = model.config
     if tuple(vae.config.latent_shape) != (c.latent_channels, c.latent_pitch, c.latent_time) or vae.config.frames_per_bin != c.frames_per_bin:
         raise ValueError("Stage-2 latent shape differs from its frozen VAE")
     model.load_state_dict(state["ema_state_dict"] if use_ema else state["model_state_dict"], strict=True)
-    info = dict(step=state["step"], vae_step=vae_step, genres=state["genres"], weights="ema" if use_ema else "raw")
+    info = dict(step=state["step"], vae_step=vae_step, genres=state["genres"], weights="ema" if use_ema else "raw",
+                note_decoding_source=decoding_source)
     return model.to(device).eval(), vae, tokenizer, LatentNormalizer(**state["normalizer"]), config, info
 
 
@@ -123,9 +161,11 @@ def diagnostics(reference, vae_baseline, prediction, ids, latent_squared_sum, la
 
 @torch.inference_mode()
 def generate(model, vae, normalizer, piece, config, *, genre=0, task="transfer", prompt_bins=0,
-             max_bins=32, steps=48, strength=1., mode="full", events=None, seed=42,
+             max_bins=32, steps=48, strength=1., mode="full", events=None, seed=None,
              activity_threshold=None, onset_threshold=None, progress=True, note_decoding=None):
     validate_inference_config(model.config, config)
+    if (piece.config.coarse_ms, piece.config.fine_ms) != (config.COARSE_MS, config.FINE_MS):
+        raise ValueError("Input piece time grid differs from the flow checkpoint")
     calibration = getattr(vae, 'decoder_calibration', None) or {}
     activity_threshold = calibration.get('activity_threshold', .5) if activity_threshold is None else activity_threshold
     onset_threshold = calibration.get('onset_threshold', .99) if onset_threshold is None else onset_threshold
@@ -137,7 +177,8 @@ def generate(model, vae, normalizer, piece, config, *, genre=0, task="transfer",
         raise ValueError("Continuation requires a complete-bin prompt and flow strength 1")
     if not 0 < activity_threshold < 1 or not 0 < onset_threshold < 1:
         raise ValueError("Invalid decoder thresholds")
-    if tuple(vae.config.latent_shape) != (model.config.latent_channels, model.config.latent_pitch, model.config.latent_time):
+    if (tuple(vae.config.latent_shape) != (model.config.latent_channels, model.config.latent_pitch, model.config.latent_time)
+            or vae.config.frames_per_bin != model.config.frames_per_bin):
         raise ValueError("VAE/model shape mismatch")
     length = prompt_bins + max_bins if task == "continue" else min(len(piece.velocity), prompt_bins + max_bins)
     reference = resize_piece(piece, length, extend=task == "continue")
@@ -157,7 +198,7 @@ def generate(model, vae, normalizer, piece, config, *, genre=0, task="transfer",
 
     output_confidence, baseline_confidence = (new_confidence(), new_confidence()) if options.mode == "held" else (None, None)
     device = next(model.parameters()).device
-    generator = torch.Generator(device=device).manual_seed(seed)
+    generator = None if seed is None else torch.Generator(device=device).manual_seed(seed)
     # Prior target history is reused as latents, not decoded/re-encoded every window.
     # This avoids accumulating an extra VAE round-trip error at each boundary.
     committed = {}
@@ -236,6 +277,12 @@ def generate(model, vae, normalizer, piece, config, *, genre=0, task="transfer",
         tokens_per_bin=int(np.prod(model.config.spatial_grid)),
         tokens_per_window=int(model.config.bins * np.prod(model.config.spatial_grid)))
     report["note_decoding"] = vars(options)
+    report["time_grid"] = dict(bin_ms=piece.config.coarse_ms, fine_ms=piece.config.fine_ms,
+        frames_per_bin=piece.config.frames_per_bin,
+        history_seconds=config.HISTORY_BINS * piece.config.coarse_ms / 1000,
+        target_window_seconds=config.TARGET_BINS * piece.config.coarse_ms / 1000,
+        prompt_seconds=int(reference.valid_mask[:prompt_bins].sum()) * piece.config.fine_ms / 1000,
+        generated_seconds=int(reference.valid_mask[prompt_bins:].sum()) * piece.config.fine_ms / 1000)
     report["accompaniment"] = dict(mode=mode, max_tracks=config.MAX_ACCOMPANIMENT_TRACKS,
         event_budget=config.MAX_ACCOMPANIMENT_EVENTS, max_tracks_used=max(b["tracks"] for b in blocks),
         omitted_events=sum(b["dropped_events"] for b in blocks))
@@ -245,7 +292,7 @@ def generate(model, vae, normalizer, piece, config, *, genre=0, task="transfer",
         jittered = deepcopy(reference)
         jitter_confidence = new_confidence() if options.mode == "held" else None
         alpha = report["latent_nrmse_vs_source"]
-        jitter_generator = torch.Generator(device=device).manual_seed(seed + 100003)
+        jitter_generator = None if seed is None else torch.Generator(device=device).manual_seed(seed + 100003)
         for offset in range(0, len(ids), config.VAE_BATCH_SIZE):
             selected = ids[offset:offset + config.VAE_BATCH_SIZE]
             with amp_context(device):
@@ -268,46 +315,52 @@ def generate(model, vae, normalizer, piece, config, *, genre=0, task="transfer",
     return output, baseline, reference, report
 
 
-def main(argv=None):
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, default=Path(defaults.SAVE_DIR) / "latest_checkpoint.pt")
-    parser.add_argument("--vae-checkpoint", type=Path)
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--task", choices=("transfer", "reconstruct", "continue"), default="transfer")
     parser.add_argument("--genre", default="jazz", help="Known training genre, or 'none' for unconditioned")
-    parser.add_argument("--prompt-bins", type=int, default=0)
-    parser.add_argument("--max-bins", type=int, default=32, help="Generated bins, excluding the preserved prompt")
-    parser.add_argument("--passes", type=int, default=48)
-    parser.add_argument("--strength", type=float, default=1.)
-    parser.add_argument("--accompaniment-mode", choices=("full", "rhythm", "none"), default="rhythm")
+    parser.add_argument("--prompt-bins", type=int, default=0, help="Preserved source bins; required for continue. One bin is 1.28 s for the new VAE (older checkpoints retain their saved clock)")
+    parser.add_argument("--max-bins", type=int, default=32, help="Maximum generated bins, excluding the prompt; 32 bins = 40.96 s with the new VAE")
+    parser.add_argument("--passes", type=int, default=48, help="Flow solver steps (default: 48)")
+    parser.add_argument("--strength", type=float, default=1., help="Amount of change in (0,1]; continuation requires 1")
+    parser.add_argument("--accompaniment-mode", choices=("full", "rhythm", "none"), default="rhythm",
+                        help="Reference note events, rhythm only, or no accompaniment guidance (default: rhythm)")
     parser.add_argument("--accompaniment-midi", type=Path, help="Optional external conditioning MIDI; not mixed into output")
-    parser.add_argument("--reference-time-scale", type=float, default=1., help="Explicit external rhythm/tempo alignment")
-    parser.add_argument("--reference-offset-seconds", type=float, default=0.)
-    parser.add_argument("--target-channel", type=int)
-    parser.add_argument("--target-program", type=int)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--activity-threshold", type=float, help="Override VAE checkpoint calibration")
-    parser.add_argument("--onset-threshold", type=float, help="Override VAE checkpoint calibration")
-    parser.add_argument("--note-decoding", choices=("legacy", "held"), help="Override saved MIDI note assembly")
-    parser.add_argument("--continuation-threshold", type=float)
-    parser.add_argument("--max-gap-ms", type=int)
-    parser.add_argument("--raw-weights", action="store_true", help="Use raw rather than EMA stage-2 weights")
+    advanced = parser.add_argument_group("Optional reference alignment and instrument selection")
+    advanced.add_argument("--reference-time-scale", type=float, default=1., help="Multiply external reference note times; no automatic beat alignment")
+    advanced.add_argument("--reference-offset-seconds", type=float, default=0.)
+    advanced.add_argument("--target-channel", type=int, help="Override automatic instrument selection (MIDI channel 0–15)")
+    advanced.add_argument("--target-program", type=int, help="GM program 0–127; requires --target-channel")
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
     args = parser.parse_args(argv)
-    if args.output_dir and args.output_dir.exists() and any(args.output_dir.iterdir()):
-        parser.error("Choose an empty/new output directory; existing artifacts are never overwritten")
-    device = torch.device(args.device)
-    model, vae, tokenizer, normalizer, config, info = load_model(args.checkpoint, device,
-        vae_checkpoint=args.vae_checkpoint, use_ema=not args.raw_weights)
-    resolve_thresholds(args, vae)
+    if args.max_bins < 1 or args.prompt_bins < 0 or args.passes < 1 or not 0 < args.strength <= 1:
+        parser.error("Lengths/passes must be positive, prompt nonnegative, and strength in (0,1]")
+    if args.task == "continue" and (args.prompt_bins < 1 or args.strength != 1):
+        parser.error("Continuation requires --prompt-bins greater than zero and --strength 1")
+    if args.accompaniment_midi and args.accompaniment_mode == "none":
+        parser.error("An accompaniment MIDI requires --accompaniment-mode rhythm or full")
+    if not args.accompaniment_midi and (args.reference_time_scale != 1 or args.reference_offset_seconds != 0):
+        parser.error("Reference alignment requires --accompaniment-midi")
+    if args.target_program is not None and args.target_channel is None:
+        parser.error("--target-program requires --target-channel")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, vae, tokenizer, normalizer, config, info = load_model(args.checkpoint, device)
+    decoding = SimpleNamespace(activity_threshold=None, onset_threshold=None)
+    resolve_thresholds(decoding, vae)
     if args.genre.lower() == "none":
         genre = 0
     elif args.genre.lower() in info["genres"]:
         genre = info["genres"].index(args.genre.lower())
     else:
         parser.error(f"Unknown genre {args.genre!r}; available={info['genres'][1:]}")
-    piece = tokenizer.encode(args.input, recover=True, seed=args.seed,
+    piece = tokenizer.encode(args.input, recover=True,
         target_channel=args.target_channel, target_program=args.target_program)
     if not piece.metadata["target_present"]:
         raise ValueError("No source target notes")
@@ -315,9 +368,9 @@ def main(argv=None):
         time_scale=args.reference_time_scale, offset_seconds=args.reference_offset_seconds) if args.accompaniment_midi else None
     output, baseline, reference, report = generate(model, vae, normalizer, piece, config, genre=genre,
         task=args.task, prompt_bins=args.prompt_bins, max_bins=args.max_bins, steps=args.passes,
-        strength=args.strength, mode=args.accompaniment_mode, events=events, seed=args.seed,
-        activity_threshold=args.activity_threshold, onset_threshold=args.onset_threshold,
-        note_decoding=note_decoding_options(args))
+        strength=args.strength, mode=args.accompaniment_mode, events=events,
+        activity_threshold=decoding.activity_threshold, onset_threshold=decoding.onset_threshold,
+        note_decoding=note_decoding_options(decoding))
     if args.output_dir is None:
         root = Path(defaults.EVALUATION_DIR); root.mkdir(parents=True, exist_ok=True)
         directory = Path(tempfile.mkdtemp(prefix="single-", dir=root))
@@ -331,8 +384,10 @@ def main(argv=None):
         genre=args.genre, target_program=piece.metadata["target_program"], is_drum=piece.metadata["target_is_drum"],
         prompt_bins=args.prompt_bins, generated_bins=len(output.velocity) - args.prompt_bins,
         passes=args.passes, strength=args.strength,
+        device=str(device), thresholds=dict(activity=decoding.activity_threshold, onset=decoding.onset_threshold),
+        note_decoding_source=info.get("note_decoding_source"),
         external_accompaniment=bool(args.accompaniment_midi), **report)
-    write_report(directory / "report.json", report)
+    (directory / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     print(json.dumps(report, allow_nan=False))
     print(f"Saved MIDI and concise report: {directory}")
     return report

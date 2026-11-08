@@ -1,5 +1,5 @@
 """Synthetic stage-2 tests; no real training or saved-checkpoint changes."""
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
 from dataclasses import asdict
 import io
@@ -23,7 +23,7 @@ from improvnet.utils.latent_flow import (LatentNormalizer, checkpoint_digest, cl
     encode_windows, flow_target, sample, weighted_loss)
 from improvnet.utils.latent_flow_data import (LatentFlowDataset, accompaniment, collate_windows,
     genre_labels, transpose_window, window_tensors)
-from improvnet.inference.latent_flow_inference import generate, load_model, reference_events, resize_piece
+from improvnet.inference.latent_flow_inference import build_parser, configure_note_decoding, generate, load_model, main, reference_events, resize_piece
 from improvnet.utils.note_decoding import NoteDecoding
 
 
@@ -47,7 +47,8 @@ def midi():
 
 def config(**kwargs):
     values = {k: v for k, v in vars(defaults).items() if k.isupper()}
-    values.update(HISTORY_BINS=1, TARGET_BINS=2, D_MODEL=32, N_LAYERS=2, N_HEADS=4,
+    values.update(COARSE_MS=1000, FINE_MS=10, RHYTHM_FRAMES_PER_TOKEN=10,
+        HISTORY_BINS=1, TARGET_BINS=2, D_MODEL=32, N_LAYERS=2, N_HEADS=4,
         PATCH_PITCH=4, PATCH_TIME=5, NUM_WORKERS=0, VAE_BATCH_SIZE=2,
         MAX_ACCOMPANIMENT_EVENTS=8, LATENT_CALIBRATION_SAMPLES=2, SAMPLES_PER_EPOCH=8,
         VALIDATION_SAMPLES=4, PITCH_AUGMENTATION=False, ARIA_METADATA=None,
@@ -368,6 +369,59 @@ class Stage2Tests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, name):
                 generate(model, vae, norm, piece, other, progress=False)
 
+    def test_128_frame_vector_training_reload_and_continuation(self):
+        c = config(COARSE_MS=1280, RHYTHM_FRAMES_PER_TOKEN=8, PATCH_PITCH=1, PATCH_TIME=1)
+        tokenizer = HierarchicalTokenizer(GridConfig(coarse_ms=1280, fine_ms=10))
+        piece = tokenizer.encode(midi())
+        vae = LocalVAE(LocalVAEConfig(frames_per_bin=128, base_channels=4, res_blocks=1,
+            latent_layout="vector", latent_channels=512)).eval().requires_grad_(False)
+        model = LatentFlowModel(model_config(c, vae, ("<unconditioned>", "classical", "jazz")))
+        norm = LatentNormalizer(torch.zeros(512), torch.ones(512))
+        for mode in ("full", "rhythm", "none"):
+            with self.subTest(mode=mode):
+                item = window_tensors(piece, 1, c, mode=mode)
+                item["retries"] = torch.tensor(0)
+                batch = collate_windows([item])
+                loss, stats = batch_objective(model, vae, norm, batch, c)
+                loss.backward()
+                self.assertTrue(torch.isfinite(loss) and torch.isfinite(stats).all())
+                self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters()))
+                self.assertTrue(all(p.grad is None for p in vae.parameters()))
+                model.zero_grad(set_to_none=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); vae_path = root / "vae.pt"; checkpoint = root / "flow.pt"
+            torch.save(dict(format="local_vae_training_v1", model_config=asdict(vae.config),
+                model_state_dict=vae.state_dict(), step=100, train_config=dict(COARSE_MS=1280,
+                FINE_MS=10, PIANO_PROGRAMS=tuple(range(8)), MAX_FRAMES=360000)), vae_path)
+            c.VAE_CHECKPOINT = str(vae_path)
+            state = dict(format="latent_flow_training_v1", model_config=asdict(model.config),
+                train_config=vars(c).copy(), genres=["<unconditioned>", "classical", "jazz"],
+                model_state_dict=model.state_dict(), ema_state_dict=model.state_dict(),
+                normalizer=norm.state_dict(), vae_sha256=checkpoint_digest(vae_path), step=7)
+            torch.save(state, checkpoint)
+            loaded, frozen, restored_tokenizer, normalizer, saved, _ = load_model(checkpoint, torch.device("cpu"))
+            self.assertEqual(restored_tokenizer.config.coarse_ms, 1280)
+            prompt = resize_piece(piece, 1)
+            output, _, reference, report = generate(loaded, frozen, normalizer, prompt, saved,
+                task="continue", prompt_bins=1, max_bins=3, steps=2, mode="rhythm", progress=False)
+            self.assertEqual(output.velocity.shape, (4, 128, 128))
+            self.assertTrue(output.valid_mask.all())
+            np.testing.assert_array_equal(output.velocity[0], prompt.velocity[0])
+            self.assertEqual(report["time_grid"]["prompt_seconds"], 1.28)
+            self.assertEqual(report["time_grid"]["generated_seconds"], 3.84)
+            self.assertEqual(report["flow_architecture"]["tokens_per_bin"], 1)
+            self.assertAlmostEqual(restored_tokenizer.decode(reference).length, 5.12)
+            restored_tokenizer.decode(output).save(root / "generated.mid")
+            self.assertTrue(mido.MidiFile(root / "generated.mid").tracks)
+            events = reference_events(root / "generated.mid", restored_tokenizer.config)
+            self.assertTrue(((events[:, 8] * 128 + events[:, 9]) <= 512).all())
+            with self.assertRaisesRegex(ValueError, "Input piece time grid"):
+                generate(loaded, frozen, normalizer, HierarchicalTokenizer().encode(midi()), saved, progress=False)
+            state["train_config"].update(COARSE_MS=640, FINE_MS=5)  # Same frame count, different clock.
+            torch.save(state, checkpoint)
+            with self.assertRaisesRegex(ValueError, "time grid"):
+                load_model(checkpoint, torch.device("cpu"))
+
     def test_current_unit_patch_checkpoint_ignores_live_architecture_defaults(self):
         c, vae, _, _, model, norm = fixture(latent_channels=4, HISTORY_BINS=8, TARGET_BINS=32,
             PATCH_PITCH=1, PATCH_TIME=1, N_LAYERS=16)
@@ -464,6 +518,137 @@ class Stage2Tests(unittest.TestCase):
                     torch.testing.assert_close(first[key], second[key])
             self.assertTrue(first["valid_mask"][c.HISTORY_BINS:].any())
             dataset.connection.close()
+
+
+class InferenceCLITests(unittest.TestCase):
+    def test_missing_note_metadata_uses_held_without_gap_bridging(self):
+        vae = SimpleNamespace(decoder_calibration=dict(activity_threshold=.3))
+        with tempfile.TemporaryDirectory() as tmp:
+            source = configure_note_decoding(vae, "unmatched", Path(tmp) / "missing.json")
+        self.assertIn("uncalibrated", source)
+        self.assertEqual(vae.note_decoding, NoteDecoding("held", .3, 0))
+
+    def test_calibrated_profile_is_bound_to_exact_vae(self):
+        import json
+        profile = dict(activity_threshold=.9, onset_threshold=.985,
+                       note_decoding=dict(mode="held", continuation_threshold=.85, max_gap_ms=20))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "profile.json"
+            path.write_text(json.dumps(dict(format="latent_flow_note_decoding_v1", profiles={"correct": profile})))
+            vae = SimpleNamespace(decoder_calibration=dict(activity_threshold=.5, onset_threshold=.99))
+            self.assertEqual(configure_note_decoding(vae, "correct", path), str(path))
+            self.assertEqual(vae.note_decoding, NoteDecoding("held", .85, 20))
+            self.assertEqual(vae.decoder_calibration["activity_threshold"], .9)
+            other = SimpleNamespace(decoder_calibration=None)
+            self.assertIn("uncalibrated", configure_note_decoding(other, "different", path))
+            self.assertEqual(other.note_decoding.max_gap_ms, 0)
+            profile["note_decoding"]["continuation_threshold"] = .95
+            path.write_text(json.dumps(dict(format="latent_flow_note_decoding_v1", profiles={"correct": profile})))
+            with self.assertRaisesRegex(ValueError, "Invalid calibrated"):
+                configure_note_decoding(SimpleNamespace(decoder_calibration=None), "correct", path)
+
+    def test_explicit_saved_decoding_is_preserved(self):
+        saved = dict(mode="held", continuation_threshold=.7, max_gap_ms=10)
+        vae = SimpleNamespace(decoder_calibration=dict(note_decoding=saved))
+        self.assertEqual(configure_note_decoding(vae, "any"), "VAE checkpoint")
+        self.assertEqual(vars(vae.note_decoding), saved)
+
+    def test_removed_tuning_flags_are_not_exposed(self):
+        for flag, value in (("--seed", "42"), ("--device", "cpu"),
+                            ("--activity-threshold", ".9"), ("--onset-threshold", ".985"),
+                            ("--note-decoding", "held"), ("--continuation-threshold", ".5"),
+                            ("--max-gap-ms", "20"), ("--raw-weights", None), ("--vae-checkpoint", "vae.pt")):
+            arguments = ["--input", "piece.mid", flag] + ([] if value is None else [value])
+            with self.subTest(flag=flag), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                build_parser().parse_args(arguments)
+
+    def test_invalid_combinations_fail_before_checkpoint_load(self):
+        for extra in (["--task", "continue"], ["--passes", "0"], ["--strength", "nan"],
+                      ["--reference-offset-seconds", "1"], ["--target-program", "0"],
+                      ["--accompaniment-midi", "ref.mid", "--accompaniment-mode", "none"]):
+            with self.subTest(extra=extra), patch("improvnet.inference.latent_flow_inference.load_model") as load:
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    main(["--input", "piece.mid", *extra])
+                load.assert_not_called()
+
+    def test_auto_device_calibration_and_reference_modes(self):
+        c, vae, piece, _, model, normalizer = fixture()
+        vae.decoder_calibration = dict(activity_threshold=.9, onset_threshold=.985)
+        vae.note_decoding = NoteDecoding("held", .4, 10)
+        info = dict(step=7, vae_step=35, genres=["<unconditioned>", "classical", "jazz"], weights="ema")
+        prefix = "improvnet.inference.latent_flow_inference."
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); source = root / "source.mid"; midi().save(source)
+            for cuda, mode in ((False, "none"), (True, "rhythm"), (False, "full")):
+                directory = root / mode
+                directory.mkdir()
+                outputs = ("reference_target.mid", "vae_reconstruction.mid", "generated_target.mid", "generated_source_mix.mid")
+                for name in outputs:
+                    (directory / name).write_bytes(b"old output")
+                (directory / "report.json").write_text("old report" * 1000)
+                (directory / "notes.txt").write_text("Keep this file")
+                arguments = ["--input", str(source), "--output-dir", str(directory), "--accompaniment-mode", mode]
+                if mode != "none":
+                    arguments += ["--accompaniment-midi", str(source)]
+                with self.subTest(mode=mode), patch(prefix + "torch.cuda.is_available", return_value=cuda), \
+                     patch(prefix + "load_model", return_value=(model, vae, HierarchicalTokenizer(), normalizer, c, info)) as load, \
+                     patch(prefix + "generate", return_value=(piece, piece, piece, {})) as generation, \
+                     redirect_stdout(io.StringIO()):
+                    report = main(arguments)
+                self.assertEqual(str(load.call_args.args[1]), "cuda" if cuda else "cpu")
+                self.assertEqual(load.call_args.kwargs, {})  # Pinned VAE and EMA defaults.
+                options = generation.call_args.kwargs
+                self.assertNotIn("seed", options)
+                self.assertEqual((options["activity_threshold"], options["onset_threshold"]), (.9, .985))
+                self.assertEqual(options["note_decoding"], vae.note_decoding)
+                self.assertEqual(options["events"] is None, mode == "none")
+                self.assertEqual(report["thresholds"], dict(activity=.9, onset=.985))
+                self.assertTrue((directory / "generated_target.mid").is_file())
+                self.assertTrue((directory / "report.json").is_file())
+                for name in outputs:
+                    self.assertTrue(mido.MidiFile(directory / name).tracks)
+                import json
+                self.assertEqual(json.loads((directory / "report.json").read_text())["step"], 7)
+                self.assertEqual((directory / "notes.txt").read_text(), "Keep this file")
+
+
+class DiagnosticTests(unittest.TestCase):
+    def test_reconstruction_uses_source_genre_or_unconditioned(self):
+        from improvnet.inference.latent_flow_diagnostics import conditioning_genre
+        labels = ["<unconditioned>", "classical", "jazz"]
+        self.assertEqual(conditioning_genre(["jazz"], labels), "jazz")
+        self.assertEqual(conditioning_genre(["classical"], labels), "classical")
+        self.assertEqual(conditioning_genre(["unknown"], labels), "none")
+        self.assertEqual(conditioning_genre([], labels), "none")
+
+    def test_cropped_window_retains_frames_and_resets_midi_clock(self):
+        from improvnet.inference.latent_flow_diagnostics import crop_piece
+        _, _, piece, _, _, _ = fixture()
+        clipped = crop_piece(piece, 1, 2)
+        np.testing.assert_array_equal(clipped.velocity, piece.velocity[1:3])
+        np.testing.assert_array_equal(clipped.onset, piece.onset[1:3])
+        self.assertEqual(clipped.metadata["tempo_map"], [(0, 500000)])
+        self.assertEqual(len(clipped.events), 0)
+        self.assertTrue(HierarchicalTokenizer().decode(clipped, target_only=True).tracks)
+
+    def test_extra_categories_separate_fragmentation_and_pitch(self):
+        from improvnet.inference.latent_flow_diagnostics import decode_prediction, measure
+        _, _, piece, _, _, _ = fixture()
+        piece = resize_piece(piece, 1)
+        piece.velocity[:] = 0; piece.onset[:] = 0
+        piece.velocity[0, 60, 10:80] = 80; piece.onset[0, 60, 10] = 1
+        piece.refresh_coarse()
+        confidence = dict(activity=(piece.velocity > 0).astype(np.float32),
+                          onset=piece.onset.astype(np.float32), velocity=np.ones_like(piece.velocity, dtype=np.float32) * .6)
+        confidence["activity"][0, 60, 30:32] = 0
+        confidence["activity"][0, 61, 50:55] = 1; confidence["onset"][0, 61, 50] = 1
+        legacy = decode_prediction(piece, confidence, piece.pedal, .9, .985, NoteDecoding())
+        held = decode_prediction(piece, confidence, piece.pedal, .9, .985, NoteDecoding("held", .85, 20))
+        for prediction, extras, activity_only in ((legacy, 2, 1), (held, 1, 0)):
+            _, metrics = measure(piece, prediction)
+            self.assertEqual(metrics["extra_notes"], extras)
+            self.assertEqual(metrics["extra_categories"]["activity_only"], activity_only)
+            self.assertEqual(metrics["extra_categories"]["off_reference_pitch"], 1)
 
 
 if __name__ == "__main__":

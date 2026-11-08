@@ -310,6 +310,9 @@ def main(argv=None):
     tokenizer.decode(predicted, target_only=True).save(output / "reconstructed_target.mid")
     tokenizer.decode(predicted).save(output / "reconstructed.mid")
     report = dict(input=str(args.input.resolve()), checkpoint=str(args.checkpoint.resolve()), step=step, bins=len(piece.velocity),
+                  time_grid=dict(bin_ms=piece.config.coarse_ms, fine_ms=piece.config.fine_ms,
+                                 frames_per_bin=piece.config.frames_per_bin,
+                                 duration_seconds=piece.n_frames * piece.config.fine_ms / 1000),
                   target=dict(channel=piece.metadata["target_channel"], program=piece.metadata["target_program"]),
                   posterior="sample" if args.sample else "mean", seed=args.seed,
                   note_decoding=vars(note_decoding_options(args)),

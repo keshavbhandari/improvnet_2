@@ -51,12 +51,14 @@ def midi(notes, programs=None, pedal=()):
 def config(**values):
     c = {k: v for k, v in vars(defaults).items() if k.isupper()}
     c.update(BASE_CHANNELS=4, CHANNEL_MULTIPLIERS=(1, 2), LATENT_CHANNELS=2, RES_BLOCKS=1,
-             LATENT_LAYOUT="spatial",
+             LATENT_LAYOUT="spatial", COARSE_MS=1000, FINE_MS=10,
+             SEMANTIC_CORRUPTION_WARMUP_STEPS=0, SEMANTIC_NOTE_PROB=.10,
              NUM_WORKERS=0, SAMPLES_PER_EPOCH=4, VALIDATION_SAMPLES=4, BATCH_SIZE=2,
              VALIDATION_BATCH_SIZE=2, ACCUM_STEPS=2, N_STEPS=4, LR=1e-3, MIN_LR=1e-4,
              WARMUP_STEPS=1, KL_WARMUP_STEPS=2, LOG_EVERY=1, VALIDATE_EVERY=2,
              SAVE_EVERY=1, MAX_VALIDATION_BATCHES=2, ARIA_METADATA=None, GIGAMIDI_METADATA=None,
              DATA_SPLIT_RATIOS={"train": .7, "validation": .3, "test": 0.}, LOG_DATA_ERRORS=True)
+    c.pop("SEMANTIC_MAX_NOTE_FRACTION", None)  # Legacy fixtures test the uncapped recipe.
     c.update(values)
     return SimpleNamespace(**c)
 
@@ -112,6 +114,13 @@ def ddp_train_check(rank, c, port):
     with patch.dict(os.environ, RANK=str(rank), WORLD_SIZE="2", LOCAL_RANK=str(rank),
                     MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port)), redirect_stdout(io.StringIO()):
         train(c, force_cpu=True)
+
+
+def ddp_continue_check(rank, c, port, checkpoint):
+    torch.set_num_threads(1)
+    with patch.dict(os.environ, RANK=str(rank), WORLD_SIZE="2", LOCAL_RANK=str(rank),
+                    MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port)), redirect_stdout(io.StringIO()):
+        train(c, force_cpu=True, continue_from=checkpoint)
 
 
 class ModelTests(unittest.TestCase):
@@ -681,6 +690,33 @@ class TrainingTests(unittest.TestCase):
                 torch.testing.assert_close(actual["model_state_dict"][key], expected["model_state_dict"][key], rtol=0, atol=0)
             self.assertTrue((Path(c.SAVE_DIR) / "tensorboard").is_dir())
 
+    def test_128_frame_scheduled_corruption_exact_resume_with_workers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); c = fixture(root)
+            for i, path in enumerate(sorted((root / "classical").glob("*.mid"))):
+                midi([(0, 48 + j * 2, 60 + i, .1 + j * .03, .7 + j * .03) for j in range(8)]).save(path)
+            c.INDEX_PATH = str(root / "scheduled.sqlite")
+            c.COARSE_MS = 1280; c.LATENT_LAYOUT = "vector"; c.LATENT_CHANNELS = 512
+            c.SEMANTIC_NOTE_PROB = .25; c.SEMANTIC_MAX_NOTE_FRACTION = .25
+            c.SEMANTIC_CORRUPTION_WARMUP_STEPS = 2
+            c.NUM_WORKERS = 2; c.PREFETCH_FACTOR = 1
+            with redirect_stdout(io.StringIO()):
+                build_midi_index(c); train(c, force_cpu=True)
+            expected = torch.load(Path(c.SAVE_DIR) / "latest_checkpoint.pt", weights_only=False)
+            c.SAVE_DIR = str(root / "resumed128")
+            request = root / "request128"; request.touch()
+            with patch.dict(os.environ, CHECKPOINT_REQUEST_FILE=str(request)), redirect_stdout(io.StringIO()):
+                train(c, force_cpu=True)
+            request.unlink()
+            with redirect_stdout(io.StringIO()):
+                train(c, force_cpu=True)
+            actual = torch.load(Path(c.SAVE_DIR) / "latest_checkpoint.pt", weights_only=False)
+            self.assertEqual(actual["step"], 4)
+            self.assertEqual(actual["next_batch"], expected["next_batch"])
+            self.assertEqual(actual["scheduler_state_dict"], expected["scheduler_state_dict"])
+            for key in actual["model_state_dict"]:
+                torch.testing.assert_close(actual["model_state_dict"][key], expected["model_state_dict"][key], rtol=0, atol=0)
+
     def test_training_wont_overwrite_unrelated_checkpoints(self):
         with tempfile.TemporaryDirectory() as tmp:
             c = fixture(Path(tmp))
@@ -692,6 +728,35 @@ class TrainingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unrelated"):
                 train(c, force_cpu=True)
             self.assertEqual(before, path.read_bytes())
+
+    def test_in_place_continuation_changes_world_and_index_once_and_retains_optimizer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); c = fixture(root)
+            c.N_STEPS, c.SAMPLES_PER_EPOCH, c.ACCUM_STEPS = 3, 8, 1
+            request = root / "checkpoint_request"; request.touch()
+            with patch.dict(os.environ, CHECKPOINT_REQUEST_FILE=str(request)), redirect_stdout(io.StringIO()):
+                train(c, force_cpu=True)
+            request.unlink()
+            checkpoint = Path(c.SAVE_DIR) / "latest_checkpoint.pt"
+            before = checkpoint.read_bytes()
+            old = torch.load(checkpoint, weights_only=False)
+            self.assertEqual((old["step"], old["world_size"]), (1, 1))
+            stat = Path(c.INDEX_PATH).stat()
+            os.utime(c.INDEX_PATH, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1000000000))
+            with self.assertRaisesRegex(ValueError, "MIDI index changed"), redirect_stdout(io.StringIO()):
+                train(c, force_cpu=True)
+            self.assertEqual(before, checkpoint.read_bytes())
+            for _ in range(2):  # Migration first, exact successor resume second.
+                with socket.socket() as sock:
+                    sock.bind(("127.0.0.1", 0)); port = sock.getsockname()[1]
+                mp.spawn(ddp_continue_check, args=(c, port, str(checkpoint)), nprocs=2, join=True)
+                state = torch.load(checkpoint, weights_only=False)
+                self.assertEqual((state["step"], state["world_size"]), (3, 2))
+                self.assertEqual(len(state["rng"]), 2)
+                self.assertEqual(state["index_identity"]["mtime_ns"], Path(c.INDEX_PATH).stat().st_mtime_ns)
+                self.assertEqual(state["scheduler_state_dict"]["last_epoch"], 3)
+                self.assertTrue(all(int(v["step"]) == 3 for v in state["optimizer_state_dict"]["state"].values()))
+                self.assertEqual(state["train_config"]["SAVE_DIR"], c.SAVE_DIR)
 
     def test_opt_in_resume_keeps_optimizer_and_step_after_batch_and_pool_change(self):
         with tempfile.TemporaryDirectory() as tmp:

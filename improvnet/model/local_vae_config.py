@@ -17,12 +17,12 @@ INDEX_PATH = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/local_v
 # Checkpoints: vae/<run>/; logs: vae/tensorboard/<run>/.
 RUNS_DIR = "/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/vae"
 TENSORBOARD_ROOT = RUNS_DIR + "/tensorboard"
-RUN_NAME = "vae176_vector512"
+RUN_NAME = "vae176_vector512_128f_corrupt25"
 SAVE_DIR = RUNS_DIR + "/" + RUN_NAME
 DATA_SPLIT_SEED = 42
 DATA_SPLIT_RATIOS = {"train": .97, "validation": .02, "test": .01}
 
-COARSE_MS = 1000
+COARSE_MS = 1280
 FINE_MS = 10
 PIANO_PROGRAMS = tuple(range(8))
 MAX_FRAMES = 360000
@@ -30,7 +30,7 @@ MAX_FRAMES = 360000
 BASE_CHANNELS = 176
 CHANNEL_MULTIPLIERS = (1, 2, 4)
 LATENT_LAYOUT = "vector"
-LATENT_CHANNELS = 512  # Vector width; stored as [512,1,1], one vector per second.
+LATENT_CHANNELS = 512  # Vector width; stored as [512,1,1], one vector per 1.28 s bin.
 VECTOR_PROJECTION_CHANNELS = 4  # Internal grid features, not additional latent codes.
 RES_BLOCKS = 2
 
@@ -46,9 +46,10 @@ PITCH_SHIFT_RANGE = (-5, 6)  # Inclusive; drums never pitch-transposed.
 CACHE_MB_PER_WORKER = 128
 MAX_DATA_RETRIES = 16
 LOG_DATA_ERRORS = False  # No per-file logs by default; retry metric remains visible.
-NUM_WORKERS = 16
+NUM_WORKERS = 4
+PREFETCH_FACTOR = 1
 
-BATCH_SIZE = 64  # Per GPU; conservative initial setting, not a measured maximum.
+BATCH_SIZE = 64  # Per GPU; no gradient accumulation.
 VALIDATION_BATCH_SIZE = 16
 MAX_VALIDATION_BATCHES = 100
 ACCUM_STEPS = 1
@@ -73,7 +74,9 @@ ONSET_POSITIVE_FRACTION = .20  # 80% of class-balanced onset loss penalizes nega
 
 # Conservative event-level denoising. Targets/pedal/accompaniment remain clean.
 SEMANTIC_CORRUPTION = True
-SEMANTIC_NOTE_PROB = .10  # Expected proposal rate; no minimum per bin.
+SEMANTIC_NOTE_PROB = .25  # Maximum proposal rate; no minimum per bin.
+SEMANTIC_CORRUPTION_WARMUP_STEPS = 100000  # Linear 0 -> 25%; validation uses 25%.
+SEMANTIC_MAX_NOTE_FRACTION = .25  # Hard cap on edited note events per bin.
 SEMANTIC_OPERATION_WEIGHTS = {"pitch": .2, "addition": .3, "timing": .4, "deletion": .1}
 SEMANTIC_PITCH_SHIFT_MAX = 1  # Semitones; isolated notes/carries aren't shifted.
 SEMANTIC_TIME_SHIFT_MS = 30  # Complete note shifts, no duration change/wraparound.
@@ -95,5 +98,5 @@ CALIBRATION_ONSET_THRESHOLDS = (.5, .8, .9, .95, .98, .99, .995, .999, .9999)
 CALIBRATION_MIN_RECALL = .99  # If unattainable, report it and select best F1.
 LOG_EVERY = 10
 VALIDATE_EVERY = 1000
-SAVE_EVERY = 1000
+SAVE_EVERY = 2000
 RESUME_TRAINING = True

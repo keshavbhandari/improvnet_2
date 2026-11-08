@@ -1,0 +1,18 @@
+{
+  "format": "latent_flow_note_decoding_v1",
+  "profiles": {
+    "bc108ae555392411391c81cc340b0bba86d8c6549fed5b61842e8d3e3a7f1acb": {
+      "activity_threshold": 0.9,
+      "onset_threshold": 0.985,
+      "note_decoding": {
+        "mode": "held",
+        "continuation_threshold": 0.85,
+        "max_gap_ms": 20
+      },
+      "validation_files": 64,
+      "validation_bins": 502,
+      "validation_reference_notes": 3676,
+      "validation_report": "/e/home/jusers/bhandari1/jupiter/improvnet_analysis/flow_decoding_20261103/calibration/report.json"
+    }
+  }
+}

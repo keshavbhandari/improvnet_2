@@ -4,7 +4,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from improvnet.model.latent_flow_train import main, resume_setting_changes
+import torch
+
+from improvnet.model.latent_flow_train import loader_options, main, resume_setting_changes, validate_config
 
 
 class ResumeTests(unittest.TestCase):
@@ -42,6 +44,30 @@ class ResumeTests(unittest.TestCase):
             main(["--batch-size", "16", "--allow-batch-size-change", "--cpu"])
             self.assertEqual(train.call_args.args[0].BATCH_SIZE, 16)
             self.assertTrue(train.call_args.kwargs["allow_batch_size_change"])
+
+    def test_memory_settings_preserve_old_checkpoint_resume(self):
+        self.config.NUM_WORKERS = 2
+        self.config.PREFETCH_FACTOR = 1
+        self.assertEqual(resume_setting_changes(self.state, self.config, self.model, 1), [])
+
+    def test_prefetch_is_only_supplied_to_worker_loaders(self):
+        options = loader_options(self.config, torch.device("cpu"))
+        self.assertNotIn("prefetch_factor", options)
+        self.config.NUM_WORKERS = 2
+        self.assertEqual(loader_options(self.config, torch.device("cuda"))["prefetch_factor"], 1)
+        self.config.PREFETCH_FACTOR = 3
+        self.assertEqual(loader_options(self.config, torch.device("cpu"))["prefetch_factor"], 3)
+
+    def test_invalid_prefetch_is_rejected(self):
+        for value in (0, -1, True, 1.5):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "PREFETCH_FACTOR"):
+                validate_config(SimpleNamespace(PREFETCH_FACTOR=value))
+
+    def test_cli_loader_controls(self):
+        with patch("improvnet.model.latent_flow_train.train") as train:
+            main(["--num-workers", "0", "--prefetch-factor", "1", "--cpu"])
+            self.assertEqual(train.call_args.args[0].NUM_WORKERS, 0)
+            self.assertEqual(train.call_args.args[0].PREFETCH_FACTOR, 1)
 
 
 if __name__ == "__main__":

@@ -45,6 +45,9 @@ def model_config(config, vae, labels):
 
 
 def validate_config(c):
+    prefetch = getattr(c, "PREFETCH_FACTOR", 1)
+    if isinstance(prefetch, bool) or not isinstance(prefetch, int) or prefetch < 1:
+        raise ValueError("PREFETCH_FACTOR must be a positive integer")
     for name in ("TARGET_BINS", "MAX_ACCOMPANIMENT_EVENTS", "LATENT_CALIBRATION_SAMPLES", "VAE_BATCH_SIZE",
                  "SAMPLES_PER_EPOCH", "VALIDATION_SAMPLES", "BATCH_SIZE", "VALIDATION_BATCH_SIZE", "ACCUM_STEPS",
                  "N_STEPS", "LOG_EVERY", "VALIDATE_EVERY", "SAVE_EVERY", "MAX_VALIDATION_BATCHES", "MAX_DATA_RETRIES"):
@@ -70,6 +73,14 @@ def validate_config(c):
 def move_batch(batch, device):
     return {key: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
             for key, value in batch.items()}
+
+
+def loader_options(c, device):
+    options = dict(num_workers=c.NUM_WORKERS, pin_memory=device.type == "cuda", collate_fn=collate_windows)
+    # PyTorch disallows prefetch_factor when loading synchronously.
+    if c.NUM_WORKERS:
+        options["prefetch_factor"] = getattr(c, "PREFETCH_FACTOR", 1)
+    return options
 
 
 @torch.inference_mode()
@@ -187,6 +198,9 @@ def prepare(c, device):
     validate_config(c)
     if not Path(c.INDEX_PATH).is_file():
         raise FileNotFoundError("Build the MIDI index with local_vae_train --build-index first")
+    if not Path(c.VAE_CHECKPOINT).is_file():
+        raise FileNotFoundError("Freeze a selected trained VAE at VAE_CHECKPOINT before starting flow matching: "
+                                + str(c.VAE_CHECKPOINT))
     vae, tokenizer, _, _ = load_vae(c.VAE_CHECKPOINT, device)
     vae.requires_grad_(False)
     if (tokenizer.config.coarse_ms, tokenizer.config.fine_ms, tokenizer.config.piano_programs) != (c.COARSE_MS, c.FINE_MS, tuple(c.PIANO_PROGRAMS)):
@@ -212,7 +226,7 @@ def check(c, device):
 
 def resume_setting_changes(state, c, current_model_config, world, *, allow_batch_size_change=False):
     """Permit only an explicitly requested batch-size change, not other incompatibilities."""
-    ignored = {"SAVE_DIR", "RESUME_TRAINING", "NUM_WORKERS", "CACHE_MB_PER_WORKER", "LOG_DATA_ERRORS",
+    ignored = {"SAVE_DIR", "RESUME_TRAINING", "NUM_WORKERS", "PREFETCH_FACTOR", "CACHE_MB_PER_WORKER", "LOG_DATA_ERRORS",
                "LOG_EVERY", "VALIDATE_EVERY", "SAVE_EVERY", "EVALUATION_DIR", "ACTIVITY_THRESHOLD", "ONSET_THRESHOLD"}
     changed = [k for k, value in vars(c).items() if k not in ignored and state["train_config"].get(k) != value]
     blocked = [k for k in changed if not (allow_batch_size_change and k == "BATCH_SIZE")]
@@ -243,13 +257,16 @@ def train(c, *, force_cpu=False, allow_batch_size_change=False):
         for name in ("latest_checkpoint.pt", "best_model.pt"):
             path = directory / name
             if path.exists():
-                candidate = torch.load(path, map_location="cpu", weights_only=False)
+                # Validate both destinations without eagerly loading two full
+                # model/EMA/Adam checkpoints into host RAM on resume.
+                candidate = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
                 if candidate.get("format") != FORMAT:
                     raise ValueError("Unrelated checkpoint in SAVE_DIR; it will not be overwritten")
                 if not c.RESUME_TRAINING:
                     raise FileExistsError("Use a fresh SAVE_DIR or resume existing stage-2 training")
                 if state is None:
                     state = candidate
+                del candidate
         model = LatentFlowModel(model_config(c, vae, labels)).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=c.LR, betas=c.BETAS, weight_decay=c.WEIGHT_DECAY)
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: lr_factor(step, c))
@@ -303,7 +320,7 @@ def train(c, *, force_cpu=False, allow_batch_size_change=False):
         batches = ResumableBatchSampler(sampler, c.BATCH_SIZE)
         if not len(batches):
             raise ValueError("Not enough samples for a distributed batch")
-        options = dict(num_workers=c.NUM_WORKERS, pin_memory=device.type == "cuda", collate_fn=collate_windows)
+        options = loader_options(c, device)
         loader = DataLoader(train_data, batch_sampler=batches, generator=torch.Generator().manual_seed(c.SEED), **options)
         val_loader = DataLoader(val_data, batch_size=c.VALIDATION_BATCH_SIZE, sampler=range(rank, len(val_data), world),
                                generator=torch.Generator().manual_seed(c.SEED + 1), **options)
@@ -313,6 +330,11 @@ def train(c, *, force_cpu=False, allow_batch_size_change=False):
             print(f"Stage 2: {sum(p.numel() for p in raw.parameters()):,} parameters; frozen VAE; "
                   f"effective window batch={c.BATCH_SIZE*world*c.ACCUM_STEPS}; genres={len(labels)-1}; step={step}", flush=True)
             print(f"Genre labels: {', '.join(labels[1:])}; unlabelled/dropout examples use unconditioned ID 0", flush=True)
+            queued_batches = c.NUM_WORKERS * options.get("prefetch_factor", 0)
+            roll_bytes = c.BATCH_SIZE * (c.HISTORY_BINS + c.TARGET_BINS) * 2 * 128 * vae.config.frames_per_bin * 4
+            print(f"Data loader: workers={c.NUM_WORKERS}, prefetch={options.get('prefetch_factor', 0)}; "
+                  f"queued rolls alone up to {queued_batches * roll_bytes / 2**30:.2f} GiB "
+                  "(excludes working batches, conditioning, pinned copies and caches)", flush=True)
         model.train(); optimizer.zero_grad(set_to_none=True)
         accumulated = 0
         stats = torch.zeros(len(STAT_KEYS), device=device, dtype=torch.float64)
@@ -392,13 +414,14 @@ def main(argv=None):
                         help="Resume with changed BATCH_SIZE, preserving training state but restarting data at an epoch boundary")
     for name in ("save-dir", "vae-checkpoint", "index"):
         parser.add_argument("--" + name)
-    for name in ("batch-size", "num-workers", "steps", "accum-steps"):
+    for name in ("batch-size", "num-workers", "prefetch-factor", "steps", "accum-steps"):
         parser.add_argument("--" + name, type=int)
     args = parser.parse_args(argv)
     module = importlib.import_module(args.config)
     c = SimpleNamespace(**{k: value for k, value in vars(module).items() if k.isupper()})
     for name, key in (("save_dir", "SAVE_DIR"), ("vae_checkpoint", "VAE_CHECKPOINT"), ("index", "INDEX_PATH"),
-                      ("batch_size", "BATCH_SIZE"), ("num_workers", "NUM_WORKERS"), ("steps", "N_STEPS"), ("accum_steps", "ACCUM_STEPS")):
+                      ("batch_size", "BATCH_SIZE"), ("num_workers", "NUM_WORKERS"), ("prefetch_factor", "PREFETCH_FACTOR"),
+                      ("steps", "N_STEPS"), ("accum_steps", "ACCUM_STEPS")):
         if getattr(args, name) is not None:
             setattr(c, key, getattr(args, name))
     if args.check:

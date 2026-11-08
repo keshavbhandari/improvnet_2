@@ -10,14 +10,17 @@ import torch
 
 from improvnet.model import local_vae_config as defaults
 from improvnet.model.local_vae_model import LocalVAE, LocalVAEConfig, Posterior, balanced_bce
-from improvnet.model.local_vae_train import batch_objective, evaluate, robustness_ramp, summarize, validate_config
+from improvnet.model.local_vae_train import ResumableBatchSampler, batch_objective, evaluate, robustness_ramp, summarize, validate_config
 from improvnet.tokenizer.hierarchical import EncodedPiece, GridConfig
-from improvnet.utils.local_vae_corruption import corrupt_roll_bin, jitter_latent, latent_channel_std, target_note_rows
+from improvnet.utils.local_vae_corruption import corrupt_roll_bin, jitter_latent, latent_channel_std, semantic_probability, target_note_rows
 from improvnet.utils.local_vae_data import bin_tensors, collate_bins, transpose_bin
 
 
 def config(**changes):
     values = {k: v for k, v in vars(defaults).items() if k.isupper()}
+    values.update(COARSE_MS=1000, FINE_MS=10, SEMANTIC_NOTE_PROB=.10,
+                  SEMANTIC_CORRUPTION_WARMUP_STEPS=0)
+    values.pop("SEMANTIC_MAX_NOTE_FRACTION", None)  # Explicit legacy corruption fixtures.
     values.update(changes)
     return SimpleNamespace(**values)
 
@@ -68,6 +71,45 @@ class CorruptionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(1)
+
+    def test_corruption_rate_ramps_by_optimizer_step_and_validation_is_fixed(self):
+        c = config(SEMANTIC_NOTE_PROB=.25, SEMANTIC_CORRUPTION_WARMUP_STEPS=100)
+        self.assertEqual([semantic_probability(c, s) for s in (0, 50, 100, 1000)], [0., .125, .25, .25])
+        self.assertEqual(semantic_probability(c, 0, training=False), .25)
+
+    def test_hard_cap_counts_events_not_frames_and_does_not_force_sparse_edits(self):
+        c = config(SEMANTIC_NOTE_PROB=1., SEMANTIC_MAX_NOTE_FRACTION=.25,
+                   SEMANTIC_OPERATION_WEIGHTS={"addition": 1.})
+        source = piece([(48 + i * 2, 80, 10, 80) for i in range(8)])
+        for seed in range(20):
+            result = corrupt_roll_bin(source, 0, c, random.Random(seed))
+            self.assertEqual(int(result[1].sum()), 10)  # Eight original + at most two added events.
+        sparse = piece([(60, 80, 10, 80), (64, 80, 15, 75), (68, 80, 20, 70)])
+        torch.testing.assert_close(corrupt_roll_bin(sparse, 0, c, random.Random(0)), bin_tensors(sparse, 0)["roll"])
+
+    def test_prefetched_batches_are_tagged_with_their_own_update_and_resume_position(self):
+        batches = ResumableBatchSampler(range(12), 2, scheduled_corruption=True, accum_steps=2)
+        batches.optimizer_step = 10
+        self.assertEqual(list(batches), [[(0, 10), (1, 10)], [(2, 10), (3, 10)],
+                                        [(4, 11), (5, 11)], [(6, 11), (7, 11)],
+                                        [(8, 12), (9, 12)], [(10, 12), (11, 12)]])
+        batches.start_batch = 2; batches.optimizer_step = 11
+        self.assertEqual(list(batches)[0], [(4, 11), (5, 11)])
+        batches.start_batch = 0; batches.optimizer_step = 20; batches.accumulated = 1
+        self.assertEqual([b[0][1] for b in batches], [20, 21, 21, 22, 22, 23])
+
+    def test_128_frame_vector_stays_512_values_and_all_branches_have_gradients(self):
+        model = LocalVAE(LocalVAEConfig(frames_per_bin=128, base_channels=4, res_blocks=1,
+                                       latent_layout="vector", latent_channels=512))
+        roll = torch.zeros(2, 2, 128, 128); roll[:, 0, 60, 10:80] = .7; roll[:, 1, 60, 10] = 1
+        pedal = torch.zeros(2, 1, 128); mask = torch.ones(2, 128, dtype=torch.bool)
+        output = model(roll, pedal, mask, corrupted_roll=roll.clone(), latent_jitter_std=.1)
+        self.assertEqual(tuple(output.posterior.mean.shape), (2, 512, 1, 1))
+        self.assertEqual(tuple(output.reconstruction.activity_logits.shape), (2, 128, 128))
+        loss = sum(branch.reconstruction.activity_logits.square().mean() + branch.reconstruction.pedal.square().mean()
+                   for branch in (output, output.denoising, output.jittered)) + output.posterior.kl().mean()
+        loss.backward()
+        self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters()))
 
     def test_zero_probability_exactly_preserves_chords_retriggers_carries_and_padding(self):
         source = piece([(60, 80, 90, 100), (60, 80, 100, 120), (64, 90, 85, 125),

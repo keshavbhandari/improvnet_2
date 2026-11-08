@@ -26,6 +26,7 @@ from torch.utils.data.distributed import DistributedSampler
 from improvnet.model.local_vae_model import LocalVAE, LocalVAEConfig, reconstruction_losses
 from improvnet.utils.local_vae_data import LocalVAEDataset, build_midi_index, collate_bins, index_settings
 from improvnet.utils.local_vae_calibration import ThresholdCalibrator, calibration_scalars
+from improvnet.utils.local_vae_corruption import semantic_probability
 
 LOSS_KEYS = ("activity", "onset", "velocity", "pedal", "consistency", "kl")
 QUALITY_KEYS = ("activity_tp", "activity_fp", "activity_fn", "onset_tp", "onset_fp", "onset_fn",
@@ -37,14 +38,22 @@ STAT_KEYS = ("loss", "reconstruction", *LOSS_KEYS, "denoising_reconstruction", "
 
 
 class ResumableBatchSampler(BatchSampler):
-    def __init__(self, sampler, batch_size):
+    def __init__(self, sampler, batch_size, *, scheduled_corruption=False, accum_steps=1):
         super().__init__(sampler, batch_size, drop_last=True)
         self.start_batch = 0
+        self.scheduled_corruption, self.accum_steps = scheduled_corruption, accum_steps
+        self.optimizer_step, self.accumulated = 0, 0
 
     def __iter__(self):
         for index, batch in enumerate(super().__iter__()):
             if index >= self.start_batch:
-                yield batch
+                if self.scheduled_corruption:
+                    # Tag before prefetch: workers cannot advance the schedule or
+                    # see a stale mutable shared step. Resume reproduces the tags.
+                    step = self.optimizer_step + (self.accumulated + index - self.start_batch) // self.accum_steps
+                    yield [(sample, step) for sample in batch]
+                else:
+                    yield batch
 
     def __len__(self):
         return max(0, super().__len__() - self.start_batch)
@@ -332,6 +341,15 @@ def validate_config(config):
     warmup = getattr(config, "ROBUSTNESS_WARMUP_STEPS", 0)
     if isinstance(warmup, bool) or not isinstance(warmup, int) or warmup < 0:
         raise ValueError("ROBUSTNESS_WARMUP_STEPS must be a nonnegative integer")
+    semantic_warmup = getattr(config, "SEMANTIC_CORRUPTION_WARMUP_STEPS", 0)
+    if isinstance(semantic_warmup, bool) or not isinstance(semantic_warmup, int) or semantic_warmup < 0:
+        raise ValueError("SEMANTIC_CORRUPTION_WARMUP_STEPS must be a nonnegative integer")
+    prefetch = getattr(config, "PREFETCH_FACTOR", 2)
+    if isinstance(prefetch, bool) or not isinstance(prefetch, int) or prefetch < 1:
+        raise ValueError("PREFETCH_FACTOR must be a positive integer")
+    cap = getattr(config, "SEMANTIC_MAX_NOTE_FRACTION", None)
+    if cap is not None and (not math.isfinite(cap) or not 0 <= cap <= 1):
+        raise ValueError("SEMANTIC_MAX_NOTE_FRACTION must be in [0,1]")
     if getattr(config, "LATENT_JITTER_WEIGHT", 0.) and (getattr(config, "LATENT_JITTER_MAX_STD", 0.) <= 0 or
                                                        getattr(config, "LATENT_JITTER_VALIDATION_STD", 0.) <= 0):
         raise ValueError("Positive LATENT_JITTER_WEIGHT needs positive training/validation noise levels")
@@ -351,7 +369,7 @@ def validate_config(config):
     model_config(config)
 
 
-def train(config, *, force_cpu=False, allow_resume_changes=False):
+def train(config, *, force_cpu=False, allow_resume_changes=False, continue_from=None):
     validate_config(config)
     if not Path(config.INDEX_PATH).exists():
         raise FileNotFoundError(f"Build the MIDI index first: python -m improvnet.model.local_vae_train --build-index --index {config.INDEX_PATH}")
@@ -373,15 +391,28 @@ def train(config, *, force_cpu=False, allow_resume_changes=False):
         directory = Path(config.SAVE_DIR)
         resume = directory / "latest_checkpoint.pt"
         state = None
+        continuing = False
+        state_path = None
         for path in (resume, directory / "best_model.pt"):
             if path.exists():
-                candidate = torch.load(path, map_location="cpu", weights_only=False)
+                candidate = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
                 if candidate.get("format") != "local_vae_training_v1":
                     raise ValueError("SAVE_DIR contains an unrelated checkpoint; it will not be overwritten")
                 if not config.RESUME_TRAINING:
                     raise FileExistsError("Existing checkpoints: use RESUME_TRAINING or a fresh SAVE_DIR")
                 if state is None:
                     state = candidate
+                    state_path = path
+                del candidate
+        if state is None and continue_from:
+            state = torch.load(continue_from, map_location="cpu", weights_only=False, mmap=True)
+            if state.get("format") != "local_vae_training_v1":
+                raise ValueError("--continue-from requires a local VAE training checkpoint")
+            continuing = True
+        elif state is not None and continue_from and state_path.resolve() == Path(continue_from).resolve():
+            # Explicitly authorized in-place migration. Once a new checkpoint
+            # records this world/index, successor jobs resume it exactly.
+            continuing = state["world_size"] != world or state.get("index_identity") != index_id
         model = LocalVAE(model_config(config)).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.LR, betas=config.BETAS, weight_decay=config.WEIGHT_DECAY)
         schedule_config = config if state is None else SimpleNamespace(**state["train_config"])
@@ -390,10 +421,10 @@ def train(config, *, force_cpu=False, allow_resume_changes=False):
         scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and not torch.cuda.is_bf16_supported())
         step, epoch, next_batch, best_val = 0, 0, 0, float("inf")
         if state is not None:
-            if state.get("index_identity") != index_id:
-                raise ValueError("MIDI index changed since checkpoint; choose a fresh SAVE_DIR")
+            if state.get("index_identity") != index_id and not continuing:
+                raise ValueError("MIDI index changed since checkpoint; choose a fresh SAVE_DIR or explicitly opt in with --continue-from")
             ignored = {"SAVE_DIR", "RUNS_DIR", "RUN_NAME", "TENSORBOARD_ROOT", "TENSORBOARD_DIR", "RESUME_TRAINING", "NUM_WORKERS", "LOG_EVERY", "VALIDATE_EVERY", "SAVE_EVERY", "CACHE_MB_PER_WORKER", "LOG_DATA_ERRORS",
-                       "ACTIVITY_THRESHOLD", "ONSET_THRESHOLD", "N_STEPS"}
+                       "ACTIVITY_THRESHOLD", "ONSET_THRESHOLD", "N_STEPS", "PREFETCH_FACTOR"}
             saved_steps = state["train_config"]["N_STEPS"]
             if config.N_STEPS < saved_steps:
                 raise ValueError(f"Resume permits increasing N_STEPS, not reducing it: "
@@ -409,14 +440,16 @@ def train(config, *, force_cpu=False, allow_resume_changes=False):
                           "SEMANTIC_PITCH_SHIFT_MAX", "SEMANTIC_TIME_SHIFT_MS", "SEMANTIC_MIN_NOTES_FOR_DELETION",
                           "SEMANTIC_WEIGHT", "LATENT_JITTER_WEIGHT", "LATENT_JITTER_MAX_STD",
                           "LATENT_JITTER_VALIDATION_STD", "ROBUSTNESS_WARMUP_STEPS",
+                          "SEMANTIC_CORRUPTION_WARMUP_STEPS", "SEMANTIC_MAX_NOTE_FRACTION",
                           "ACTIVE_BIN_PROB", "PITCH_AUGMENTATION", "PITCH_SHIFT_RANGE",
                           "COLLECTION_WEIGHTS", "SAMPLES_PER_EPOCH", "MAX_DATA_RETRIES"}
             blocked = [k for k in changed if not allow_resume_changes or k not in compatible]
-            if state["model_config"] != asdict(model.config) or state["world_size"] != world or blocked:
+            if state["model_config"] != asdict(model.config) or (state["world_size"] != world and not continuing) or blocked:
                 raise ValueError(f"Exact resume needs the same architecture/world/data/optimizer settings; changed={changed}. "
                                  "Use --allow-resume-changes for loss weights, KL warmup, gradient clipping, "
                                  "sampling/augmentation and batch/validation settings; "
-                                 "architecture, world size, index and optimizer schedule remain protected.")
+                                 "architecture, world size, index and optimizer schedule remain protected. "
+                                 "--continue-from explicitly permits GPU-count/index migration.")
             model.load_state_dict(state["model_state_dict"])
             model.decoder_calibration = state.get("decoder_calibration")
             optimizer.load_state_dict(state["optimizer_state_dict"])
@@ -429,12 +462,24 @@ def train(config, *, force_cpu=False, allow_resume_changes=False):
                           f"continuing cosine decay from saved LR {scheduler.get_last_lr()[0]:.6g}. "
                           "Warmup, data position and best-score tracking are preserved.", flush=True)
             scaler.load_state_dict(state["scaler_state_dict"])
-            rng = state["rng"][rank]
-            random.setstate(rng["python"])
-            torch.set_rng_state(rng["torch"].cpu())
-            if device.type == "cuda" and rng["cuda"] is not None:
-                torch.cuda.set_rng_state(rng["cuda"], device)
+            if not continuing:
+                rng = state["rng"][rank]
+                random.setstate(rng["python"])
+                torch.set_rng_state(rng["torch"].cpu())
+                if device.type == "cuda" and rng["cuda"] is not None:
+                    torch.cuda.set_rng_state(rng["cuda"], device)
             step, epoch, next_batch, best_val = (state[k] for k in ("step", "epoch", "next_batch", "best_val"))
+            if continuing:
+                epoch += 1
+                next_batch, best_val = 0, float("inf")
+                random.seed(config.SEED + rank + step)
+                torch.manual_seed(config.SEED + rank + step)
+                if rank == 0:
+                    print(f"Non-exact continuation from {continue_from}: step {step}; "
+                          f"ranks {state['world_size']} -> {world}; adopting current MIDI index. "
+                          "Weights, optimizer and LR/corruption schedules retained; data position, "
+                          "per-rank RNG and validation best-score tracking reset. "
+                          "Subsequent resumes use the new run's exact checkpoint.", flush=True)
             if changed:
                 # The old batch index no longer identifies the same examples
                 # with a new batch size/pool. Resume at a virtual epoch boundary,
@@ -451,10 +496,14 @@ def train(config, *, force_cpu=False, allow_resume_changes=False):
         train_data = LocalVAEDataset(config, "train", error_dir=directory / "data_errors")
         val_data = LocalVAEDataset(config, "validation", error_dir=directory / "data_errors")
         sampler = DistributedSampler(train_data, num_replicas=world, rank=rank, shuffle=True, seed=config.SEED, drop_last=True)
-        batches = ResumableBatchSampler(sampler, config.BATCH_SIZE)
+        batches = ResumableBatchSampler(sampler, config.BATCH_SIZE,
+            scheduled_corruption=getattr(config, "SEMANTIC_CORRUPTION_WARMUP_STEPS", 0) > 0,
+            accum_steps=config.ACCUM_STEPS)
         if not len(batches):
             raise ValueError("SAMPLES_PER_EPOCH cannot supply one distributed batch")
         options = dict(num_workers=config.NUM_WORKERS, pin_memory=device.type == "cuda", collate_fn=collate_bins)
+        if config.NUM_WORKERS:
+            options["prefetch_factor"] = getattr(config, "PREFETCH_FACTOR", 2)
         train_loader = DataLoader(train_data, batch_sampler=batches, generator=torch.Generator().manual_seed(config.SEED), **options)
         val_loader = DataLoader(val_data, batch_size=config.VALIDATION_BATCH_SIZE,
                                 sampler=range(rank, len(val_data), world), generator=torch.Generator().manual_seed(config.SEED + 1), **options)
@@ -470,6 +519,10 @@ def train(config, *, force_cpu=False, allow_resume_changes=False):
             print(f"Denoising={getattr(config, 'SEMANTIC_CORRUPTION', False)}; "
                   f"latent jitter=0..{getattr(config, 'LATENT_JITTER_MAX_STD', 0.):.0%} channel std; "
                   f"robustness warmup={getattr(config, 'ROBUSTNESS_WARMUP_STEPS', 0)} steps", flush=True)
+            print(f"Bins={config.COARSE_MS} ms/{model_config(config).frames_per_bin} frames; "
+                  f"note corruption max={getattr(config, 'SEMANTIC_NOTE_PROB', 0.):.0%}, "
+                  f"ramp={getattr(config, 'SEMANTIC_CORRUPTION_WARMUP_STEPS', 0)} updates, "
+                  f"hard cap={getattr(config, 'SEMANTIC_MAX_NOTE_FRACTION', None)}", flush=True)
             if train_data.report["limited"]:
                 print("WARNING: partial/debug MIDI index, not the full corpus", flush=True)
             for name, data in (("train", train_data), ("validation", val_data)):
@@ -485,6 +538,7 @@ def train(config, *, force_cpu=False, allow_resume_changes=False):
             sampler.set_epoch(epoch)
             train_data.set_epoch(epoch)
             batches.start_batch = next_batch
+            batches.optimizer_step, batches.accumulated = step, accumulated
             full_batches = len(sampler) // config.BATCH_SIZE
             if next_batch >= full_batches:
                 raise ValueError("Invalid checkpoint data position")
@@ -532,6 +586,8 @@ def train(config, *, force_cpu=False, allow_resume_changes=False):
                         writer.add_scalar("train/lr", scheduler.get_last_lr()[0], step)
                         writer.add_scalar("train/kl_weight", config.KL_WEIGHT * min(1., step / max(1, config.KL_WARMUP_STEPS)), step)
                         writer.add_scalar("train/robustness_ramp", robustness_ramp(step - 1, config), step)
+                        if getattr(config, "SEMANTIC_CORRUPTION", False):
+                            writer.add_scalar("train/semantic_note_probability", semantic_probability(config, step - 1), step)
                     metrics.zero_()
                 best = False
                 if step % config.VALIDATE_EVERY == 0 or step == config.N_STEPS:
@@ -585,12 +641,13 @@ def main():
     parser.add_argument("--steps", type=int)
     parser.add_argument("--samples-per-epoch", type=int)
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--continue-from", help="Explicitly accept a new GPU count/index for this checkpoint; retain weights, optimizer and step, reset data/RNG/best-score state. Can migrate the current run in place.")
     parser.add_argument("--allow-resume-changes", action="store_true",
                         help="Continue weights/optimizer with changed loss weights, KL warmup, clipping, sampling/augmentation or batch/validation settings; not an exact replay")
     parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
-    if args.no_resume and args.allow_resume_changes:
-        parser.error("--allow-resume-changes cannot be combined with --no-resume")
+    if args.no_resume and (args.allow_resume_changes or args.continue_from):
+        parser.error("--allow-resume-changes/--continue-from cannot be combined with --no-resume")
     module = importlib.import_module(args.config)
     config = SimpleNamespace(**{k: v for k, v in vars(module).items() if k.isupper()})
     if args.run_name is not None:
@@ -623,7 +680,8 @@ def main():
     else:
         if args.max_index_files is not None:
             parser.error("--max-index-files requires --build-index")
-        train(config, force_cpu=args.cpu, allow_resume_changes=args.allow_resume_changes)
+        train(config, force_cpu=args.cpu, allow_resume_changes=args.allow_resume_changes,
+              continue_from=args.continue_from)
 
 
 if __name__ == "__main__":

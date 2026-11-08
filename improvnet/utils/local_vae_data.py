@@ -21,7 +21,7 @@ from mido import KeySignatureError
 from torch.utils.data import Dataset
 
 from improvnet.tokenizer.hierarchical import EVENT_FIELDS, GridConfig, HierarchicalTokenizer
-from improvnet.utils.local_vae_corruption import corrupt_roll_bin, target_note_rows
+from improvnet.utils.local_vae_corruption import corrupt_roll_bin, semantic_probability, target_note_rows
 
 INDEX_FORMAT = "local_vae_midi_index_v1"
 
@@ -368,6 +368,12 @@ class LocalVAEDataset(Dataset):
         self.epoch = epoch
 
     def __getitem__(self, index):
+        corruption_step = None
+        if isinstance(index, tuple):
+            index, corruption_step = index
+        scheduled = self.split == "train" and getattr(self.config, "SEMANTIC_CORRUPTION_WARMUP_STEPS", 0) > 0
+        if scheduled and corruption_step is None:
+            raise ValueError("Scheduled corruption requires (sample index, optimizer step) from the batch sampler")
         if not 0 <= index < len(self):
             raise IndexError(index)
         epoch = self.epoch if self.split == "train" else 0
@@ -414,7 +420,9 @@ class LocalVAEDataset(Dataset):
                     # target-part or bin selection. Validation's
                     # corruptions are fixed; neither split changes clean targets.
                     semantic_rng = random.Random(seed_for(self.config.SEED, self.split, epoch, index, "semantic"))
-                    item["corrupted_roll"] = corrupt_roll_bin(piece, bin_index, self.config, semantic_rng, notes=notes)
+                    probability = semantic_probability(self.config, corruption_step or 0, training=self.split == "train")
+                    item["corrupted_roll"] = corrupt_roll_bin(piece, bin_index, self.config, semantic_rng,
+                                                               notes=notes, probability=probability)
                 if self.split == "train" and self.config.PITCH_AUGMENTATION and not bool(item["is_drum"]):
                     pitches = torch.cat(((item["roll"].any(0).any(-1) | (item["previous_velocity"] > 0)).nonzero().flatten(),
                                          item["events"][item["events"][:, 3] == 0, 4]))

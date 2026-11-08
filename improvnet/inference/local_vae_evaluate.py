@@ -131,6 +131,8 @@ def main(argv=None):
     metrics, latent_metrics = total.report(), latent.report()
     sampled_f1, zero_f1 = sampled_total.report()["activity_f1"], zero_total.report()["activity_f1"]
     report = dict(checkpoint=str(args.checkpoint.resolve()), step=step, seed=args.seed, files=files, bins=bins,
+                  time_grid=dict(bin_ms=tokenizer.config.coarse_ms, fine_ms=tokenizer.config.fine_ms,
+                                 frames_per_bin=tokenizer.config.frames_per_bin),
                   thresholds=dict(activity=args.activity_threshold, onset=args.onset_threshold), skipped=sum(failures.values()),
                   note_decoding=vars(note_decoding_options(args)),
                   errors=metrics, latent=latent_metrics,

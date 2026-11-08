@@ -8,17 +8,17 @@ stages; this does not change any AR or discrete-flow matching checkpoint.
 ## What gets encoded
 
 One coarse bin contains **all** its fine frames, not only its maximum-velocity
-and onset-count summaries. Defaults are 1 second / 10 ms = 100 frames. Each bin
-gets one learned **256-value vector**. The internal convolutional features retain
-pitch/time order before a learned projection combines the complete second.
+and onset-count summaries. The current config uses **1.28 seconds / 10 ms = 128
+frames**. Each bin gets one learned **512-value vector**. The internal convolutional
+features retain pitch/time order before a learned projection combines the complete bin.
 
 | Batched field | Default shape | Meaning |
 | --- | --- | --- |
-| `roll` | `[B, 2, 128, 100]` | Velocity / 127; binary onsets |
-| `corrupted_roll` | `[B, 2, 128, 100]` | Optional perturbed encoder input; `roll` remains the clean target |
-| `pedal` | `[B, 1, 100]` | CC64 / 127; not duplicated across pitches |
-| `valid_mask` | `[B, 100]` | True for actual fine frames, false for trailing padding |
-| `latent` | `[B, 256, 1, 1]` | One vector per second in `vae176_vector256`; singleton axes preserve the flow matching API; sampled for training, mean for validation |
+| `roll` | `[B, 2, 128, 128]` | Velocity / 127; binary onsets |
+| `corrupted_roll` | `[B, 2, 128, 128]` | Optional perturbed encoder input; `roll` remains the clean target |
+| `pedal` | `[B, 1, 128]` | CC64 / 127; not duplicated across pitches |
+| `valid_mask` | `[B, 128]` | True for actual fine frames, false for trailing padding |
+| `latent` | `[B, 512, 1, 1]` | One vector per 1.28-second bin; singleton axes preserve the flow API; sampled for training, mean for validation |
 | `events` | `[B, Emax, 11]` | Typed accompaniment rows, padded separately |
 | `event_positions` | `[B, Emax, 2]` | Start/end relative to this bin in fine frames |
 | `event_mask` | `[B, Emax]` | True for actual accompaniment rows |
@@ -41,10 +41,9 @@ have a sustain channel. Existing same-pitch overlap normalization applies.
 ## Model and objective
 
 - A convolutional 2-D residual encoder downsamples pitch and time by 4.
-- The backbone starts at **176 channels**, about **62.22M parameters**
-  (retained baseline: 96 channels, 18.55M parameters).
-  The 1-second / 10-ms clock is unchanged. Vector256 has 64,632,440 parameters
-  including its learned global compression/expansion projections.
+- The backbone starts at **176 channels**. The current 128-frame/vector512 model
+  has **68,467,704 parameters**, including its learned global projections.
+  Historical one-second/vector256 runs used 64,632,440 parameters.
 - A separate 1-D encoder handles pedal; hidden pedal features fuse into the
   posterior. Stored pedal remains one value per frame.
 - The diagonal Gaussian posterior has learned mean/log-variance. Its decoder
@@ -55,7 +54,7 @@ have a sustain channel. Existing same-pitch overlap normalization applies.
   expansion back to those internal planes before convolutional reconstruction.
   These planes are reconstructed from the vector, never passed around it.
   No `tanh` bounds the latent; stage 2 learns per-coordinate mean/std normalization.
-  `LATENT_CHANNELS=256` specifies vector width here; spatial mode still interprets
+  `LATENT_CHANNELS=512` specifies vector width here; spatial mode still interprets
   it as the number of pitch/time planes. Legacy checkpoint configs default to
   spatial mode and retain their existing state keys.
 - Separate heads reconstruct activity, onsets, nonzero velocity and pedal.
@@ -96,19 +95,61 @@ length; extending after LR has reached its floor keeps it there. Reducing a save
 run's step budget is rejected.
 
 This follows the idea of local piano-roll compression in
-[Huang et al.](https://arxiv.org/html/2402.14285v4#S5), adapted to 100-frame bins
+[Huang et al.](https://arxiv.org/html/2402.14285v4#S5), using 128-frame bins
 and separately stored pedal. Its denoising branch is inspired by the paper's
 recipe, with gentler corruption and an additional latent-jitter branch, not an
 exact reproduction of its training hyperparameters.
 
 ### Conservative corruption and latent jitter
 
-Each nearby note has a 10% probability of **one proposal**, with operation shares
+The single `improvnet.model.local_vae_config` uses 1,280 ms bins
+(128 frames at 10 ms), a 512-value vector, batch 64 and accumulation 1. Its run
+name is `vae176_vector512_128f_corrupt25`; old checkpoints remain intact.
+The separate experiment config has been folded into this main config. Start/resume with:
+
+```bash
+python -m improvnet.model.local_vae_train
+```
+
+This experiment ramps note-event proposal probability from 0 to 25% over
+100,000 optimizer updates, within the existing 200,000-update budget. At most
+`floor(0.25 * visible_reference_events)` events per bin can be modified; unsafe
+proposals are skipped, and fewer than four visible events cannot be corrupted.
+The sampler tags prefetched examples with their intended optimizer update, so
+the schedule resumes exactly and is independent of worker timing. Validation
+corruption stays fixed at the full 25% proposal rate. Note-edit magnitudes,
+operation shares and the separate 10% latent-jitter branch are retained.
+Regular checkpoints save every 2,000 updates; validation runs every 1,000 and
+saves best-model improvements. Time-limit checkpoint requests also save. This is
+an adaptation of the paper's gradual-corruption recipe, not a reproduction of
+its full training budget. A new encoder requires new stage-2 training and
+bin-compatible conditioning. The flow config now targets this run's frozen
+`best_model.flow.pt` snapshot, with separate output folders. Freeze a selected
+trained VAE before starting stage 2; see [the flow setup](latent_flow.md).
+Inference restores the clock from each checkpoint, so old one-second runs still work.
+
+The Slurm launcher is `/e/home/jusers/bhandari1/jupiter/run_scripts/improvnet/vae_single_node_launch.sh`.
+It follows the AR launcher: one booster node, four GPUs, batch 64 per GPU
+(256 total, accumulation 1), 12-hour allocation, checkpoint before the time
+limit, and automatic successor submission. Slurm output/error files go to
+`run_scripts/improvnet/vae_run_logs`; checkpoints stay in this VAE's existing folder.
+
+`--continue-from CHECKPOINT` explicitly permits continuing with a different GPU
+count and/or MIDI index. It retains weights, optimizer, LR/corruption schedules
+and optimizer step; it restarts data at a new virtual epoch, reseeds each rank,
+and resets validation best-score tracking. This is not exact replay. Architecture
+and optimizer settings still must match. It can initialize a separate run or,
+when it names the current run's checkpoint, migrate that run in place and
+overwrite its checkpoints. Once saved world/index identities match, the same
+launcher resumes exactly without repeating migration. Ordinary resume still
+rejects GPU-count/index changes. The index must remain unchanged while training.
+
+Each selected note receives at most **one proposal**, with operation shares
 20% pitch shift, 30% adjacent-note addition, 40% timing shift, 10% deletion.
-Thus proposal rates are approximately 2%, 3%, 4%, 1% respectively; actual edits
-are lower because unsafe proposals are skipped. This is an expected rate, not
-a guaranteed or hard-capped fraction in every bin. Sparse/silent bins are never
-forced to contain a corruption.
+At the maximum rate, proposal rates before the hard cap/rejections are approximately
+5%, 7.5%, 10%, 2.5% respectively; actual edits are lower. Sparse/silent bins are
+never forced to contain a corruption. Historical one-second runs used a fixed
+10% proposal rate without the new hard cap.
 
 - Pitch shifts: +/-1 semitone, only fully contained notes with at least two local
   attacks; isolated notes and carries are not pitch-shifted.
@@ -122,12 +163,12 @@ forced to contain a corruption.
   an originally visible note. Drums omit pitch shifts/additions, preserving IDs.
 
 Corruption uses complete normalized events extracted once per cached piece,
-including neighbouring attacks and carries, **before** cropping the one-second
+including neighbouring attacks and carries, **before** cropping the 1.28-second
 input. Attacks before the bin stay carries; only real attacks inside the bin
 set onset bits. Padding, clean targets, pedal and accompaniment remain unchanged.
 Ordinary pitch augmentation then transposes clean and corrupted rolls together.
 Neighbouring events are used to construct consistent corruption; the VAE still
-sees only its one-second input, not additional context bins.
+sees only its 1.28-second input, not additional context bins.
 
 Training jitter amplitude is uniform per example from 0 to a warmed-up maximum
 of 10% of the detached, valid-weighted clean posterior-mean channel standard
@@ -267,7 +308,7 @@ Architecture, world size, data index and optimization settings must match for an
 exact resume. Logging cadence, worker count and cache budget may change. An
 unrelated checkpoint in the run directory is refused, not overwritten.
 
-The default save directory is `artifacts/vae/vae176_vector256`. The
+The default save directory is `artifacts/vae/vae176_vector512_128f_corrupt25`. The
 176-channel model must start fresh, not resume a 96-channel checkpoint. Existing
 checkpoint architecture metadata still lets inference load older models;
 model state keys and default inference behavior have not changed. Once the new
@@ -310,7 +351,9 @@ Reuse the same command/name to resume that experiment. Existing-checkpoint guard
 still prevent replacing a different architecture, even with `--allow-resume-changes`.
 `--save-dir` is an alternative explicit path, mutually exclusive with `--run-name`.
 Reconstruction tools accept `--checkpoint` pointing to either run's `best_model.pt`;
-their default follows `SAVE_DIR`, currently `vae176_vector256`. Pass
+their default follows `SAVE_DIR`, currently `vae176_vector512_128f_corrupt25`.
+Inference/evaluation reports include the saved bin duration and fine-frame count;
+single-piece inference also reports actual duration excluding padding. Pass
 `--checkpoint /.../artifacts/vae/baseline96/best_model.pt` to evaluate the baseline.
 
 Width 176 yields **62,221,828 parameters** versus 18,548,468 at width 96. This

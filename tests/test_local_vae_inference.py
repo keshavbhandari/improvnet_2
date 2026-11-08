@@ -18,7 +18,7 @@ from improvnet.inference.local_vae_evaluate import main as evaluate, readiness, 
 from improvnet.model import local_vae_config as defaults
 from improvnet.model.local_vae_model import LocalVAE, LocalVAEConfig, Posterior, Reconstruction
 from improvnet.utils.note_decoding import NoteDecoding
-from improvnet.tokenizer.hierarchical import HierarchicalTokenizer, read_performance
+from improvnet.tokenizer.hierarchical import GridConfig, HierarchicalTokenizer, read_performance
 from improvnet.utils.local_vae_data import build_midi_index
 
 
@@ -122,22 +122,25 @@ class InferenceTests(unittest.TestCase):
 
             def decode(self, latent):
                 activity = torch.where(latent[:, 0] > 0, .999, .001)
-                activity[:, :, 99] = .01  # Uncertainty immediately before a bin seam.
+                activity[:, :, -1] = .01  # Uncertainty immediately before a bin seam.
                 onset = torch.where(latent[:, 1] > 0, .999, .001)
                 return Reconstruction(torch.logit(activity), torch.logit(onset), latent[:, 0],
-                                      torch.zeros((len(latent), 1, 100)))
+                                      torch.zeros((len(latent), 1, latent.shape[-1])))
 
-        model = Echo()
-        a, _, _, _ = reconstruct(model, self.piece, batch_size=1)
-        b, _, _, _ = reconstruct(model, self.piece, batch_size=2)
-        np.testing.assert_array_equal(a.velocity, b.velocity)
-        np.testing.assert_array_equal(a.onset, b.onset)
-        scores = Scores(); scores.notes(self.piece, a)
-        self.assertEqual(scores.report()['notes_with_offsets_f1'], 1)
-        self.assertEqual(scores.report()['offset_mae_ms'], 0)
-        legacy, _, _, _ = reconstruct(model, self.piece, note_decoding=NoteDecoding())
-        scores = Scores(); scores.notes(self.piece, legacy)
-        self.assertEqual(scores.report()['extra_notes'], 1)
+        for coarse_ms in (1000, 1280):
+            with self.subTest(coarse_ms=coarse_ms):
+                piece = HierarchicalTokenizer(GridConfig(coarse_ms=coarse_ms)).encode(source())
+                model = Echo()
+                a, _, _, _ = reconstruct(model, piece, batch_size=1)
+                b, _, _, _ = reconstruct(model, piece, batch_size=2)
+                np.testing.assert_array_equal(a.velocity, b.velocity)
+                np.testing.assert_array_equal(a.onset, b.onset)
+                scores = Scores(); scores.notes(piece, a)
+                self.assertEqual(scores.report()['notes_with_offsets_f1'], 1)
+                self.assertEqual(scores.report()['offset_mae_ms'], 0)
+                legacy, _, _, _ = reconstruct(model, piece, note_decoding=NoteDecoding())
+                scores = Scores(); scores.notes(piece, legacy)
+                self.assertEqual(scores.report()['extra_notes'], 1)
 
     def test_onset_matching_tolerance_one_to_one_and_offset_errors(self):
         other = deepcopy(self.piece)
@@ -189,12 +192,32 @@ class InferenceTests(unittest.TestCase):
             self.assertEqual(len(first), 2)
             self.assertEqual(first, list(candidates(data, 42)))
 
+    def test_128_frame_checkpoint_cli_uses_saved_clock(self):
+        model = LocalVAE(LocalVAEConfig(frames_per_bin=128, base_channels=4, res_blocks=1,
+                                       latent_layout="vector", latent_channels=512)).eval()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); source_path = root / "source.mid"; source().save(source_path)
+            checkpoint = root / "vae.pt"
+            cfg = dict(COARSE_MS=1280, FINE_MS=10, PIANO_PROGRAMS=tuple(range(8)), MAX_FRAMES=360000)
+            torch.save(dict(format="local_vae_training_v1", model_config=asdict(model.config),
+                model_state_dict=model.state_dict(), train_config=cfg, step=5), checkpoint)
+            with redirect_stdout(io.StringIO()):
+                report = main(["--input", str(source_path), "--checkpoint", str(checkpoint),
+                               "--output-dir", str(root / "out"), "--device", "cpu"])
+            self.assertEqual(report["bins"], 2)
+            self.assertEqual(report["time_grid"], dict(bin_ms=1280, fine_ms=10,
+                             frames_per_bin=128, duration_seconds=1.3))
+            notes = read_performance(root / "out" / "reference_target.mid")["notes"]
+            self.assertEqual(len(notes), 2)
+            self.assertAlmostEqual(notes[-1].end, 1.3)
+
     def test_single_and_batch_checkpoint_cli_reports(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); data = root / "midi"; data.mkdir()
             for i in range(3): source().save(data / f"piece{i}.mid")
             cfg = {k: v for k, v in vars(defaults).items() if k.isupper()}
-            cfg.update(DATASETS={"classical_archives": str(data)}, ARIA_METADATA=None,
+            cfg.update(COARSE_MS=1000, FINE_MS=10,
+                       DATASETS={"classical_archives": str(data)}, ARIA_METADATA=None,
                        INDEX_PATH=str(root / "index.sqlite"), DATA_SPLIT_RATIOS={"train": 0., "validation": 0., "test": 1.})
             checkpoint = root / "model.pt"
             torch.save(dict(format="local_vae_training_v1", model_config=asdict(self.model.config),
