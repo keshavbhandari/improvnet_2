@@ -6,20 +6,18 @@ import random
 import sys
 import torch
 from tqdm import tqdm
-from improvnet.inference.melody_outputs import inference_output_paths, stage_output_names
+from improvnet.inference.melody_outputs import inference_output_paths, stage_output_names, plan_stages
 from improvnet.inference.melody_runtime import INFERENCE_SEED, TOP_K
-from improvnet.model import melody_config as cfg
 from improvnet.utils.ar_utils import ProcessData
 from improvnet.utils.melody import TASKS, melody_voice, read_midi_notes, skyline, write_midi_notes
-from improvnet.model.encoders.reference import choose_reference
-from improvnet.utils.melody_stems import kit_only_notes, DRUM_KIT_PITCHES, DRUM_KIT_ALIASES
+from improvnet.model.encoders.reference import choose_reference, reference_report
 
 def run_cli(inference_factory, pipeline_runner=None):
     parser = argparse.ArgumentParser(description='Refine melody, harmonize and add drums/bass with batched inference.')
     parser.add_argument('--model', required=True)
     parser.add_argument('--input', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True,
-                        help='Run name/path: claire_v8.mid writes all outputs inside claire_v8/, including final.mid')
+                        help='Run name/path: claire_v12.mid writes all outputs inside claire_v12/, including final.mid')
     parser.add_argument('--genre', choices=['jazz', 'blues'], default='jazz')
     parser.add_argument('--task', choices=['pipeline', *TASKS],
                         metavar='{pipeline,refine,harmonize,stem}', default='pipeline')
@@ -29,14 +27,15 @@ def run_cli(inference_factory, pipeline_runner=None):
                         help='Stem to add; pipeline adds requested drums then acoustic bass after harmonization')
     parser.add_argument('--melody-strength', type=float, default=.2,
                         help='Refinement corruption strength; 0 passes through the extracted skyline without generation')
-    parser.add_argument('--rhythm-strength', type=float, default=.8,
-                        help='Timing-mask fraction; Harmonize enforces at least 60%% (1 masks all timings)')
-    parser.add_argument('--reference-regions',choices=['same','different'],default='same',
-                        help='Embed the same reference excerpt with both encoders, or use disjoint excerpts')
-    parser.add_argument('--style-reference', type=Path, help='Piano/drum reference MIDI for both harmonization and stem addition')
+    parser.add_argument('--rhythm-strength', type=float, default=.95,
+                        help='Timing-mask fraction; Harmonize enforces at least 90%% (1 masks all timings)')
+    parser.add_argument('--reference-mode', choices=['exact','trio'], default='trio',
+                        help='Match each stage output exactly or use its piano/drums/acoustic-bass subset')
+    parser.add_argument('--style-reference', type=Path, help='Reference MIDI; shared random window by default, or averaged reference features')
+    parser.add_argument('--reference-aggregation', choices=['window','average'], default='window',
+                        help='Use one random shared excerpt, or average global/local features across all eligible excerpts')
     parser.add_argument('--reference-id', help='Select a jazz/blues entry from reference_catalog.json')
     parser.add_argument('--reference-bucket', help='Sample a matching beat/style similarity bucket from the catalogue')
-    parser.add_argument('--no-reference-conditioning', '--no-rhythm-conditioning', '--no-style-conditioning', dest='no_rhythm_conditioning', action='store_true')
     parser.add_argument('--temperature', type=float, default=1.)
     args = parser.parse_args()
     if any(not 0 <= x <= 1 for x in (args.melody_strength, args.rhythm_strength)):
@@ -51,7 +50,7 @@ def run_cli(inference_factory, pipeline_runner=None):
         from improvnet.inference.melody_pipeline import run_pipeline
         pipeline_runner = run_pipeline
     loaded_notes = read_midi_notes(args.input, infer.tokenizer, include_drums=True)
-    original = kit_only_notes(loaded_notes)
+    original = list(loaded_notes)
     pitched = [n for n in original if n.instrument != 'drum']
     original_instruments = sorted({n.instrument for n in pitched})
     if not original or not pitched:
@@ -74,17 +73,24 @@ def run_cli(inference_factory, pipeline_runner=None):
         tasks.extend(['stem']*len(stem_targets))
     else:
         tasks = [args.task]
+    stage_names = stage_output_names(tasks,stem_targets)
+    planned = plan_stages(original,tasks,requested,original_instruments,stem_targets,
+                          task_mode=args.task,target_instrument=args.target_instrument)
+    stage_instruments = {name:selected for name,(task,_,selected) in zip(stage_names,planned) if task != 'refine'}
     reference = None
-    if any(t in tasks for t in ('harmonize','stem')) and not args.no_rhythm_conditioning:
+    if any(t in tasks for t in ('harmonize','stem')):
         if args.style_reference:
-            ref = kit_only_notes(read_midi_notes(args.style_reference, infer.tokenizer,include_drums=True))
-            reference = infer.encoders.from_notes(ref, infer.tokenizer, random.Random(INFERENCE_SEED),regions=args.reference_regions)
+            ref = read_midi_notes(args.style_reference, infer.tokenizer,include_drums=True)
+            reference = infer.encoders.from_notes(ref, infer.tokenizer,mode=args.reference_mode,stage_instruments=stage_instruments,aggregation=args.reference_aggregation,rng=random.Random(INFERENCE_SEED))
             reference['id'] = str(args.style_reference)
         else:
             reference = choose_reference(infer.encoders, args.genre, random.Random(INFERENCE_SEED),
-                regions=args.reference_regions, reference_id=args.reference_id, bucket=args.reference_bucket)
-    if reference and reference.get('style_mixture_embedding') is None and 'stem' in tasks:
-        tqdm.write('Reference has no usable piano/drum window; drum addition will run without that condition.', file=sys.stderr)
+                reference_id=args.reference_id, bucket=args.reference_bucket,
+                mode=args.reference_mode,stage_instruments=stage_instruments,aggregation=args.reference_aggregation)
+    if reference:
+        for stage,condition in reference['stage_conditions'].items():
+            if 'drum' in condition['output_instruments'] and not condition['drum_palette']:
+                raise ValueError(f'Reference for {stage} has no standard drum-kit sounds; choose a reference containing drums')
     outputs = inference_output_paths(args.output)
     stage_names = stage_output_names(tasks, stem_targets)
     outputs.update({name: outputs['directory'] / f'{name}.mid' for name in stage_names})
@@ -101,12 +107,12 @@ def run_cli(inference_factory, pipeline_runner=None):
     write_midi_notes(current, outputs['final'], infer.tokenizer)
     report = dict(model=str(args.model), checkpoint_step=infer.checkpoint_step, protocol_version=infer.meta['version'],
                   input=str(args.input), output=str(outputs['final']), genre=args.genre,
-                  nonkit_input_drum_notes_filtered=sum(n.instrument=='drum' and n.pitch not in DRUM_KIT_PITCHES and n.pitch not in DRUM_KIT_ALIASES for n in loaded_notes),
-                  input_drum_articulations_normalized=sum(n.instrument=='drum' and n.pitch in DRUM_KIT_ALIASES for n in loaded_notes),
+                  nonkit_input_drum_notes_filtered=0,percussion_mode='reference_kit',reference_mode=args.reference_mode,reference_aggregation=args.reference_aggregation,
+                  input_drum_articulations_normalized=0,
                   requested_instruments=requested, instruments=sorted({n.instrument for n in current}),
                   missing_instruments=sorted(set(requested)-{n.instrument for n in current}),
-                  task_order=task_order, stage_order=stage_names, output_notes=len(current), harmony_conditioning=False,
-                  style_reference={k:v for k,v in reference.items() if not k.endswith('_embedding')} if reference else None, seed=INFERENCE_SEED, top_k=TOP_K, device=str(infer.device), chunks=chunks)
+                  task_order=task_order, stage_order=stage_names, output_notes=len(current),
+                  style_reference=reference_report(reference) if reference else None, seed=INFERENCE_SEED, top_k=TOP_K, device=str(infer.device), chunks=chunks)
     report['stem_summary'] = []
     for target in sorted({log['target_instrument'] for log in chunks if log['task'] == 'stem'}):
         added = sum(log['added_stem_notes'] for log in chunks

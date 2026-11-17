@@ -1,4 +1,4 @@
-"""Current V5 data contracts."""
+"""Current V12 data contracts."""
 import json
 import mido
 import pytest
@@ -58,6 +58,38 @@ def test_recovery_never_clips_a_corrupt_note(tmp_path):
         read_midi_notes(path)
 
 
+@pytest.mark.parametrize('meta_type,payload,counter', [
+    (0x59,[], 'truncated_key_signature'),
+    (0x59,[0], 'truncated_key_signature'),
+    (0x58,[], 'truncated_time_signature'),
+    (0x58,[4,2], 'truncated_time_signature')])
+def test_truncated_descriptive_metadata_preserves_every_musical_event(tmp_path,meta_type,payload,counter):
+    clean,broken=tmp_path/'clean.mid',tmp_path/'broken.mid'
+    midi_fixture(clean)
+    midi=mido.MidiFile(clean)
+    if meta_type==0x58:
+        midi.tracks[0][2]=mido.MetaMessage('time_signature',numerator=4,denominator=4,time=120)
+        midi.save(clean)
+    midi.tracks[0][2]=mido.UnknownMetaMessage(meta_type,data=payload,time=120)
+    midi.save(broken)
+    recovery={}
+    assert read_midi_notes(broken,recovery=recovery)==read_midi_notes(clean)
+    assert recovery=={counter:1}
+    a,b=read_midi_dict(clean),read_midi_dict(broken)
+    for attr in ('note_msgs','tempo_msgs','pedal_msgs','instrument_msgs','ticks_per_beat'):
+        assert getattr(a,attr)==getattr(b,attr)
+
+
+def test_truncated_tempo_is_not_silently_repaired(tmp_path):
+    path=tmp_path/'tempo.mid'
+    midi_fixture(path)
+    midi=mido.MidiFile(path)
+    midi.tracks[0][0]=mido.UnknownMetaMessage(0x51,data=[0],time=0)
+    midi.save(path)
+    with pytest.raises(IndexError):
+        read_midi_notes(path)
+
+
 def test_fixed_size_header_read_cannot_borrow_neighbour_instruments(tmp_path):
     path=tmp_path/'records.jsonl'
     first=json.dumps(dict(instrument=['instrument','drum'])).encode()+b'\n'
@@ -98,9 +130,7 @@ def test_retry_percentage_uses_consumed_attempts_and_reports_routing_separately(
     messages=[]
     counts=dict(attempts=110,retries=10,routed=20,malformed=6,protected=4)
     stats=torch.tensor([counts.get(k,0) for k in DATA_STAT_NAMES])
-    metrics=report_data_stats(stats,'train',messages.append)
-    assert metrics['data_retry_percent']==pytest.approx(1000/110)
-    assert metrics['data_routed_percent']==20
+    assert report_data_stats(stats,'train',messages.append) is None
     assert 'retries=10/110 (9.09% of attempts)' in messages[0]
     assert 'routed=20/100 (20.00% of accepted)' in messages[0]
     assert 'malformed=6' in messages[0] and 'protected=4' in messages[0]
@@ -326,3 +356,24 @@ def test_distinct_recorded_drum_takes_are_not_dropped_for_sharing_piano(tmp_path
     assert manifest['supplemental_performances']['records']==2
     assert len([r for r in manifest['prepared_extra_rows'] if r.get('supplemental')])==2
 
+
+
+def test_annotation_parse_cache_reused_without_bypassing_copy_protection(tmp_path,monkeypatch):
+    import hashlib
+    import improvnet.utils.melody_data as module
+    config,_=corpus(tmp_path,ratio=1,raw_count=1)
+    config.FALLBACK_PARSED_CACHE=tmp_path/'annotation_cache'
+    dataset=MelodyDataset(config.DATA_FILE,'train',config)
+    row=next(r for r in dataset.other if r['kind']=='raw')
+    digest=hashlib.sha256(row['path'].encode()).hexdigest()
+    path=config.FALLBACK_PARSED_CACHE/digest[:2]/(digest+'.json')
+    path.parent.mkdir(parents=True)
+    record=mix(20,row['genre'])
+    payload=dict(version=5,sha256='source-sha',fingerprint='melody-hash',record=record)
+    path.write_text(json.dumps(payload))
+    monkeypatch.setattr(module,'read_job',lambda *a:pytest.fail('Must reuse annotated notes'))
+    assert dataset.load_record(row)['notes']==json.loads(path.read_text())['record']['notes']
+    dataset.cache.clear()
+    dataset.protected_hashes.add('source-sha')
+    with pytest.raises(ValueError,match='protected'):
+        dataset.load_record(row)

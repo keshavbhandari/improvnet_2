@@ -1,4 +1,4 @@
-"""Small, bounded repairs to retained notes during V5 stem generation.
+"""Small, bounded repairs to retained notes during optional stem denoising.
 
 The accompaniment can move slightly while the melody pitches, every retained
 instrument/note, exact chord grouping and the chunk's ownership clock survive.
@@ -46,7 +46,6 @@ class StemAnchors:
             latest = min(onset + self.timing, latest)
             self.upper[onset] = latest
             latest -= tokenizer.time_step_ms
-        self.by_time = {t: i for i, t in enumerate(self.times)}
 
     def onset_bounds(self, index, last_onset):
         time = self.notes[index].onset

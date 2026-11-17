@@ -1,16 +1,14 @@
 """Train-fold-only automatic performance reference selection."""
 from pathlib import Path
-import random
 from improvnet.model import melody_config
 from improvnet.utils.melody import MelodyTokenizer, Note
 from improvnet.utils.melody_reference import PIANOS
 from improvnet.utils.melody_data import MelodyDataset
-from improvnet.utils.melody_stems import kit_only_notes
 from improvnet.utils.reference_catalog import DEFAULT_CATALOG, load_catalog, load_entry_notes
 
 
-def choose_reference(encoder, genre, rng, *, regions='same', reference_id=None,
-                     bucket=None, catalog_path=DEFAULT_CATALOG):
+def choose_reference(encoder, genre, rng, *, reference_id=None,
+                     bucket=None, catalog_path=DEFAULT_CATALOG,mode='trio',stage_instruments=None,aggregation='window'):
     if reference_id or bucket or Path(catalog_path).is_file():
         catalogue = load_catalog(catalog_path)
         rows = [e for e in catalogue['examples'] if e['genre'] == genre
@@ -32,12 +30,12 @@ def choose_reference(encoder, genre, rng, *, regions='same', reference_id=None,
                     if getattr(encoder, name).sha256 != catalogue['encoders'][name]['sha256']:
                         raise ValueError('Catalogue encoder changed; rebuild the reference catalogue')
                 result = encoder.from_notes(load_entry_notes(entry), MelodyTokenizer(),
-                    random.Random(entry['excerpt']['seed']), regions=regions)
+                    mode=mode,stage_instruments=stage_instruments,aggregation=aggregation,rng=rng)
                 result.update(id=entry['id'], path=entry['path'], title=entry['title'],
                     genre=entry['genre'], source=entry['source'], instruments=entry['instruments'],
                     rhythm=entry['rhythm'], style_bucket=entry['style_bucket'], beat_bucket=entry['beat_bucket'],
                     catalogue_excerpt=entry['excerpt'], catalogue=str(catalog_path),
-                    bucket_scope='Stored excerpt; --reference-regions different changes the beat window')
+                    bucket_scope='Catalogue selects the piece; inference embeds a random window or averages all eligible windows')
                 return result
             except (OSError, ValueError, KeyError) as error:
                 failures.append(str(error))
@@ -51,10 +49,19 @@ def choose_reference(encoder, genre, rng, *, regions='same', reference_id=None,
         try:
             record = data.load_record(row)
             notes = [Note('Acoustic Piano' if n[0]=='piano' else n[0], *n[1:]) for n in record['notes']]
-            notes += kit_only_notes([Note(*n) for n in record.get('drums', [])])
-            result = encoder.from_notes(notes, MelodyTokenizer(), rng, regions=regions)
+            notes += [Note(*n) for n in record.get('drums', [])]
+            result = encoder.from_notes(notes, MelodyTokenizer(), mode=mode,stage_instruments=stage_instruments,aggregation=aggregation,rng=rng)
             result['id'] = record.get('path') or row.get('path') or str(row.get('offset'))
             return result
         except (ValueError, OSError, KeyError):
             continue
     raise ValueError('No usable training-fold piano reference; pass --style-reference')
+
+
+def reference_report(value):
+    """Remove embeddings/internal fields recursively before serializing an inference report."""
+    if isinstance(value,dict):
+        return {k:reference_report(v) for k,v in value.items() if not hasattr(v,'detach') and not k.startswith('_')}
+    if isinstance(value,(list,tuple)):
+        return [reference_report(v) for v in value]
+    return value

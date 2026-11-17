@@ -19,6 +19,8 @@ cd /e/home/jusers/bhandari1/jupiter/improvnet_melody_contrastive || exit 1
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1
+# Variable-length batches otherwise fragment the CUDA allocator over time.
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 # Set to 0 in the submission environment to disable automatic continuation.
 export AUTO_RESUBMIT="${AUTO_RESUBMIT:-1}"
 
@@ -28,7 +30,12 @@ if command -v git >/dev/null 2>&1; then
     git status --short
 fi
 
-CHECKPOINT_REQUEST_FILE="/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v8/.checkpoint-request-${SLURM_JOB_ID}"
+if [[ -n "${CHECKPOINT_REQUEST_FILE:-}" && "$CHECKPOINT_REQUEST_FILE" != */melody_refinement_v12/* ]]; then
+    echo "Refusing to turn an older run's automatic continuation into V12. Submit V12 explicitly after review." >&2
+    exit 1
+fi
+
+CHECKPOINT_REQUEST_FILE="/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v12/.checkpoint-request-${SLURM_JOB_ID}"
 export CHECKPOINT_REQUEST_FILE
 mkdir -p "$(dirname "$CHECKPOINT_REQUEST_FILE")"
 rm -f "$CHECKPOINT_REQUEST_FILE"

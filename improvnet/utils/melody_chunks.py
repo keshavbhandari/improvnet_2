@@ -2,7 +2,7 @@
 from dataclasses import replace
 import math
 
-from improvnet.utils.melody import notes_to_tokens, ordered, TASKS
+from improvnet.utils.melody import notes_to_tokens, ordered, TASKS, tokens_to_notes, PREFIX_TOKENS
 
 
 def token_count(notes, start=0, stop=None):
@@ -70,14 +70,14 @@ def stem_bounds(notes,start,stop):
 
 
 def history_tokens(notes, max_tokens, tokenizer):
-    """Keep a bounded clean/generated tail, with complete notes and no lead-in T's."""
+    """Fit the most recent complete onset groups."""
     if not notes or max_tokens < 6:
         return []
     notes = ordered(notes)
     start = len(notes)
     while start > 0:
         previous = start - 1
-        while previous > 0 and notes[previous - 1].onset == notes[previous].onset:
+        while previous > 0 and notes[previous-1].onset == notes[start-1].onset:
             previous -= 1
         if token_count(notes, previous) > max_tokens:
             break
@@ -85,23 +85,36 @@ def history_tokens(notes, max_tokens, tokenizer):
     if start == len(notes):
         return []
     origin = notes[start].onset
-    return notes_to_tokens([replace(n, onset=n.onset - origin) for n in notes[start:]], tokenizer)
+    return notes_to_tokens([replace(n,onset=n.onset-origin) for n in notes[start:]], tokenizer)
+
+
+def trim_history(tokens, max_tokens, tokenizer):
+    """Drop oldest complete groups to prioritize an intact source and response."""
+    if len(tokens) <= max_tokens:
+        return tokens
+    return history_tokens(tokens_to_notes(tokens, tokenizer),
+                          max(0,max_tokens),tokenizer)
 
 
 def validate_lengths(config):
-    if not 16 <= config.SEQ_LEN <= 8192:
-        raise ValueError('SEQ_LEN must be between 16 and 8192, including conditions')
+    if config.REFERENCE_WINDOWS!=1:raise ValueError('V12 training uses exactly one reference window')
+    if not 0<=config.REFERENCE_PITCH_SEMITONES<=7 or int(config.REFERENCE_PITCH_SEMITONES)!=config.REFERENCE_PITCH_SEMITONES:
+        raise ValueError('Reference pitch augmentation must use integer semitones up to seven')
+    if not 0<=config.JAZZ_RAMP_START_STEP<config.JAZZ_RAMP_END_STEP or config.JAZZ_BLUES_REPEATS<1:
+        raise ValueError('Invalid jazz curriculum')
+    for name in ('REFERENCE_WINDOWS','REFERENCE_LOCAL_BINS','REFERENCE_ENCODER_BATCH_SIZE'):
+        if getattr(config,name)<1 or int(getattr(config,name))!=getattr(config,name):
+            raise ValueError(f'{name} must be a positive integer')
+    if not PREFIX_TOKENS+16 <= config.SEQ_LEN <= 8192:
+        raise ValueError('SEQ_LEN must fit the 34-position prefix and music within 8192 positions')
     if not 6 <= config.CHUNK_TOKENS < config.SEQ_LEN - 6:
         raise ValueError('CHUNK_TOKENS must leave room for response and separators')
-    if not 6 <= config.MIX_RESPONSE_TOKENS < config.SEQ_LEN - 6:
-        raise ValueError('MIX_RESPONSE_TOKENS must leave room for input and separators')
     if not 0 <= config.HISTORY_TOKENS < config.SEQ_LEN or not 0 <= config.HISTORY_PROB <= 1:
         raise ValueError('Invalid history token cap or probability')
-    if not math.isfinite(config.HARMONIZE_EXPANSION) or config.HARMONIZE_EXPANSION < 1:
-        raise ValueError('HARMONIZE_EXPANSION must be at least 1')
     for name in ('POLY_HISTORY_PROB', 'HISTORY_CORRUPTION_PROB', 'REFERENCE_PROB',
-                 'STEM_DRUM_PROB', 'AR_MIXTURE_PROB', 'STEM_PITCH_SHIFT_PROB', 'GENERIC_MERGE_PROB',
-                 'STEM_PITCH_SHIFT_MIN_PROB', 'STEM_PITCH_CLEAN_PROB', 'HARMONIZE_FULL_MASK_PROB'):
+                 'STEM_DRUM_PROB', 'STEM_SOURCE_CORRUPTION_PROB', 'AR_MIXTURE_PROB', 'STEM_PITCH_SHIFT_PROB', 'GENERIC_MERGE_PROB',
+                 'STEM_PITCH_SHIFT_MIN_PROB', 'STEM_PITCH_CLEAN_PROB', 'HARMONIZE_FULL_MASK_PROB',
+                 'KIT_DRUM_EXAMPLE_PROB','REFERENCE_EXACT_PROB'):
         if not 0 <= getattr(config, name) <= 1:
             raise ValueError(f'{name} must be in [0,1]')
     if len(config.TASK_WEIGHTS) != len(TASKS) or any(not math.isfinite(x) or x < 0 for x in config.TASK_WEIGHTS) or sum(config.TASK_WEIGHTS) <= 0:
@@ -117,8 +130,8 @@ def validate_lengths(config):
         raise ValueError('Stem pitch shifts must be between 0 and 7 semitones')
     if not 0 <= config.STEM_PITCH_SHIFT_MIN_PROB <= config.STEM_PITCH_SHIFT_PROB <= .05:
         raise ValueError('Stem pitch corruption rates must lie between 0% and 5%')
-    if not .5 < config.HARMONIZE_MIN_MASK_RATIO <= 1:
-        raise ValueError('Harmonization timing masking must be greater than 50%')
+    if not .9 <= config.HARMONIZE_MIN_MASK_RATIO <= 1:
+        raise ValueError('Harmonization timing masking must be between 90% and 100%')
     if config.GENERIC_MERGE_PROB > .5:
         raise ValueError('Generic merge probability cannot exceed 50% of additional edits')
     if not 1 <= config.MAX_CORRUPTIONS <= 4 or int(config.MAX_CORRUPTIONS) != config.MAX_CORRUPTIONS:

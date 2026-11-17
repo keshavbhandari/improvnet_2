@@ -4,7 +4,7 @@ from pathlib import Path
 
 import mido
 from mido.midifiles import midifiles as smf
-from mido.midifiles.meta import KeySignatureError, meta_charset
+from mido.midifiles.meta import KeySignatureError, meta_charset, build_meta_message
 
 from improvnet.tokenizer.midi import MidiDict, midi_to_dict
 
@@ -37,10 +37,21 @@ class RecoverableMidiFile(mido.MidiFile):
                         if status!=0xff:
                             last_status=status
                     if status==0xff:
+                        meta_type=smf.read_byte(infile)
+                        data=smf.read_bytes(infile,smf.read_variable_int(infile))
                         try:
-                            msg=smf.read_meta_message(infile,delta)
+                            msg=build_meta_message(meta_type,data,delta)
                         except KeySignatureError:
                             self.recovery['invalid_key_signature']+=1
+                            msg=mido.MetaMessage('sequencer_specific',time=delta)
+                        except IndexError:
+                            expected={0x58:4,0x59:2}.get(meta_type)
+                            if expected is None or len(data)>=expected:
+                                raise
+                            name='truncated_time_signature' if meta_type==0x58 else 'truncated_key_signature'
+                            self.recovery[name]+=1
+                            # Keep the delta time. Broken descriptive metadata
+                            # must not alter musical events or tempo messages.
                             msg=mido.MetaMessage('sequencer_specific',time=delta)
                     elif status in (0xf0,0xf7):
                         data=smf.read_bytes(infile,smf.read_variable_int(infile))
@@ -66,7 +77,7 @@ class RecoverableMidiFile(mido.MidiFile):
 def read_midi_dict(path, recovery=None):
     try:
         midi=mido.MidiFile(path)
-    except (KeySignatureError,ValueError,OSError) as original:
+    except (KeySignatureError,ValueError,OSError,IndexError) as original:
         try:
             midi=RecoverableMidiFile(path)
         except Exception:

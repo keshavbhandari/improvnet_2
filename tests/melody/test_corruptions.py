@@ -1,4 +1,4 @@
-"""Current V5 corruptions contracts."""
+"""Current finetuning corruptions contracts."""
 import random
 import pytest
 import torch
@@ -12,13 +12,13 @@ from improvnet.utils.melody_ornaments import merge_nonornaments, ornament_spans,
 from collections import Counter
 
 
-def test_v6_has_three_tasks_fresh_path_and_original_ar_initialization():
+def test_current_run_has_three_tasks_fresh_path_and_original_ar_initialization():
     assert TASKS == ('refine', 'harmonize', 'stem')
-    assert cfg.TASK_WEIGHTS == (.20, .40, .40) and cfg.PROTOCOL_VERSION == 11
-    assert cfg.SAVE_DIR.endswith('/melody_refinement_v8')
+    assert cfg.TASK_WEIGHTS == (.20, .40, .40) and cfg.PROTOCOL_VERSION == 16
+    assert cfg.SAVE_DIR.endswith('/melody_refinement_v12')
     assert cfg.DATA_FILE.name == 'melody_manifest_v7.json'
     assert '/ar_context_split_instrument/' in cfg.INIT_CHECKPOINT
-    assert cfg.BATCH_SIZE == 24 and cfg.CHUNK_TOKENS == 512 and cfg.MIX_RESPONSE_TOKENS == 2048
+    assert cfg.BATCH_SIZE == 24 and cfg.CHUNK_TOKENS == 512
     assert cfg.HISTORY_TOKENS == 2048 and cfg.SEQ_LEN == 8192
 
 
@@ -85,21 +85,21 @@ def test_stem_pitch_shifts_cannot_reorder_retained_chord_anchors_across_instrume
         assert all(abs(a.pitch-b.pitch)<=7 for a,b in zip(notes,result))
 
 
-def test_stem_source_is_corrupted_but_full_mix_and_history_labels_are_clean():
+def test_stem_source_full_mix_and_history_are_clean_by_default():
     rec = mix(200)
     ex = prepare_example(rec,random.Random(17),settings(POLY_HISTORY_PROB=1.,REFERENCE_PROB=1.),
                          task='stem',target_instrument='drum')
     clean = response(ex); noisy = tokens_to_notes(prompt_source(ex))
     retained = [n for n in clean if n.instrument!='drum']
-    assert len(noisy) == len(retained) and noisy != retained
+    assert len(noisy) == len(retained) and noisy == retained
     assert ex['stem_name']=='drum' and ex['stem_mask'].any()
     assert ex['history_length'] and not ex['history_mono'] and not ex['history_corrupted']
-    assert ex['style_present'] and ex['exposure'].shape == (7,)
+    assert ex['reference_ids'].ne(2).any() and ex['exposure'].shape == (7,)
     expected = ordered([replace(Note(*n),onset=n[3]-ex['start_ms']) for n in rec['notes']+rec['drums']
                         if ex['start_ms']<=n[3]<ex['end_ms']])
     assert clean == expected
-    assert ex['source_length']<=512 and ex['response_length']+1<=2048
-    # Validation denoising remains task-realistic but exactly reproducible.
+    assert ex['source_length']<=512 and len(ex['input'])+3<=8192
+    # Clean validation source and labels remain exactly reproducible.
     same = prepare_example(rec,random.Random(17),settings(POLY_HISTORY_PROB=1.,REFERENCE_PROB=1.),
                            task='stem',target_instrument='drum')
     assert torch.equal(ex['input'],same['input']) and torch.equal(ex['target'],same['target'])
@@ -130,11 +130,6 @@ def test_generic_merge_has_ten_percent_extra_weight():
     assert len(tokens_to_notes(source)) < len(notes)
 
 
-def test_retired_orchestration_is_not_a_v5_training_task():
-    with pytest.raises(ValueError,match='Unknown v5 task'):
-        prepare_example(mix(20),random.Random(1),task='orchestrate')
-
-
 @pytest.mark.parametrize('count',(1,2,3,5,7,127))
 @pytest.mark.parametrize('fraction',(.6,.73,1.))
 def test_timing_masking_strictly_exceeds_half_even_in_small_groups(count,fraction):
@@ -149,21 +144,21 @@ def test_timing_masking_strictly_exceeds_half_even_in_small_groups(count,fractio
 def test_severity_sampler_includes_full_masking_and_never_weak_examples():
     rng=random.Random(4)
     fractions=[harmonize_strength(rng) for _ in range(2000)]
-    assert all(.6<=f<=1 for f in fractions)
+    assert all(.9<=f<=1 for f in fractions)
     assert 430<=sum(f==1 for f in fractions)<=570
-    assert harmonize_strength(rng,0)==.6 and harmonize_strength(rng,.9)==.9
+    assert harmonize_strength(rng,0)==.9 and harmonize_strength(rng,.9)==.9
 
 
 @pytest.mark.parametrize('requested',(0.,.2,.6,.9,1.))
 def test_real_harmonize_examples_mask_heavily_and_keep_clean_targets(requested):
     record=mix(60)
-    example=prepare_example(record,random.Random(14),settings(HISTORY_PROB=0.,POLY_HISTORY_PROB=0.,RHYTHM_STYLE_PROB=0.),
+    example=prepare_example(record,random.Random(14),settings(HISTORY_PROB=0.,POLY_HISTORY_PROB=0.),
                             task='harmonize',strength=requested)
     source=prompt_source(example)
     note_count=sum(isinstance(t,tuple) and t[0]=='note' for t in source)
-    assert source.count('<MASK>')/(2*note_count)>=.6
-    assert example['timing_mask_fraction']>.5
-    assert example['strength'].item()==pytest.approx(max(.6,requested))
+    assert source.count('<MASK>')/(2*note_count)>=.9
+    assert example['timing_mask_fraction']>=.9
+    assert example['strength'].item()==pytest.approx(max(.9,requested))
     expected=ordered([replace(Note(*n),onset=n[3]-example['start_ms']) for n in record['notes']
                       if example['start_ms']<=n[3]<example['end_ms']])
     assert response(example)==expected and example['source_length']<=512
@@ -175,7 +170,7 @@ def test_all_three_tasks_show_history_about_three_quarters_of_eligible_examples(
     for task in TASKS:
         shown=0
         for seed in range(100):
-            ex=prepare_example(record,random.Random(seed),settings(RHYTHM_STYLE_PROB=0.),task=task)
+            ex=prepare_example(record,random.Random(seed),settings(),task=task)
             shown+=bool(ex['history_length'])
             if ex['history_length']:assert ex['history_mono']==(task=='refine')
         assert 60<=shown<=88
@@ -208,7 +203,7 @@ def test_model_can_repair_seven_semitones_but_not_change_skyline_or_exceed_cap()
     script=[]
     for note in anchors:script+=attrs(79 if note.pitch==72 else 67,note.onset,200)
     infer,_=scripted_inference(script+['<E>'])
-    infer.meta.update(version=9,stem_pitch_shift_semitones=7,stem_pitch_shift_prob=.05)
+    infer.meta.update(version=16,stem_pitch_shift_semitones=7,stem_pitch_shift_prob=.05)
     result=infer.generate(make_prompt('stem',['<S>','<E>'],target_instrument='drum'),
         'jazz',1.,['Acoustic Piano','drum'],2200,temperature=0.,fixed_notes=anchors,
         stem_add=True,target_instrument='drum',stop_at_window_end=True,max_new_tokens=256)
@@ -220,8 +215,8 @@ def test_model_can_repair_seven_semitones_but_not_change_skyline_or_exceed_cap()
 
 def test_inference_harmonize_enforces_mask_floor_and_reports_actual_fraction(monkeypatch):
     infer,_=scripted_inference([])
-    infer.meta.update(version=9,tasks=list(TASKS),seq_len=512,chunk_tokens=18,history_tokens=64,
-                      mix_response_tokens=128,harmonize_expansion=4.,skyline_tolerance_ms=50)
+    infer.meta.update(version=16,tasks=list(TASKS),seq_len=512,chunk_tokens=18,history_tokens=64,
+                      skyline_tolerance_ms=50)
     infer.options=cfg
     notes=[Note('Acoustic Piano',72,90,t,80) for t in (0,200)]
     calls=[]
@@ -231,7 +226,7 @@ def test_inference_harmonize_enforces_mask_floor_and_reports_actual_fraction(mon
         return notes
     monkeypatch.setattr(infer,'generate',generate)
     result,logs=infer.transform(notes,'harmonize','jazz',0.,random.Random(5),instruments=['Acoustic Piano'])
-    assert result==notes and calls[0][1]==.6
+    assert result==notes and calls[0][1]==.9
     assert calls[0][0][0]=='<HARMONIZE>' and calls[0][0].count('<MASK>')==4
     assert logs[0]['timing_mask_fraction']==1.
 
@@ -336,7 +331,7 @@ def test_training_condition_reflects_mandatory_merge_and_target_stays_clean():
     notes=trill()
     record=dict(notes=[[n.instrument,n.pitch,n.velocity,n.onset,n.duration] for n in notes],
                 drums=[],source='fixture',genre='jazz',path='trill.mid')
-    example=prepare_example(record,PickEdit('pitch'),settings(HISTORY_PROB=0.,RHYTHM_STYLE_PROB=0.),
+    example=prepare_example(record,PickEdit('pitch'),settings(HISTORY_PROB=0.),
                             task='refine',strength=0.)
     assert example['requested_strength']==0. and example['strength'].item()==.75
     clean=[replace(n,onset=n.onset-notes[0].onset) for n in notes]
@@ -349,8 +344,8 @@ def test_training_condition_reflects_mandatory_merge_and_target_stays_clean():
 @pytest.mark.parametrize('requested', [.1, .9])
 def test_positive_inference_strength_still_accounts_for_mandatory_merges(monkeypatch, requested):
     infer,_=scripted_inference([])
-    infer.meta.update(version=9,tasks=list(TASKS),seq_len=512,chunk_tokens=64,history_tokens=64,
-                      mix_response_tokens=128,skyline_tolerance_ms=50)
+    infer.meta.update(version=16,tasks=list(TASKS),seq_len=512,chunk_tokens=64,history_tokens=64,
+                      skyline_tolerance_ms=50)
     infer.options=cfg
     notes=trill();seen=[]
     def generate(prompt,genre,strength,*args,**kwargs):
@@ -365,8 +360,8 @@ def test_positive_inference_strength_still_accounts_for_mandatory_merges(monkeyp
 
 def test_zero_inference_strength_preserves_ornaments_without_corruption_or_generation(monkeypatch):
     infer,calls=scripted_inference([])
-    infer.meta.update(version=11,tasks=list(TASKS),seq_len=512,chunk_tokens=64,history_tokens=64,
-                      mix_response_tokens=128,skyline_tolerance_ms=50)
+    infer.meta.update(version=16,tasks=list(TASKS),seq_len=512,chunk_tokens=64,history_tokens=64,
+                      skyline_tolerance_ms=50)
     infer.options=cfg
     def fail(*args,**kwargs):
         raise AssertionError('Zero refinement must bypass corruption and model generation')
@@ -430,7 +425,7 @@ def test_requested_ten_to_hundred_percent_controls_actual_additional_note_covera
             assert after.onset%10==after.duration%10==0
 
 
-def test_training_removes_auxiliary_percussion_from_current_mix_and_history_without_changing_record():
+def test_training_preserves_auxiliary_percussion_in_current_mix_and_history_without_changing_record():
     from copy import deepcopy
     from improvnet.utils.melody_stems import DRUM_KIT_PITCHES
     record=mix(80)
@@ -441,41 +436,40 @@ def test_training_removes_auxiliary_percussion_from_current_mix_and_history_with
         example=prepare_example(record,random.Random(14),settings(HISTORY_PROB=1.,POLY_HISTORY_PROB=1.,HISTORY_CORRUPTION_PROB=1.),
                                 task=task,target_instrument='Acoustic Bass' if task=='stem' else None)
         assert example['history_length']>0
-        assert example['nonkit_drum_notes_filtered']==800
+        assert not example['stem_source_corrupted']
         inst=None;drums=[]
         for token in [MelodyTokenizer().id_to_tok[i] for i in example['input'].tolist()]:
             if isinstance(token,tuple) and token[0]=='instrument':inst=token[1]
             if isinstance(token,tuple) and token[0]=='note' and inst=='drum':drums.append(token[1])
-        assert all(p in DRUM_KIT_PITCHES for p in drums)
-        if task=='stem':assert drums and all(n.pitch in DRUM_KIT_PITCHES for n in response(example) if n.instrument=='drum')
+        if task=='stem':
+            assert drums and {39,54,56,60,82} <= set(drums)
+            assert example['percussion_palette']=='full'
+            actual=[n for n in response(example) if n.instrument=='drum']
+            expected=[replace(Note(*n),onset=n[3]-example['start_ms']) for n in record['drums'] if example['start_ms']<=n[3]<example['end_ms']]
+            assert Counter(actual)==Counter(expected)
     assert record==original
 
 
-def test_auxiliary_only_percussion_routes_to_another_task_without_parse_retries(tmp_path,monkeypatch):
+def test_auxiliary_only_percussion_remains_a_full_mode_drum_target(tmp_path,monkeypatch):
     from melody_test_helpers import corpus
     from improvnet.utils.melody_data import MelodyDataset,DATA_STAT_NAMES
     config,_=corpus(tmp_path)
     config.TASK_WEIGHTS=(0.,0.,1.)
+    config.KIT_DRUM_EXAMPLE_PROB=0.
     dataset=MelodyDataset(config.DATA_FILE,'train',config)
     record=dict(mix(30),drums=[['drum',60,80,100,20]])
     record['notes']=[n for n in record['notes'] if n[0]=='Acoustic Piano']
     monkeypatch.setattr(dataset,'load_record',lambda row:record)
     example=dataset[0]
-    assert TASKS[example['task']] in ('refine','harmonize')
+    assert TASKS[example['task']]=='stem' and example['percussion_palette']=='full'
+    assert {n.pitch for n in response(example) if n.instrument=='drum'}=={60}
     stats=dict(zip(DATA_STAT_NAMES,example['data_stats'].tolist()))
-    assert stats['routed']==1 and stats['retries']==0 and stats['attempts']==1
+    assert stats['routed']==0 and stats['retries']==0 and stats['attempts']==1
 
 
-def test_electronic_hihat_edges_normalize_without_losing_rhythm_or_remapping_other_instruments():
-    from improvnet.utils.melody_stems import kit_only_notes
-    notes=[Note('Acoustic Piano',22,90,0,400),Note('drum',22,60,100,20),
-           Note('drum',42,90,100,20),Note('drum',26,80,300,30),Note('drum',60,80,400,20)]
-    normalized=kit_only_notes(notes)
-    assert normalized==[notes[0],notes[2],replace(notes[3],pitch=46)]
-    assert [n.onset for n in normalized if n.instrument=='drum']==[100,300]
-    assert kit_only_notes(normalized)==normalized
+def test_training_preserves_electronic_hihat_articulations():
     record=mix(30)
     record['drums']=[['drum',22,60,i*200,20] for i in range(30)]+[['drum',26,80,i*200+100,20] for i in range(30)]
     example=prepare_example(record,random.Random(4),settings(),task='stem',target_instrument='drum')
-    assert {n.pitch for n in response(example) if n.instrument=='drum'}<={42,46}
-    assert example['drum_articulations_normalized']==60 and example['nonkit_drum_notes_filtered']==0
+    assert {n.pitch for n in response(example) if n.instrument=='drum'}=={22,26}
+    assert not example['stem_source_corrupted']

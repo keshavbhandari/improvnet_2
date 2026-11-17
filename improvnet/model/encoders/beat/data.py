@@ -8,7 +8,6 @@ from improvnet.model.encoders.data import PiecePairDataset, transpose_view, mask
 from improvnet.utils.melody import Note, ordered, notes_to_tokens
 from improvnet.utils.melody_reference import PIANOS
 from improvnet.utils.melody_chunks import token_count
-from improvnet.utils.melody_stems import kit_only_notes
 from improvnet.metrics.continuity.data import PairCollator
 
 
@@ -102,7 +101,7 @@ class BeatPairDataset(PiecePairDataset):
 
     def load_notes(self,row):
         rec=self.base.load_record(row)
-        return ordered([Note('Acoustic Piano' if n[0]=='piano' else n[0],*n[1:]) for n in rec['notes']]+kit_only_notes([Note(*n) for n in rec.get('drums',[])]))
+        return ordered([Note('Acoustic Piano' if n[0]=='piano' else n[0],*n[1:]) for n in rec['notes']]+[Note(*n) for n in rec.get('drums',[])])
 
     @staticmethod
     def identity(row):

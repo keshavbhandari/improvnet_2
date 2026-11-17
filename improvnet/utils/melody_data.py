@@ -12,15 +12,16 @@ import random
 import torch
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from improvnet.model import melody_config as cfg
-from improvnet.scripts.melody_prepare import make_record, read_job, melody_fingerprint
+from improvnet.scripts.melody_prepare import make_record, read_job
 from improvnet.utils.ar_utils import ProcessData
 from improvnet.utils.melody import (Note, MelodyTokenizer, TASKS, make_prompt, mask_timing,
-    melody_voice, notes_to_tokens, ordered, sample_strength, harmonize_strength, skyline, tokens_to_notes, window)
+    PREFIX_TOKENS, melody_voice, notes_to_tokens, ordered, sample_strength, harmonize_strength, skyline, tokens_to_notes, window)
+from improvnet.utils.drum_profile import drum_profile
 from improvnet.utils.melody_chunks import (chunk_bounds, chunk_end, chunk_starts,
-                                          history_tokens, stem_bounds, shorten_chunk, validate_lengths)
+                                          history_tokens, trim_history, stem_bounds, shorten_chunk, validate_lengths)
 from improvnet.utils.melody_corruptions import corrupt_history, corrupt_stem_source, sample_stem_pitch_probability, refinement_source, refinement_strength
-from improvnet.utils.melody_reference import neighboring_reference, reference_ids
-from improvnet.utils.melody_stems import choose_missing_stem, instrument_weight, DRUM_KIT_PITCHES, DRUM_KIT_ALIASES, kit_only_notes
+from improvnet.utils.melody_reference import neighboring_references, reference_ids, reference_instruments, transpose_reference
+from improvnet.utils.melody_stems import choose_missing_stem, instrument_weight, DRUM_KIT_PITCHES, DRUM_KIT_ALIASES, percussion_mode, PERCUSSION_MODES
 
 
 DATA_STAT_NAMES=('attempts','retries','routed','no_pitched','malformed','protected','token_budget','other')
@@ -39,21 +40,33 @@ def retry_reason(error):
     return 'other'
 
 
+class NoReferenceWindow(ValueError):
+    """No safe complete neighbor; keep this piece eligible for refinement."""
+
+
 class NoStemWindow(ValueError):
     """No meaningful multi-instrument stem target window is available."""
 
 
-def stem_source(full_mix,rng,config,target_instrument=None):
+class NoKitWindow(ValueError):
+    """Resample a different drum example; never strip a mixed-percussion window."""
+
+
+def stem_source(full_mix,rng,config,target_instrument=None,require_kit=False,prefer_pitched=False):
     """A complete retained mixture paired with the original mix, never labels."""
     instruments=sorted({n.instrument for n in full_mix})
     if len(instruments)<2 or not set(instruments)-{'drum'}:
         raise NoStemWindow('Stem addition requires at least two audible instruments')
     candidates=instruments.copy()
+    if prefer_pitched and len(set(instruments)-{'drum'}) > 1:
+        candidates = [i for i in candidates if i != 'drum']
     if target_instrument is not None:
         if target_instrument not in candidates:
             raise NoStemWindow('Requested stem is absent from the clean mixture')
         candidates=[target_instrument]
     full_onsets=[n.onset for n in full_mix]
+    auxiliary_onsets = [n.onset for n in full_mix if n.instrument == 'drum'
+                        and n.pitch not in DRUM_KIT_PITCHES and n.pitch not in DRUM_KIT_ALIASES]
     while candidates:
         selected=choose_missing_stem(candidates,rng,config.STEM_DRUM_PROB,config.JAZZ_INSTRUMENT_WEIGHT)
         source=[n for n in full_mix if n.instrument!=selected]
@@ -64,12 +77,16 @@ def stem_source(full_mix,rng,config,target_instrument=None):
         for begin in chunk_starts(source,config.CHUNK_TOKENS):
             stop=chunk_end(source,begin,config.CHUNK_TOKENS)
             start,end=stem_bounds(source,begin,stop)
+            if require_kit and selected == 'drum' and bisect_left(auxiliary_onsets,end)>bisect_left(auxiliary_onsets,start):
+                continue
             target=full_mix[bisect_left(full_onsets,start):bisect_left(full_onsets,end)]
             if bisect_left(attacks,end)>bisect_left(attacks,start) and len({n.instrument for n in target})>=2:
                 valid.append(begin)
         if valid:
             return selected,source,valid
         candidates.remove(selected)
+    if require_kit:
+        raise NoKitWindow('No authentic kit-only drum window in this piece')
     raise NoStemWindow('No overlapping missing-stem window')
 
 
@@ -101,14 +118,13 @@ def ar_record(entry):
     return record,fingerprint
 
 
-def prepare_example(record, rng, config=cfg, task=None, strength=None, target_instrument=None):
+def prepare_example(record, rng, config=cfg, task=None, strength=None, target_instrument=None,require_kit=False,prefer_pitched=False):
     tok = MelodyTokenizer()
     task = task or rng.choices(TASKS, config.TASK_WEIGHTS)[0]
     if task not in TASKS:
-        raise ValueError(f'Unknown v5 task: {task}')
+        raise ValueError(f'Unknown task: {task}')
     notes = ordered([Note('Acoustic Piano' if n[0] == 'piano' else n[0], *n[1:]) for n in record['notes']])
-    drums = kit_only_notes([Note(*n) for n in record.get('drums', [])])
-    nonkit_drums = sum(n[1] not in DRUM_KIT_PITCHES and n[1] not in DRUM_KIT_ALIASES for n in record.get('drums', []))
+    drums = [Note(*n) for n in record.get('drums', [])]
     if not notes:
         raise ValueError('No pitched notes')
     melody = melody_voice(notes if record['source'] in ('weimar', 'wikifonia', 'curated') else
@@ -123,7 +139,7 @@ def prepare_example(record, rng, config=cfg, task=None, strength=None, target_in
     target_domain = melody if task == 'refine' else notes
     target_instrument = target_instrument if task == 'stem' else None
     if task == 'stem':
-        target_instrument,domain,starts=stem_source(full_mix,rng,config,target_instrument)
+        target_instrument,domain,starts=stem_source(full_mix,rng,config,target_instrument,require_kit=require_kit,prefer_pitched=prefer_pitched)
         target_domain=full_mix
     else:
         starts=chunk_starts(domain,config.CHUNK_TOKENS)
@@ -152,8 +168,9 @@ def prepare_example(record, rng, config=cfg, task=None, strength=None, target_in
                                timing_ms=config.TIMING_CORRUPTION_MS, time_step_ms=tok.time_step_ms)
         left = history_tokens(hist, config.HISTORY_TOKENS, tok)
     stop = chunk_end(domain, begin, config.CHUNK_TOKENS)
-    stem_pitch_probability = sample_stem_pitch_probability(rng, config) if task == 'stem' else None
-    state, bounded = rng.getstate(), False
+    stem_corrupted = task == 'stem' and rng.random() < config.STEM_SOURCE_CORRUPTION_PROB
+    stem_pitch_probability = sample_stem_pitch_probability(rng, config) if stem_corrupted else 0.
+    state = rng.getstate()
     while True:
         rng.setstate(state)
         bounds=stem_bounds if task=='stem' else chunk_bounds
@@ -167,42 +184,55 @@ def prepare_example(record, rng, config=cfg, task=None, strength=None, target_in
         target_notes = window(target_domain, start, end)
         condition_strength = refinement_strength(core, strength, config) if task == 'refine' else strength
         if task == 'refine':
-            source = refinement_source(core, strength, rng, tok, config, bounded)
+            source = refinement_source(core, strength, rng, tok, config)
         elif task == 'harmonize':
             source = mask_timing(core, strength, rng, tok, round_up=True)
         elif task == 'stem':
             if not any(n.instrument==target_instrument for n in target_notes) or len({n.instrument for n in target_notes})<2:
                 raise NoStemWindow('Shrunk target has no requested missing-stem attacks')
-            source=notes_to_tokens(corrupt_stem_source(core,rng,tok,config,end-start,pitch_probability=stem_pitch_probability),tok)
+            source=notes_to_tokens(corrupt_stem_source(core,rng,tok,config,end-start,pitch_probability=stem_pitch_probability)
+                if stem_corrupted else core,tok)
         target = notes_to_tokens(target_notes, tok)[1:]
-        prompt = make_prompt(task, source, left, target_instrument)
-        cap = config.CHUNK_TOKENS if task=='refine' else config.MIX_RESPONSE_TOKENS
-        if len(source) <= config.CHUNK_TOKENS and len(target) + 1 <= cap and len(prompt) + len(target) + 2 <= config.SEQ_LEN:
+        # The selected target owns its full time interval. Sacrifice history first;
+        # only reduce the interval when source+response alone exceed the AR context.
+        empty_prompt = make_prompt(task, source, (), target_instrument)
+        history_room = config.SEQ_LEN - PREFIX_TOKENS - len(empty_prompt) - len(target)
+        if len(source) <= config.CHUNK_TOKENS and history_room >= 0:
+            original_history_length = len(left)
+            left = trim_history(left, history_room, tok)
+            prompt = make_prompt(task, source, left, target_instrument)
             break
-        available = config.SEQ_LEN - len(left) - 6 - 2*int(target_instrument is not None)
-        fraction = min(config.CHUNK_TOKENS / len(source), cap / (len(target) + 1), available / (len(source) + len(target)))
+        available = config.SEQ_LEN - PREFIX_TOKENS - len(make_prompt(task, [], (), target_instrument))
+        fraction = min(config.CHUNK_TOKENS / len(source), available / (len(source) + len(target)))
         try:
             stop = shorten_chunk(domain, begin, stop, .98 * fraction)
-        except ValueError:
-            if task != 'refine' or bounded or len(target) + 1 > cap:
-                raise ValueError('Complete onset group exceeds the training token budget')
-            bounded = True
-    reference = None
-    beat_reference = None
-    if task in ('harmonize', 'stem') and rng.random() < config.REFERENCE_PROB:
-        # Exclude all sounds owned by this target, including releases after end.
-        protected_end = max([end]+[n.onset+n.duration for n in full_mix if start<=n.onset<end])
-        reference = neighboring_reference(full_mix, start, protected_end, rng,
-            max_tokens=config.REFERENCE_TOKENS, guard_ms=config.REFERENCE_GUARD_MS,
-            max_distance_ms=config.REFERENCE_MAX_DISTANCE_MS,
-            instruments={n.instrument for n in target_notes})
-    if task in ('harmonize','stem') and rng.random()<config.REFERENCE_PROB:
+        except ValueError as error:
+            raise ValueError('Complete onset group exceeds the training token budget') from error
+    references=[]
+    reference_mode='exact' if rng.random()<config.REFERENCE_EXACT_PROB else 'trio'
+    required_instruments=reference_instruments({n.instrument for n in target_notes},reference_mode)
+    if task in ('harmonize','stem') and required_instruments and rng.random()<config.REFERENCE_PROB:
         protected_end=max([end]+[n.onset+n.duration for n in full_mix if start<=n.onset<end])
-        beat_reference=neighboring_reference(full_mix,start,protected_end,rng,
+        references=neighboring_references(full_mix,start,protected_end,rng,count=config.REFERENCE_WINDOWS,
             max_tokens=config.REFERENCE_TOKENS,guard_ms=config.REFERENCE_GUARD_MS,
-            max_distance_ms=config.REFERENCE_MAX_DISTANCE_MS)
-    beat_ids=reference_ids(beat_reference,tok)
-    ref_ids = reference_ids(reference, tok)
+            max_distance_ms=config.REFERENCE_MAX_DISTANCE_MS,instruments=required_instruments)
+    if task in ('harmonize','stem') and config.REFERENCE_PROB==1. and not references:
+        raise NoReferenceWindow('No safe complete neighboring reference window')
+    bank=torch.full((config.REFERENCE_WINDOWS,config.REFERENCE_TOKENS),tok.pad_id,dtype=torch.long)
+    for i,ref in enumerate(references):
+        stream=reference_ids(ref,tok)
+        bank[i,:len(stream)]=torch.tensor(stream)
+    style_bank,beat_bank=bank.clone(),bank.clone()
+    shifts=[]
+    for i,ref in enumerate(references):
+        pair=[]
+        for destination in (style_bank,beat_bank):
+            notes,shift=transpose_reference(ref['notes'],rng,config.REFERENCE_PITCH_SEMITONES) if record.get('_augment') else (ref['notes'],0)
+            stream=[tok.tok_to_id[t] for t in notes_to_tokens(notes,tok)]
+            destination[i,:len(stream)]=torch.tensor(stream)
+            pair.append(shift)
+        shifts.append(pair)
+    profile=drum_profile(references[0]['notes']) if task=='stem' and references else drum_profile([])
     ids = [tok.tok_to_id[t] for t in prompt + target]
     labels = [config.IGNORE_INDEX] * len(prompt) + [tok.tok_to_id[t] for t in target]
     stem_mask, current = [False] * len(prompt), None
@@ -221,21 +251,24 @@ def prepare_example(record, rng, config=cfg, task=None, strength=None, target_in
     exposure=torch.zeros(len(TASKS)*2+1,dtype=torch.long)
     exposure[TASKS.index(task)*2+int(genre in ('jazz','blues'))]=1
     exposure[-1]=int(target_instrument=='drum')
+    palette = percussion_mode(target_notes)
+    condition_stats = torch.tensor([int(target_instrument=='drum'),
+        int(target_instrument=='drum' and palette=='kit'), int(target_instrument=='drum' and palette=='full'),
+        int(bool(references) and reference_mode=='exact'), int(bool(references) and reference_mode=='trio'),
+        int(bool(references) and reference_mode=='exact'), int(bool(references) and reference_mode=='trio')])
     return dict(input=torch.tensor(ids[:-1]), target=torch.tensor(labels[1:]),
                 genre=torch.tensor(config.GENRES.index(genre)),
                 multi_hot=ProcessData().get_instrument_multihot(notes_to_tokens(target_notes, tok)),
                 strength=torch.tensor(condition_strength, dtype=torch.float32), requested_strength=strength, task=TASKS.index(task),
-                beat_ids=torch.tensor(beat_ids,dtype=torch.long),beat_present=torch.tensor(bool(beat_ids)),
-                beat_bounds=None if beat_reference is None else (beat_reference['start_ms'],beat_reference['end_ms']),
-                style_ids=torch.tensor(ref_ids, dtype=torch.long),
-                style_present=torch.tensor(bool(ref_ids)),
-                style_bounds=None if reference is None else (reference['start_ms'], reference['end_ms']),
-                style_view=None if reference is None else reference['view'], exposure=exposure, history_length=len(left), history_corrupted=history_corrupted,
+                percussion_mode=torch.tensor(PERCUSSION_MODES[palette]),percussion_palette=palette,condition_stats=condition_stats,
+                reference_mode=reference_mode,
+                reference_ids=bank,reference_style_ids=style_bank,reference_beat_ids=beat_bank,reference_pitch_shifts=shifts,reference_bounds=[(ref['start_ms'],ref['end_ms']) for ref in references],
+                reference_view=None if not references else references[0]['view'],drum_profile=profile,
+                exposure=exposure, history_length=len(left), history_corrupted=history_corrupted,
                 input_mono=task in ('refine', 'harmonize'), history_mono=task == 'refine',
                 refinement_changed_fraction=changed_fraction,
-                nonkit_drum_notes_filtered=nonkit_drums,
-                drum_articulations_normalized=sum(n[1] in DRUM_KIT_ALIASES for n in record.get('drums', [])),
-                drum_attacks_deduplicated=len(record.get('drums', []))-nonkit_drums-len(drums), timing_mask_fraction=source.count('<MASK>')/(2*len(core)) if task == 'harmonize' else None, stem_pitch_error_rate=stem_pitch_probability,
+                stem_source_corrupted=stem_corrupted,history_tokens_dropped=original_history_length-len(left),
+                timing_mask_fraction=source.count('<MASK>')/(2*len(core)) if task == 'harmonize' else None, stem_pitch_error_rate=stem_pitch_probability,
                 source_length=len(source), response_length=len(target), start_ms=start, end_ms=end,
                 stem_mask=torch.tensor(stem_mask[1:], dtype=torch.bool),
                 stem_instrument=torch.tensor(ProcessData().INSTRUMENT_CLASSES.index(target_instrument) if target_instrument else -1),
@@ -295,16 +328,15 @@ class MelodyDataset(Dataset):
         if self.split!='train':
             return len(self.eval_rows)
         fraction=sum(self.config.TASK_WEIGHTS[:2])/sum(self.config.TASK_WEIGHTS)
-        # Full file traversals for the two universally eligible tasks. Separate
-        # mixture draws preserve these traversals and the requested task weights.
+        # Keep a stable candidate-draw epoch length across the curriculum.
+        # Separate mixture draws preserve the requested task weights.
         return math.ceil(self.main_slots()/fraction) if fraction else self.main_slots()
 
 
     def set_epoch(self, epoch):
         self.epoch = epoch
         rng = random.Random(self.config.DATA_SPLIT_SEED + (epoch * 9176 if self.split == 'train' else 0))
-        # One traversal covers every jazz/blues row and 8x as many non-jazz
-        # candidate slots. Rotate a wider pool each epoch without changing splits.
+        # Rotate candidate files each epoch without changing protected splits.
         self.other_order = list(range(len(self.other)))
         rng.shuffle(self.other_order)
         if self.split == 'train':
@@ -384,9 +416,18 @@ class MelodyDataset(Dataset):
             source_path=row.get('raw_path') or row['path']
             digest = hashlib.sha256(source_path.encode()).hexdigest()
             cache = Path(self.config.PARSED_CACHE) / digest[:2] / (digest + '.json')
-            try:
-                payload = json.loads(cache.read_text())
-            except FileNotFoundError:
+            payload = None
+            caches = [cache]
+            annotated_cache = getattr(self.config, 'FALLBACK_PARSED_CACHE', None)
+            if annotated_cache:
+                caches.append(Path(annotated_cache) / digest[:2] / (digest + '.json'))
+            for parsed in caches:
+                try:
+                    payload = json.loads(parsed.read_text())
+                    break
+                except FileNotFoundError:
+                    continue
+            if payload is None:
                 job, sha, notes, error = read_job((Path(source_path), 'classical' if row['genre'] == 'classical' else 'jazz',
                                                   row['source'], '', False))
                 if error:
@@ -424,34 +465,42 @@ class MelodyDataset(Dataset):
             self.cache.popitem(last=False)
 
     def __getitem__(self, idx):
+        idx,step=idx if isinstance(idx,tuple) else (idx,0)
         rng = random.Random(self.config.DATA_SPLIT_SEED + idx * 1000003 + (self.epoch * 9176 if self.split == 'train' else 0))
-        ratio,repeats=self.config.CLASSICAL_RATIO,self.config.JAZZ_BLUES_REPEATS
+        forced_target, require_kit = None, False
+        ratio=self.config.CLASSICAL_RATIO
         weights=self.config.TASK_WEIGHTS
         if self.split=='train':
             fraction=sum(weights[:2])/sum(weights)
             before=math.floor(idx*fraction+1e-9)
             is_main=math.floor((idx+1)*fraction+1e-9)>before
             if is_main:
-                position=before%(self.main_slots())
-                block,within=divmod(position,ratio+repeats)
-                jazz_blues=within<repeats
+                weight=jazz_weight(step,self.config)
+                probability=weight/(ratio+weight)
+                jazz_before=math.floor(before*probability+1e-9)
+                jazz_blues=math.floor((before+1)*probability+1e-9)>jazz_before
                 pool=self.jazz_blues if jazz_blues else self.other
-                slot=block if jazz_blues else block*ratio+within-repeats
+                slot=jazz_before%len(self.jazz_blues) if jazz_blues else before-jazz_before
                 first=pool[slot if jazz_blues else self.other_order[slot%len(self.other_order)]]
                 task=rng.choices(TASKS[:2],weights[:2])[0]
             else:
                 auxiliary=idx-before
-                jazz_blues=auxiliary%(ratio+repeats)<repeats
+                weight=jazz_weight(step,self.config)
+                probability=weight/(ratio+weight)
+                jazz_blues=math.floor((auxiliary+1)*probability+1e-9)>math.floor(auxiliary*probability+1e-9)
                 task=rng.choices(TASKS[2:],weights[2:])[0]
                 use_ar=not jazz_blues and self.ar_mixtures and rng.random()<self.config.AR_MIXTURE_PROB
                 pool=self.ar_mixtures if use_ar else self.stem_pools[jazz_blues]
                 if rng.random()<self.config.STEM_DRUM_PROB:
                     drummed=self.task_pools['ar' if use_ar else jazz_blues,'drum']
                     pool=drummed or pool
+                    if drummed:
+                        forced_target = 'drum'
+                        require_kit = rng.random() < self.config.KIT_DRUM_EXAMPLE_PROB
                 if not pool:
                     pool=self.jazz_blues if jazz_blues else self.other
                 # Jazz instrument weighting applies to mixture draws, without
-                # removing any file from the four full jazz/blues traversals.
+                # overriding the scheduled genre proportions.
                 sample=rng.sample(pool,min(32,len(pool)))
                 first=rng.choices(sample,[max([instrument_weight(i,self.config.JAZZ_INSTRUMENT_WEIGHT)
                                        for i in r.get('instruments',[])] or [1.]) for r in sample])[0]
@@ -466,16 +515,20 @@ class MelodyDataset(Dataset):
             try:
                 record = dict(self.load_record(row), _augment=self.split == 'train')
                 try:
-                    result=prepare_example(record, rng, self.config, task)
-                except NoStemWindow:
-                    if task != 'stem':
-                        raise
-                    # Header instrument hints can disagree with the audible MIDI.
-                    # Reuse this same piece for a valid task instead of discarding
-                    # it or pretending that a missing second stem exists.
-                    weights=self.config.TASK_WEIGHTS[:2]
-                    fallback=rng.choices(TASKS[:2],weights if any(weights) else (1.,1.))[0]
-                    result=prepare_example(record,rng,self.config,fallback)
+                    result=prepare_example(record, rng, self.config, task,
+                        target_instrument=forced_target,require_kit=require_kit,
+                        prefer_pitched=self.split=='train' and forced_target is None)
+                except (NoStemWindow,NoReferenceWindow) as error:
+                    if isinstance(error,NoReferenceWindow):
+                        fallback='refine'
+                    else:
+                        weights=self.config.TASK_WEIGHTS[:2]
+                        fallback=rng.choices(TASKS[:2],weights if any(weights) else (1.,1.))[0]
+                    try:
+                        result=prepare_example(record,rng,self.config,fallback)
+                    except NoReferenceWindow:
+                        fallback='refine'
+                        result=prepare_example(record,rng,self.config,fallback)
                     self.routed_counts[task+' -> '+fallback]+=1
                     stats['routed']+=1
                 self.samples_seen+=1
@@ -507,15 +560,14 @@ def collate_examples(batch):
         if actual is not None:
             corruption += torch.tensor([1., example['requested_strength'], float(example['strength']),
                                         actual, float(actual <= .2), float(actual >= .8)], dtype=torch.float64)
-    references={}
-    for name in ('style','beat'):
-        length=max(1,max(len(x[name+'_ids']) for x in batch))
-        ids=torch.full((len(batch),length),cfg.PAD_ID,dtype=torch.long)
-        for i,x in enumerate(batch):ids[i,:len(x[name+'_ids'])]=x[name+'_ids']
-        references[name+'_ids']=ids
-        references[name+'_attention_mask']=ids.ne(cfg.PAD_ID)
-    return dict(**references,input=inputs,target=targets,task=torch.tensor([x['task'] for x in batch]),data_stats=data_stats,corruption_summary=corruption,**masks,
-        **{k:torch.stack([x[k] for x in batch]) for k in ('genre','multi_hot','strength','style_present','beat_present','stem_instrument','exposure')})
+    bank=torch.stack([x['reference_ids'] for x in batch])
+    # Trim only padding, retaining all windows and every complete source token.
+    width=max(1,int(bank.ne(cfg.PAD_ID).sum(-1).max()))
+    bank=bank[:,:,:width]
+    references=dict(reference_ids=bank,reference_attention_mask=bank.ne(cfg.PAD_ID),
+        **{key:torch.stack([x[key] for x in batch])[:,:,:width] for key in ('reference_style_ids','reference_beat_ids')})
+    return dict(**references,input=inputs,target=targets,window_ms=torch.tensor([x['end_ms']-x['start_ms'] for x in batch]),task=torch.tensor([x['task'] for x in batch]),data_stats=data_stats,corruption_summary=corruption,**masks,
+        **{k:torch.stack([x[k] for x in batch]) for k in ('genre','multi_hot','strength','percussion_mode','condition_stats','drum_profile','stem_instrument','exposure')})
 
 
 def build_dataloader(split, batch_size, distributed=False, config=cfg):
@@ -527,3 +579,26 @@ def build_dataloader(split, batch_size, distributed=False, config=cfg):
     if config.NUM_WORKERS:
         options['prefetch_factor'] = config.PREFETCH_FACTOR
     return DataLoader(dataset, batch_size=batch_size, sampler=sampler, **options)
+
+
+def jazz_weight(step,config):
+    """One through 10k, then a linear ramp to the configured final jazz weight."""
+    start,end=config.JAZZ_RAMP_START_STEP,config.JAZZ_RAMP_END_STEP
+    if not 0<=start<end or config.JAZZ_BLUES_REPEATS<1:
+        raise ValueError('Invalid jazz curriculum boundaries or final weight')
+    fraction=min(1.,max(0.,(step-start)/(end-start)))
+    return 1.+fraction*(config.JAZZ_BLUES_REPEATS-1.)
+
+
+def training_epoch_loader(loader,epoch,consumed,step,micro_step=0):
+    """Attach update numbers before prefetch, preserving exact indices on resume."""
+    loader.sampler.set_epoch(epoch)
+    world=loader.sampler.num_replicas
+    remaining=list(loader.sampler)[consumed//world:]
+    accumulation=loader.dataset.config.ACCUM_STEPS
+    scheduled=[(index,step+(micro_step%accumulation+position//loader.batch_size)//accumulation)
+               for position,index in enumerate(remaining)]
+    options=dict(num_workers=loader.num_workers,pin_memory=loader.pin_memory,
+        collate_fn=loader.collate_fn,generator=loader.generator,drop_last=loader.drop_last)
+    if loader.num_workers:options['prefetch_factor']=loader.prefetch_factor
+    return DataLoader(loader.dataset,batch_size=loader.batch_size,sampler=scheduled,**options)

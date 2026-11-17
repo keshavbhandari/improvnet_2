@@ -4,6 +4,17 @@ from improvnet.utils.melody import ordered, notes_to_tokens
 from improvnet.utils.melody_chunks import chunk_end
 
 PIANOS = frozenset(('Acoustic Piano', 'Electric Piano', 'Bright Piano', 'Honky-tonk Piano'))
+TRIO_INSTRUMENTS = PIANOS | {'drum', 'Acoustic Bass'}
+
+
+def reference_instruments(target_instruments, mode):
+    """Exact output instrumentation or its piano/drums/double-bass subset."""
+    instruments = set(target_instruments)
+    if mode == 'exact':
+        return instruments
+    if mode == 'trio':
+        return instruments & TRIO_INSTRUMENTS
+    raise ValueError('Reference mode must be exact or trio')
 
 
 def crop_notes(notes, rng, max_tokens=512, *, tail=False):
@@ -38,7 +49,7 @@ def neighboring_reference(notes, target_start, target_end, rng, *, max_tokens=51
     """
     required = set(instruments or ())
     if solo is None:
-        solo = len(required) == 1
+        solo = len(required) == 1 and 'drum' not in required
     notes = ordered([n for n in notes if not required or n.instrument in required])
     if solo and notes:
         pitched = sorted({n.instrument for n in notes if n.instrument != 'drum'})
@@ -75,3 +86,26 @@ def reference_ids(reference, tokenizer):
     if reference is None:
         return []
     return [tokenizer.tok_to_id[t] for t in notes_to_tokens(reference['notes'], tokenizer)]
+
+
+def neighboring_references(notes,target_start,target_end,rng,*,count=1,**kwargs):
+    """Distinct nearby windows, excluding target attacks and held releases."""
+    remaining=list(notes)
+    result=[]
+    for _ in range(count):
+        ref=neighboring_reference(remaining,target_start,target_end,rng,**kwargs)
+        if ref is None:break
+        result.append(ref)
+        left,right=ref['start_ms'],ref['end_ms']
+        remaining=[n for n in remaining if n.onset+n.duration<=left or n.onset>=right]
+    return sorted(result,key=lambda r:r['start_ms'])
+
+
+def transpose_reference(notes,rng,semitones=7):
+    """Change reference key only; preserve drums, instruments, timing and notes."""
+    pitches=[n.pitch for n in notes if n.instrument!='drum']
+    if not pitches:return list(notes),0
+    low,high=max(-semitones,-min(pitches)),min(semitones,127-max(pitches))
+    choices=[shift for shift in range(low,high+1) if shift]
+    shift=rng.choice(choices) if choices else 0
+    return [replace(n,pitch=n.pitch+shift) if n.instrument!='drum' else n for n in notes],shift

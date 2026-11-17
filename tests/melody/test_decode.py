@@ -1,4 +1,4 @@
-"""Current V5 decode contracts."""
+"""Current V12 decode contracts."""
 import random
 import sys
 import pytest
@@ -61,7 +61,14 @@ def test_duplicate_attributes_do_not_create_another_strike_but_retriggers_surviv
     assert result == ordered([Note('Acoustic Piano', 60, 90, 0, 100),
                               Note('Acoustic Piano', 60, 90, 10, 100),
                               Note('Violin', 60, 90, 10, 500)])
-    assert infer.last_decode_stats == dict(duplicate_attacks_removed=1, end_reason='end_token')
+    assert infer.last_decode_stats == dict(duplicate_attacks_removed=1, end_reason='end_token',
+                                          decoded_tokens=17,history_tokens_dropped=0,response_token_budget=128)
+
+
+
+
+
+
 
 
 def test_deduplication_uses_serialized_onset_and_roundtrip_preserves_repeated_notes(tmp_path):
@@ -81,8 +88,8 @@ def test_deduplication_uses_serialized_onset_and_roundtrip_preserves_repeated_no
 @pytest.mark.parametrize('expand',(False,True))
 def test_refinement_source_count_changes_do_not_skip_input(expand,monkeypatch):
     infer,_=scripted_inference([])
-    infer.meta.update(version=9,tasks=list(TASKS),seq_len=512,chunk_tokens=64,history_tokens=100,
-                      mix_response_tokens=256,harmonize_expansion=4.,skyline_tolerance_ms=50)
+    infer.meta.update(version=16,tasks=list(TASKS),seq_len=512,chunk_tokens=64,history_tokens=100,
+                      skyline_tolerance_ms=50)
     infer.options=cfg
     notes=[Note('Acoustic Piano',72,90,i*1000,2000) for i in range(100)]
     def corrupt(core,*a):
@@ -90,7 +97,7 @@ def test_refinement_source_count_changes_do_not_skip_input(expand,monkeypatch):
     monkeypatch.setattr('improvnet.inference.melody_inference.refinement_source',corrupt)
     def generate(prompt,*a,**kw):
         infer.last_decode_stats={}
-        assert len(prompt)+kw['max_new_tokens']+2<=512
+        assert len(prompt)+2<512 and kw['max_new_tokens'] is None
         return [Note('Acoustic Piano',65,90,a[3]-10,100)]
     infer.generate=generate
     _,logs=infer.transform(notes,'refine','jazz',1.,random.Random(1),monophonic=True)
@@ -107,7 +114,7 @@ def test_output_cannot_overwrite_input_or_intermediate_source(tmp_path,monkeypat
     write_midi_notes([Note('Acoustic Piano',60,90,0,100)],source)
     class Fake:
         def __init__(self,*a):
-            self.tokenizer=MelodyTokenizer();self.meta=dict(version=9,skyline_tolerance_ms=50)
+            self.tokenizer=MelodyTokenizer();self.meta=dict(version=16,skyline_tolerance_ms=50)
     monkeypatch.setattr(module,'MelodyInference',Fake)
     monkeypatch.setattr(sys,'argv',['melody_inference','--model','unused','--input',str(source),'--output',str(tmp_path/'out.mid'),'--no-rhythm-conditioning'])
     with pytest.raises(SystemExit):module.main()
@@ -136,8 +143,8 @@ def test_stem_rest_is_allowed_when_the_budget_only_fits_the_retained_notes():
 @pytest.mark.parametrize('all_silent',(False,True))
 def test_stem_stage_continues_over_silent_chunks_and_a_wholly_missing_stem(all_silent, capsys):
     infer,_=scripted_inference([])
-    infer.meta.update(version=9,tasks=list(TASKS),seq_len=512,chunk_tokens=18,
-        history_tokens=64,mix_response_tokens=128,harmonize_expansion=4.,skyline_tolerance_ms=50)
+    infer.meta.update(version=16,tasks=list(TASKS),seq_len=512,chunk_tokens=18,
+        history_tokens=64,skyline_tolerance_ms=50)
     infer.options=cfg
     original=[Note('Acoustic Piano',60+i%5,90,i*100,400) for i in range(12)]
     calls=[]
@@ -160,7 +167,7 @@ def test_stem_stage_continues_over_silent_chunks_and_a_wholly_missing_stem(all_s
         assert sum(n.instrument=='drum' for n in result)==2
 
 
-def test_v5_stem_repairs_timing_but_preserves_chords_melody_pitch_and_pitch_change_cap():
+def test_stem_repairs_timing_but_preserves_chords_melody_pitch_and_pitch_change_cap():
     anchors = ordered([Note('Acoustic Piano', pitch, 90, i*100, 200)
                        for i in range(21) for pitch in (72, 60)])
     script = []
@@ -171,7 +178,7 @@ def test_v5_stem_repairs_timing_but_preserves_chords_melody_pitch_and_pitch_chan
         requested_onset = note.onset + (20 if note.pitch == 72 else 40)
         script.extend(attrs(pitch, requested_onset, 240))
     infer, _ = scripted_inference(script + ['<E>'])
-    infer.meta.update(version=9, stem_timing_jitter_ms=50, stem_pitch_shift_prob=.05,
+    infer.meta.update(version=16, stem_timing_jitter_ms=50, stem_pitch_shift_prob=.05,
                       stem_pitch_shift_semitones=2, skyline_tolerance_ms=50)
     result = infer.generate(make_prompt('stem', ['<S>', '<E>'], target_instrument='drum'),
         'jazz', 1., ['Acoustic Piano', 'drum'], 2200, temperature=0., fixed_notes=anchors,
@@ -187,11 +194,11 @@ def test_v5_stem_repairs_timing_but_preserves_chords_melody_pitch_and_pitch_chan
     assert infer.last_decode_stats['stem_rest']
 
 
-def test_v5_stem_correction_can_cross_five_second_bin_without_losing_anchors():
+def test_stem_correction_can_cross_five_second_bin_without_losing_anchors():
     anchors = [Note('Acoustic Piano', 72, 90, 0, 200),
                Note('Acoustic Piano', 74, 90, 4990, 200)]
     infer, _ = scripted_inference(attrs(72, 0, 200)+['<T>']+attrs(74, 0, 200)+['<E>'])
-    infer.meta.update(version=9)
+    infer.meta.update(version=16)
     result = infer.generate(make_prompt('stem', ['<S>', '<E>'], target_instrument='drum'),
         'jazz', 1., ['Acoustic Piano', 'drum'], 5100, temperature=0., fixed_notes=anchors,
         stem_add=True, target_instrument='drum', stop_at_window_end=True, max_new_tokens=10)
@@ -199,7 +206,7 @@ def test_v5_stem_correction_can_cross_five_second_bin_without_losing_anchors():
     assert infer.last_decode_stats['retained_onset_corrections'] == 1
 
 
-def test_v5_anchor_policy_protects_percussion_pitch_and_owned_window_and_group_order():
+def test_anchor_policy_protects_percussion_pitch_and_owned_window_and_group_order():
     from improvnet.inference.melody_stem_anchors import StemAnchors
     anchors = [Note('Acoustic Piano', 72, 90, 0, 200),
                Note('drum', 42, 90, 20, 20),
@@ -214,10 +221,10 @@ def test_v5_anchor_policy_protects_percussion_pitch_and_owned_window_and_group_o
     assert policy.onset_bounds(2, 20) == (30, 30)
 
 
-def test_v5_stem_transform_protects_rolled_chord_skyline_across_chunk_edges(monkeypatch):
+def test_stem_transform_protects_rolled_chord_skyline_across_chunk_edges(monkeypatch):
     infer, _ = scripted_inference([])
-    infer.meta.update(version=9,tasks=['refine','harmonize','stem'],seq_len=512,chunk_tokens=10,
-        history_tokens=64,mix_response_tokens=128,harmonize_expansion=4.,skyline_tolerance_ms=50)
+    infer.meta.update(version=16,tasks=['refine','harmonize','stem'],seq_len=512,chunk_tokens=10,
+        history_tokens=64,skyline_tolerance_ms=50)
     infer.options=cfg
     # The lower note is in the next exact-onset chunk but belongs to the same
     # 50ms performed chord. Computing skyline from each chunk would protect it.
@@ -233,10 +240,10 @@ def test_v5_stem_transform_protects_rolled_chord_skyline_across_chunk_edges(monk
     assert protected == [True,False,True,False]
 
 
-def test_v5_stream_waits_for_complete_rolled_chord_without_changing_chunk_boundaries(monkeypatch):
+def test_stream_waits_for_complete_rolled_chord_without_changing_chunk_boundaries(monkeypatch):
     infer, _ = scripted_inference([])
-    infer.meta.update(version=9,tasks=['refine','harmonize','stem'],seq_len=512,chunk_tokens=10,
-        history_tokens=64,mix_response_tokens=128,harmonize_expansion=4.,skyline_tolerance_ms=50)
+    infer.meta.update(version=16,tasks=['refine','harmonize','stem'],seq_len=512,chunk_tokens=10,
+        history_tokens=64,skyline_tolerance_ms=50)
     infer.options=cfg
     # The first buffered prefix has a complete next onset group (30ms), yet
     # its apparent skyline at 0ms is replaced by a higher 40ms attack later.
@@ -272,12 +279,12 @@ def test_v5_stream_waits_for_complete_rolled_chord_without_changing_chunk_bounda
 
 
 @pytest.mark.parametrize('window_ms', (5000,5100))
-def test_v5_clock_correction_respects_tight_response_budget_and_owned_window(window_ms):
+def test_clock_correction_respects_tight_response_budget_and_owned_window(window_ms):
     anchor=Note('Acoustic Piano',72,90,4990,200)
     # No spare token for a clock marker: requesting one must not spend the
     # fixed-note reserve. Correction can stay on 4990ms without losing it.
     infer,_=scripted_inference(['<T>']+attrs(72,0,200)+['<E>'])
-    infer.meta.update(version=9)
+    infer.meta.update(version=16)
     result=infer.generate(make_prompt('stem',['<S>','<E>'],target_instrument='drum'),
         'jazz',1.,['Acoustic Piano','drum'],window_ms,temperature=0.,fixed_notes=[anchor],
         stem_add=True,target_instrument='drum',stop_at_window_end=True,max_new_tokens=5)
@@ -437,7 +444,7 @@ def test_quantized_solo_ties_become_one_melody_attack():
     assert [n.pitch for n in melody_voice(notes)] == [64, 62]
     rec = dict(notes=[astuple(n) for n in notes], melody_indices=[0, 1, 2],
                genre='jazz', source='weimar', windows=[0], harmony_windows=[])
-    config = SimpleNamespace(**dict({k:v for k,v in vars(cfg).items() if k.isupper()}, HISTORY_PROB=0))
+    config = SimpleNamespace(**dict({k:v for k,v in vars(cfg).items() if k.isupper()}, HISTORY_PROB=0,BEAT_TOKENS=False))
     x = prepare_example(rec, random.Random(1), config, task='refine', strength=0)
     tok = MelodyTokenizer()
     response = [tok.id_to_tok[i] for i in x['target'].tolist() if i != -100]
@@ -476,16 +483,25 @@ def test_standard_kit_midi_program_channel_and_pitched_notes_are_preserved(tmp_p
     assert {m.note for m in messages if m.type=='note_on' and m.velocity>0 and m.channel!=9}=={60}
 
 
-def test_stem_transform_filters_auxiliary_drums_before_anchoring(monkeypatch):
+def test_bass_transform_preserves_auxiliary_drum_anchors(monkeypatch):
     infer,_=scripted_inference([])
-    infer.meta.update(version=9,tasks=list(TASKS),seq_len=512,chunk_tokens=64,history_tokens=64,
-                      mix_response_tokens=128,skyline_tolerance_ms=50)
+    infer.meta.update(version=16,tasks=list(TASKS),seq_len=512,chunk_tokens=64,history_tokens=64,
+                      skyline_tolerance_ms=50)
     infer.options=cfg
     original=ordered([Note('Acoustic Piano',60,90,0,500),Note('drum',60,80,100,20)])
     seen=[]
     def generate(prompt,*args,**kwargs):
         seen.extend(kwargs['fixed_notes']);infer.last_decode_stats={}
-        return kwargs['fixed_notes']+[Note('drum',42,80,0,20)]
+        return kwargs['fixed_notes']+[Note('Acoustic Bass',42,80,0,200)]
     monkeypatch.setattr(infer,'generate',generate)
-    result,_=infer.transform(original,'stem','jazz',1.,random.Random(1),instruments=['Acoustic Piano','drum'],target_instrument='drum')
-    assert seen==[original[0]] and {n.pitch for n in result if n.instrument=='drum'}=={42}
+    result,_=infer.transform(original,'stem','jazz',1.,random.Random(1),instruments=['Acoustic Piano','drum','Acoustic Bass'],target_instrument='Acoustic Bass')
+    assert seen==original and {n.pitch for n in result if n.instrument=='drum'}=={60}
+
+
+def test_full_percussion_mode_can_generate_auxiliary_hits():
+    anchor=Note('Acoustic Piano',72,90,0,200)
+    infer,_=scripted_inference(attrs(72,0,200)+attrs(60,0,20,'drum')+['<E>'])
+    output=infer.generate(make_prompt('stem',['<S>','<E>'],target_instrument='drum'),
+        'jazz',1.,['Acoustic Piano','drum'],500,temperature=0.,fixed_notes=[anchor],
+        stem_add=True,target_instrument='drum',max_new_tokens=64,percussion_palette='full')
+    assert {n.pitch for n in output if n.instrument=='drum'}=={60}

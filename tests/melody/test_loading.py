@@ -44,3 +44,21 @@ def test_resume_preserves_prefetch_and_exact_remaining_sample_order(workers):
     assert torch.cat([batch[0] for batch in resumed]).tolist()==list(range(5,20))
 
 
+@pytest.mark.parametrize('workers',[0,1])
+def test_curriculum_schedule_and_prefetched_resume_indices(tmp_path,workers):
+    from types import SimpleNamespace
+    from torch.utils.data import Dataset,DistributedSampler
+    from improvnet.utils.melody_data import jazz_weight,training_epoch_loader
+    config=SimpleNamespace(JAZZ_RAMP_START_STEP=10000,JAZZ_RAMP_END_STEP=15000,JAZZ_BLUES_REPEATS=4,ACCUM_STEPS=2)
+    assert [jazz_weight(step,config) for step in (0,9999,10000,12500,15000,20000)]==[1,1,1,2.5,4,4]
+    class Indexed(Dataset):
+        def __init__(self):self.config=config
+        def __len__(self):return 24
+        def __getitem__(self,index):return torch.tensor(index)
+    dataset=Indexed()
+    sampler=DistributedSampler(dataset,num_replicas=1,rank=0,seed=42)
+    loader=DataLoader(dataset,batch_size=3,sampler=sampler,num_workers=workers,**({'prefetch_factor':1} if workers else {}))
+    complete=list(training_epoch_loader(loader,2,0,9998))
+    resumed=list(training_epoch_loader(loader,2,12,10000))
+    torch.testing.assert_close(torch.cat(complete[4:]),torch.cat(resumed))
+    assert [int(batch[0,1]) for batch in complete]==[9998,9998,9999,9999,10000,10000,10001,10001]

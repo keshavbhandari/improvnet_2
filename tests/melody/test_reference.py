@@ -1,4 +1,4 @@
-"""V6 pairing, frozen conditioning and strict neighboring-reference exclusion."""
+"""Shared-window pairing, frozen conditioning and strict neighboring-reference exclusion."""
 from dataclasses import replace
 import json
 import random
@@ -95,27 +95,10 @@ def test_neighbor_excludes_target_window_and_overlapping_held_notes(solo):
 
 def test_short_piece_drops_conditioning_instead_of_reusing_target():
     assert neighboring_reference(music(10),0,2000,random.Random(2)) is None
-    ex=prepare_example(mix(1),random.Random(3),settings(REFERENCE_PROB=1.),task='harmonize')
-    assert not ex['style_present'] and not len(ex['style_ids'])
+    ex=prepare_example(mix(1),random.Random(3),settings(REFERENCE_PROB=.99),task='harmonize')
+    assert not ex['reference_ids'].ne(2).any()
 
 
-def test_training_conditions_only_mix_tasks_and_neighbors_exclude_target_releases():
-    records=mix(250)
-    for task in ('refine','harmonize','stem'):
-        for seed in range(10):
-            ex=prepare_example(records,random.Random(seed),settings(REFERENCE_PROB=1.),task=task)
-            if task=='refine':
-                assert not ex['style_present']
-            elif ex['style_present']:
-                releases=[n.onset+n.duration+ex['start_ms'] for n in tokens_to_notes(
-                    [MelodyTokenizer().id_to_tok[int(t)] for t in ex['target'] if t>=0])]
-                start,end=ex['style_bounds']
-                assert end<=ex['start_ms']-250 or start>=max([ex['end_ms']]+releases)+250
-                assert ex['style_view'] in ('solo','mixture')
-    batch=collate_examples([prepare_example(records,random.Random(i),task='harmonize') for i in range(3)])
-    assert batch['style_ids'].shape==batch['style_attention_mask'].shape
-    assert batch['style_ids'].size(1)<=512
-    assert 'style_values' not in batch and 'style_mask' not in batch
 
 
 def test_frozen_encoder_identity_no_grad_and_absent_rows(tmp_path):
@@ -129,22 +112,6 @@ def test_frozen_encoder_identity_no_grad_and_absent_rows(tmp_path):
     assert not any(p.requires_grad for p in runtime.model.parameters())
     with pytest.raises(ValueError,match='changed'):
         FrozenReferenceEncoder(path,'cpu',expected_sha256='wrong')
-    model=MelodyRefinementModel(embed_dim=32,n_heads=4,n_kv_heads=2,n_layers=1,num_genres=4,num_instruments=41,dropout=0.)
-    logits=model(ids,genre=torch.ones(2,dtype=torch.long),multi_hot=torch.zeros(2,41),strength=torch.ones(2),
-                 style_embedding=embedding,style_mask=torch.tensor([1.,0.]))
-    logits.sum().backward()
-    assert model.style_proj[-1].weight.grad.abs().sum()>0
-    assert all(p.grad is None for p in runtime.model.parameters())
-
-
-def test_reference_presence_gate_remains_neutral_after_projection_trains():
-    model=MelodyRefinementModel(embed_dim=32,n_heads=4,n_kv_heads=2,n_layers=1,num_genres=4,num_instruments=41,dropout=0.).eval()
-    with torch.no_grad(): model.style_proj[-1].weight.normal_()
-    ids=torch.tensor([[3,4,5]])
-    kwargs=dict(genre=torch.zeros(1,dtype=torch.long),multi_hot=torch.zeros(1,41),strength=torch.zeros(1))
-    a=model(ids,**kwargs)
-    b=model(ids,style_embedding=torch.randn(1,256),style_mask=torch.zeros(1),**kwargs)
-    torch.testing.assert_close(a,b,rtol=0,atol=0)
 
 
 def test_pair_dataset_respects_folds_and_deterministic_evaluation(tmp_path,monkeypatch):
@@ -161,24 +128,11 @@ def test_pair_dataset_respects_folds_and_deterministic_evaluation(tmp_path,monke
 
 def test_inference_embeds_piano_drums_once_without_other_tracks(tmp_path):
     runtime=FrozenReferenceEncoder(reference_checkpoint(tmp_path),'cpu')
-    reference=runtime.from_notes(music(100)+[Note('Electric Bass',40,90,0,200)],MelodyTokenizer(),random.Random(2))
+    reference=runtime.from_notes(music(100)+[Note('Electric Bass',40,90,0,200)],MelodyTokenizer(),random.Random(2),instruments={'Acoustic Piano','drum'})
     assert reference['instruments']==['Acoustic Piano','drum']
-    assert reference['solo_embedding'].shape==reference['mixture_embedding'].shape==(256,) and reference['tokens']<=512
+    assert reference['embedding'].shape==(256,) and reference['tokens']<=512
 
 
-def test_training_style_view_matches_output_instruments():
-    record=mix(250)
-    # Polyphonic piano remains one instrument: its reference must remain piano-only.
-    piano=dict(record, notes=[n for n in record['notes'] if n[0]=='Acoustic Piano'])
-    for seed in range(12):
-        solo=prepare_example(piano,random.Random(seed),settings(REFERENCE_PROB=1.),task='harmonize')
-        if solo['style_present']:
-            assert solo['style_view']=='solo'
-            assert {n.instrument for n in decode(solo['style_ids'])}=={'Acoustic Piano'}
-        mixture=prepare_example(piano,random.Random(seed),settings(REFERENCE_PROB=1.),task='stem',target_instrument='drum')
-        if mixture['style_present']:
-            assert mixture['style_view']=='mixture'
-            assert {n.instrument for n in decode(mixture['style_ids'])}=={'Acoustic Piano','drum'}
 
 
 def test_target_matching_drops_condition_when_neighbor_has_wrong_instruments():

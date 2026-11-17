@@ -5,15 +5,14 @@ import json
 import numpy as np
 from improvnet.utils.melody import Note, attack_groups, ordered
 from improvnet.utils.melody_groove import infer_clock, groove_statistics
-from improvnet.utils.melody_stems import kit_only_notes
 
 DEFAULT_CATALOG = Path(__file__).resolve().parents[1] / 'inference' / 'reference_catalog.json'
-CATALOG_FORMAT = 'melody_reference_catalog_v1'
+CATALOG_FORMAT = 'melody_reference_catalog_v2'
 
 
 def record_notes(record):
     notes = [Note('Acoustic Piano' if n[0] == 'piano' else n[0], *n[1:]) for n in record['notes']]
-    return ordered(kit_only_notes(notes + [Note(*n) for n in record.get('drums', [])]))
+    return ordered(notes + [Note(*n) for n in record.get('drums', [])])
 
 
 def load_catalog(path=DEFAULT_CATALOG):

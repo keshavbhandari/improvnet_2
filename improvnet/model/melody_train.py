@@ -18,12 +18,11 @@ from torch.utils.tensorboard import SummaryWriter
 
 from improvnet.model import melody_config as cfg
 from improvnet.model.ar_train import all_ranks_finite, build_scheduler, checkpoint_requested, next_training_position
-from improvnet.utils.melody_stems import DRUM_KIT_PITCHES
 from improvnet.model.melody_model import (MelodyRefinementModel, checkpoint_metadata,
                                         initialize_from_ar, validate_checkpoint)
 from improvnet.utils.ar_utils import (ProcessData, build_optimizer, collect_rng_state_for_checkpoint,
-                                    load_checkpoint, resume_epoch_loader, save_checkpoint)
-from improvnet.utils.melody_data import build_dataloader,DATA_STAT_NAMES
+                                    load_checkpoint, save_checkpoint)
+from improvnet.utils.melody_data import build_dataloader,DATA_STAT_NAMES,training_epoch_loader,jazz_weight
 from improvnet.utils.melody import TASKS
 from improvnet.model.encoders.runtime import FrozenConditioners, pin_checkpoint
 
@@ -35,11 +34,14 @@ def autocast(device):
     return torch.amp.autocast('cuda', dtype=dtype)
 
 
-def loss_for_batch(model, batch, ignore_index=-100):
+def loss_for_batch(model, batch, ignore_index=-100, *, return_token_losses=False):
     logits = model(target=batch['input'], genre=batch['genre'],
-                   multi_hot=batch['multi_hot'], strength=batch['strength'],
-                   style_embedding=batch['style_embedding'], style_mask=batch['style_mask'],beat_embedding=batch.get('beat_embedding'),beat_mask=batch.get('beat_mask'))
-    return F.cross_entropy(logits.flatten(0, 1), batch['target'].flatten(), ignore_index=ignore_index)
+                   multi_hot=batch['multi_hot'], strength=batch['strength'],percussion_mode=batch['percussion_mode'],
+                   reference_features=batch['reference_features'],reference_mask=batch['reference_mask'],
+                   reference_positions=batch['reference_positions'],drum_profile=batch['drum_profile'])
+    losses=F.cross_entropy(logits.transpose(1,2),batch['target'],ignore_index=ignore_index,reduction='none')
+    loss=losses.sum()/batch['target'].ne(ignore_index).sum().clamp_min(1)
+    return (loss,losses.detach()) if return_token_losses else loss
 
 
 def progress_logger(save_dir):
@@ -60,8 +62,6 @@ def report_exposures(counts,report):
     rows=counts[:-1].reshape(len(TASKS),2).tolist()
     report('Exposure (non-jazz, jazz/blues): '+str(dict(zip(TASKS,rows)))+
            f'; missing-drum examples={counts[-1].item()}')
-    return {f'exposure/{task}/'+genre:rows[i][j] for i,task in enumerate(TASKS)
-            for j,genre in enumerate(('other','jazz_blues'))}
 
 
 def report_data_stats(stats,split,report):
@@ -75,7 +75,14 @@ def report_data_stats(stats,split,report):
     reasons=', '.join(f'{k}={counts[k]}' for k in DATA_STAT_NAMES[3:] if counts[k]) or 'none'
     report(f'Data ({split}): retries={retries}/{attempts} ({retry_percent:.2f}% of attempts); '
            f'routed={counts["routed"]}/{accepted} ({routed_percent:.2f}% of accepted); reasons: {reasons}.')
-    return dict(data_retry_percent=retry_percent,data_routed_percent=routed_percent)
+
+
+def report_conditions(stats, report):
+    if dist.is_initialized():
+        dist.all_reduce(stats)
+    total,kit,full,se,st,be,bt = stats.tolist()
+    report(f'Percussion drum targets: kit={kit}/{total} ({100*kit/max(1,total):.1f}%), full={full}/{total}; '
+           f'visible references exact/trio: style={se}/{st}, beat={be}/{bt}.')
 
 
 @torch.no_grad()
@@ -86,7 +93,9 @@ def evaluate_validation(model, loader, device, config=cfg, max_batches=100, repo
     totals = torch.zeros(len(tasks), 2, dtype=torch.float64, device=device)
     instruments = ProcessData().INSTRUMENT_CLASSES
     stem_totals = torch.zeros(len(instruments), 2, dtype=torch.float64, device=device)
+    palette_totals = torch.zeros(3,2,dtype=torch.float64,device=device)
     data_stats=torch.zeros(len(DATA_STAT_NAMES),dtype=torch.long,device=device)
+    palette_examples=torch.zeros(3,dtype=torch.long,device=device)
     for i, batch in enumerate(islice(loader,max_batches)):
         batch = {k: v.to(device) for k, v in batch.items()}
         reference_encoder.condition_batch(batch)
@@ -94,8 +103,9 @@ def evaluate_validation(model, loader, device, config=cfg, max_batches=100, repo
             data_stats+=batch['data_stats']
         with autocast(device):
             logits = model(target=batch['input'], genre=batch['genre'],
-                           multi_hot=batch['multi_hot'], strength=batch['strength'],
-                           style_embedding=batch['style_embedding'], style_mask=batch['style_mask'],beat_embedding=batch.get('beat_embedding'),beat_mask=batch.get('beat_mask'))
+                           multi_hot=batch['multi_hot'], strength=batch['strength'],percussion_mode=batch['percussion_mode'],
+                           reference_features=batch['reference_features'],reference_mask=batch['reference_mask'],
+                           reference_positions=batch['reference_positions'],drum_profile=batch['drum_profile'])
             losses = F.cross_entropy(logits.transpose(1, 2), batch['target'],
                                      ignore_index=config.IGNORE_INDEX, reduction='none')
         for task in range(len(tasks)):
@@ -107,11 +117,21 @@ def evaluate_validation(model, loader, device, config=cfg, max_batches=100, repo
                 mask = batch['stem_mask'] & (batch['stem_instrument'] == instrument).unsqueeze(1)
                 stem_totals[instrument, 0] += losses[mask].sum().double()
                 stem_totals[instrument, 1] += mask.sum()
+            for palette in (1,2):
+                mask = batch['stem_mask'] & ((batch['stem_instrument']==instruments.index('drum'))
+                                             & (batch['percussion_mode']==palette)).unsqueeze(1)
+                palette_totals[palette,0] += losses[mask].sum().double()
+                palette_totals[palette,1] += mask.sum()
+        for palette in (1,2):
+            palette_examples[palette]+=((batch['stem_instrument']==instruments.index('drum')) & (batch['percussion_mode']==palette)).sum()
+        del logits,losses
         if report is not None and (i+1)%25==0:
             report(f'Validation progress: {i+1}/{min(max_batches,len(loader))} batches per rank')
     if dist.is_initialized():
         dist.all_reduce(totals)
         dist.all_reduce(stem_totals)
+        dist.all_reduce(palette_totals)
+        dist.all_reduce(palette_examples)
     model.train()
     metrics = {name: (totals[i, 0] / totals[i, 1]).item() for i, name in
                enumerate(tasks) if totals[i, 1] > 0}
@@ -121,8 +141,14 @@ def evaluate_validation(model, loader, device, config=cfg, max_batches=100, repo
             metrics['stem_target/' + name.replace(' ', '_')] = (stem_totals[i, 0] / stem_totals[i, 1]).item()
     if stem_totals[:, 1].sum() > 0:
         metrics['stem_target'] = (stem_totals[:, 0].sum() / stem_totals[:, 1].sum()).item()
+    for palette,name in ((1,'kit'),(2,'full')):
+        if palette_totals[palette,1] > 0:
+            metrics['drum_palette/'+name] = (palette_totals[palette,0]/palette_totals[palette,1]).item()
     if report is not None:
-        metrics.update(report_data_stats(data_stats,'validation',report))
+        for palette,name in ((1,'kit'),(2,'full')):
+            report(f'Validation drum palette ({name}): examples={int(palette_examples[palette])}, '
+                   f'target tokens={int(palette_totals[palette,1])}.')
+        report_data_stats(data_stats,'validation',report)
     return metrics
 
 
@@ -135,6 +161,12 @@ def train(config=cfg, n_steps=None):
     local_rank = int(os.environ.get('LOCAL_RANK', '0'))
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
+        # cuDNN SDPA exhausted external CUDA memory on variable-length V11
+        # batches. Keep fused Flash/efficient attention, including recomputation.
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        torch.backends.cuda.enable_math_sdp(False)
         device = torch.device('cuda', local_rank)
     else:
         device = torch.device('cpu')
@@ -147,6 +179,9 @@ def train(config=cfg, n_steps=None):
         report(f'Melody refiner: batch/GPU={config.BATCH_SIZE}, accumulation={config.ACCUM_STEPS}, '
                f'effective batch={config.BATCH_SIZE * config.ACCUM_STEPS * world}, stop step={n_steps}')
         report(f'Direct progress log: {Path(config.SAVE_DIR)/"training.log"}')
+        if device.type=='cuda':
+            report('CUDA attention: Flash/efficient SDPA enabled; cuDNN and quadratic math SDPA disabled.')
+        report(f'Jazz curriculum: weight=1 through {config.JAZZ_RAMP_START_STEP}, linearly rising to {config.JAZZ_BLUES_REPEATS} by {config.JAZZ_RAMP_END_STEP}.')
         report(f'Data loader: workers/rank={config.NUM_WORKERS}, prefetch={config.PREFETCH_FACTOR}, '
                f'cache/worker<={config.WORKER_RECORD_CACHE} records / '
                f'{getattr(config,"WORKER_CACHE_NOTES",100000)} notes.')
@@ -168,34 +203,39 @@ def train(config=cfg, n_steps=None):
         setattr(config,name.upper()+'_ENCODER',pinned)
     reference_encoder=FrozenConditioners(config.STYLE_ENCODER,config.BEAT_ENCODER,device,
         style_sha256=checkpoint['refinement']['style_encoder_sha256'] if checkpoint is not None else None,
-        beat_sha256=checkpoint['refinement']['beat_encoder_sha256'] if checkpoint is not None else None)
+        beat_sha256=checkpoint['refinement']['beat_encoder_sha256'] if checkpoint is not None else None,
+        windows=config.REFERENCE_WINDOWS,local_bins=config.REFERENCE_LOCAL_BINS,batch_size=config.REFERENCE_ENCODER_BATCH_SIZE)
     for name in ('style','beat'):
         encoder=getattr(reference_encoder,name)
         if encoder.dim!=getattr(config,name.upper()+'_DIM'):raise ValueError(f'{name} encoder dimension differs')
         setattr(config,name.upper()+'_ENCODER_SHA256',encoder.sha256)
         if rank==0:report(f'{name} encoder: frozen=True; step={encoder.step}; sha256={encoder.sha256}; checkpoint={encoder.path}')
+    if config.REFERENCE_TOKENS>min(reference_encoder.style.max_tokens,reference_encoder.beat.max_tokens):
+        raise ValueError('Reference token budget exceeds the frozen encoder limit')
     train_loader = build_dataloader('train', config.BATCH_SIZE, distributed, config)
     val_loader = build_dataloader('validation', config.BATCH_SIZE, distributed, config)
     if rank == 0:
         report(f'Data: {config.DATA_FILE}; training candidate slots/epoch={len(train_loader.dataset)}, '
               f'validation files={len(val_loader.dataset)}; requested task weights={dict(zip(tasks, config.TASK_WEIGHTS))}')
-        report(f'{config.RUN_NAME} tasks={tasks}; jazz/blues full file passes={config.JAZZ_BLUES_REPEATS}; '
+        report(f'{config.RUN_NAME} tasks={tasks}; jazz/blues final weight={config.JAZZ_BLUES_REPEATS}; '
                f'non-jazz candidate pool={config.CLASSICAL_RATIO}x; eligible mixture tasks sampled separately; '
-               f'drum priority={config.STEM_DRUM_PROB:.0%}; kit-only drum sounds={len(DRUM_KIT_PITCHES)}; neighbor-reference visibility={config.REFERENCE_PROB:.0%}; '
+               f'drum priority={config.STEM_DRUM_PROB:.0%}; full percussion targets preserved; '
+               f'authentic-kit requests={config.KIT_DRUM_EXAMPLE_PROB:.0%} of drum draws; '
+               f'exact/trio references={config.REFERENCE_EXACT_PROB:.0%}/{1-config.REFERENCE_EXACT_PROB:.0%}; '
+               f'neighbor-reference visibility={config.REFERENCE_PROB:.0%}; '
+               f'reference windows<={config.REFERENCE_WINDOWS}, local bins/window={config.REFERENCE_LOCAL_BINS}; '
                f'history refine/mix={config.HISTORY_PROB:.0%}/{config.POLY_HISTORY_PROB:.0%}; history corruption={config.HISTORY_CORRUPTION_PROB:.0%}; '
                f'refinement=ornaments first + balanced 10%-100% independent edits (5% none); '
                f'pitch error range=+/-{config.PITCH_CORRUPTION_SEMITONES} semitones; '
                f'onset/duration jitter<= {config.TIMING_CORRUPTION_MS}ms (10ms ticks); '
-               f'stem timing jitter<= {config.STEM_TIMING_JITTER_MS}ms; '
+               f'stem source corruption probability={config.STEM_SOURCE_CORRUPTION_PROB:.0%}; '
                f'accompaniment pitch errors={config.STEM_PITCH_SHIFT_MIN_PROB:.0%}..{config.STEM_PITCH_SHIFT_PROB:.0%} per example, '
                f'range=+/-{config.STEM_PITCH_SHIFT_SEMITONES} semitones; '
                f'harmonize masking>={config.HARMONIZE_MIN_MASK_RATIO:.0%}, fully masked={config.HARMONIZE_FULL_MASK_PROB:.0%}.')
     model = MelodyRefinementModel(**config.MODEL_KWARGS)
     metadata = checkpoint_metadata(model, config)
-    data_policy_updated=False
     if checkpoint is not None:
-        validate_checkpoint(checkpoint, metadata,allow_data_policy_update=True)
-        data_policy_updated=checkpoint['refinement'].get('data_policy_revision',1)!=metadata['data_policy_revision']
+        validate_checkpoint(checkpoint, metadata)
         for key, value in [('batch_size', config.BATCH_SIZE), ('accum_steps', config.ACCUM_STEPS), ('world_size', world)]:
             if checkpoint.get(key) != value:
                 raise ValueError(f'Resume {key} changed; keep it unchanged or use a fresh run')
@@ -210,7 +250,11 @@ def train(config=cfg, n_steps=None):
     model.to(device)
     if distributed:
         model = DDP(model, device_ids=[local_rank] if device.type == 'cuda' else None)
-    optimizer = build_optimizer(model.parameters(), is_main_process=rank == 0, config=config)
+    backbone,conditioning=[],[]
+    for name,parameter in model.named_parameters():
+        (conditioning if any(part in name for part in ('reference_memory.','memory_projection.','strength_proj.','percussion_embedding.')) else backbone).append(parameter)
+    optimizer = build_optimizer([dict(params=backbone,lr=config.LR,name='backbone'),
+        dict(params=conditioning,lr=config.CONDITIONING_LR,name='conditioning')],is_main_process=rank==0,config=config)
     scheduler = build_scheduler(optimizer, config.WARMUP_STEPS, config.N_STEPS, config.MIN_LR, config.DECAY_STEPS)
     use_scaler = device.type == 'cuda' and torch.cuda.get_device_capability(device)[0] < 8
     scaler = torch.amp.GradScaler('cuda', enabled=use_scaler)
@@ -223,15 +267,9 @@ def train(config=cfg, n_steps=None):
         if rank==0:
             report(f'Resumed checkpoint at step {step}; optimizer restored={resume["optimizer_restored"]}; '
                    f'scheduler restored={restored}; epoch={epoch}; next sample={consumed}.')
-        if data_policy_updated:
-            best=float('inf')
-            if rank==0:
-                report(f'Data policy upgraded to revision {metadata["data_policy_revision"]}: '
-                       'resetting best-validation comparison for the changed sampling policy; '
-                       'model/optimizer/scheduler and progress are retained.')
         if not restored or changed:
             for group in optimizer.param_groups:
-                group['lr'] = group['initial_lr'] = config.LR
+                group['lr'] = group['initial_lr'] = config.CONDITIONING_LR if group.get('name')=='conditioning' else config.LR
             scheduler = build_scheduler(optimizer, config.WARMUP_STEPS, config.N_STEPS,
                                         config.MIN_LR, config.DECAY_STEPS, last_epoch=step - 1)
     del checkpoint
@@ -243,6 +281,8 @@ def train(config=cfg, n_steps=None):
     data_stats=torch.zeros(len(DATA_STAT_NAMES),dtype=torch.long,device=device)
     exposures=torch.zeros(len(TASKS)*2+1,dtype=torch.long,device=device)
     corruption_summary=torch.zeros(6,dtype=torch.float64,device=device)
+    condition_stats=torch.zeros(7,dtype=torch.long,device=device)
+    train_palette=torch.zeros(3,2,dtype=torch.float64,device=device)
 
     def save(position, is_best=False):
         report(f'Saving checkpoint at step {step}.')
@@ -258,7 +298,7 @@ def train(config=cfg, n_steps=None):
     while step < n_steps and not stop:
         train_loader.dataset.set_epoch(epoch)
         train_loader.sampler.set_epoch(epoch)
-        loader = resume_epoch_loader(train_loader, epoch=epoch, start_global_sample_idx=consumed)
+        loader = training_epoch_loader(train_loader,epoch,consumed,step,micro_step)
         for batch_idx, batch in enumerate(loader):
             global_sample = consumed + batch_idx * config.BATCH_SIZE * world
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -266,11 +306,13 @@ def train(config=cfg, n_steps=None):
             data_stats+=batch['data_stats']
             exposures+=batch['exposure'].sum(0)
             corruption_summary+=batch['corruption_summary']
+            condition_stats+=batch['condition_stats'].sum(0)
             accumulating = (micro_step + 1) % config.ACCUM_STEPS != 0
             sync = model.no_sync() if distributed and accumulating else contextlib.nullcontext()
             with sync:
                 with autocast(device):
-                    loss = loss_for_batch(model, batch, config.IGNORE_INDEX) / config.ACCUM_STEPS
+                    loss,token_losses = loss_for_batch(model,batch,config.IGNORE_INDEX,return_token_losses=True)
+                    loss = loss / config.ACCUM_STEPS
                 if not all_ranks_finite(loss, device):
                     report(f'Step {step}: skipping batch because loss is non-finite on at least one rank.')
                     optimizer.zero_grad(set_to_none=True)
@@ -281,6 +323,10 @@ def train(config=cfg, n_steps=None):
             micro_step += 1
             window_loss += loss.item() * config.ACCUM_STEPS
             window_batches += 1
+            for palette in (1,2):
+                mask=batch['stem_mask'] & ((batch['stem_instrument']==ProcessData().INSTRUMENT_CLASSES.index('drum')) & (batch['percussion_mode']==palette)).unsqueeze(1)
+                train_palette[palette,0]+=token_losses[mask].sum().double()
+                train_palette[palette,1]+=mask.sum()
             if accumulating:
                 continue
             scaler.unscale_(optimizer)
@@ -318,14 +364,19 @@ def train(config=cfg, n_steps=None):
                         writer.add_scalar('Validation/' + name, value, step)
             stop = checkpoint_requested(device)
             if step%getattr(config,'DATA_LOG_EVERY',50)==0 or stop or step>=n_steps:
-                data_metrics=report_data_stats(data_stats,'train',report)
-                data_metrics.update(report_exposures(exposures,report))
+                if distributed:dist.all_reduce(train_palette)
+                palette_metrics={f'drum_palette/{name}':(train_palette[p,0]/train_palette[p,1]).item()
+                                 for p,name in ((1,'kit'),(2,'full')) if train_palette[p,1]>0}
+                train_palette.zero_()
+                report_data_stats(data_stats,'train',report)
+                report_exposures(exposures,report)
+                report_conditions(condition_stats,report)
+                report(f'Jazz/blues sampling weight={jazz_weight(step,config):.3f}; non-jazz weight={config.CLASSICAL_RATIO}.')
+                condition_stats.zero_()
                 if dist.is_initialized():
                     dist.all_reduce(corruption_summary)
                 if corruption_summary[0] > 0:
-                    names=('requested_mean','effective_mean','changed_mean','changed_low_fraction','changed_high_fraction')
                     rates=(corruption_summary[1:]/corruption_summary[0]).tolist()
-                    data_metrics.update({'corruption/'+name:value for name,value in zip(names,rates)})
                     report(f'Refinement corruption: requested mean={rates[0]:.1%}, '
                            f'effective mean={rates[1]:.1%}, changed notes={rates[2]:.1%}; '
                            f'low (<=20%) examples={rates[3]:.1%}, high (>=80%)={rates[4]:.1%}.')
@@ -333,7 +384,7 @@ def train(config=cfg, n_steps=None):
                 exposures.zero_()
                 data_stats.zero_()
                 if rank==0:
-                    for name,value in data_metrics.items():
+                    for name,value in palette_metrics.items():
                         writer.add_scalar('Train/'+name,value,step)
             if validation_due or step % config.CHECKPOINT_EVERY == 0 or stop or step >= n_steps:
                 save(last_position, is_best)

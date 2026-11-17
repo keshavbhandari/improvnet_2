@@ -131,30 +131,11 @@ def test_dual_references_both_exclude_target_and_held_releases():
         for seed in range(12):
             ex=prepare_example(rec,random.Random(seed),settings(REFERENCE_PROB=1.),task=task)
             end=max([ex['end_ms']]+[n[3]+n[4] for n in rec['notes']+rec['drums'] if ex['start_ms']<=n[3]<ex['end_ms']])
-            for kind in ('style','beat'):
-                if ex[kind+'_present']:
-                    a,b=ex[kind+'_bounds']
-                    assert b<=ex['start_ms']-250 or a>=end+250
-                    assert len(ex[kind+'_ids'])<=512
-    batch=collate_examples([prepare_example(rec,random.Random(1),task='refine')])
-    assert not batch['style_present'].any() and not batch['beat_present'].any()
-
-
-def test_frozen_dual_runtime_same_different_regions_and_gradients(tmp_path):
-    style=reference_checkpoint(tmp_path)
-    beat=reference_checkpoint(tmp_path,kind='beat')
-    enc=FrozenConditioners(style,beat,'cpu')
-    notes=tracks(300)
-    a=enc.from_notes(notes,MelodyTokenizer(),random.Random(5),'same')
-    b=enc.from_notes(notes,MelodyTokenizer(),random.Random(5),'different')
-    assert a['style_region']['start_ms']==a['beat_region']['start_ms']
-    assert a['style_region']['end_ms']==a['beat_region']['end_ms']
-    sr,br=b['style_region'],b['beat_region']
-    assert sr['end_ms']+250<=br['start_ms'] or br['end_ms']+250<=sr['start_ms']
-    assert all(v.shape==(256,) for k,v in a.items() if k.endswith('_embedding') and v is not None)
-    assert all(not p.requires_grad for model in (enc.style.model,enc.beat.model) for p in model.parameters())
-    with pytest.raises(ValueError,match='too short'):
-        enc.from_notes(tracks(2),MelodyTokenizer(),random.Random(1),'different')
+            for a,b in ex['reference_bounds']:
+                assert b<=ex['start_ms']-250 or a>=end+250
+            assert ex['reference_ids'].size(-1)<=512
+    batch=collate_examples([prepare_example(rec,random.Random(1),settings(),task='refine')])
+    assert not batch['reference_ids'].ne(2).any()
 
 
 def test_other_performance_of_same_piece_is_not_a_temporal_negative():
@@ -170,14 +151,13 @@ def test_both_ar_projections_learn_while_both_encoders_stay_fixed(tmp_path):
     from improvnet.model.melody_model import MelodyRefinementModel
     from improvnet.model.melody_train import loss_for_batch
     enc=FrozenConditioners(reference_checkpoint(tmp_path),reference_checkpoint(tmp_path,kind='beat'),'cpu')
-    config=settings(CHUNK_TOKENS=32,MIX_RESPONSE_TOKENS=64,HISTORY_TOKENS=16,SEQ_LEN=128,REFERENCE_PROB=1.)
+    config=settings(CHUNK_TOKENS=32,HISTORY_TOKENS=16,SEQ_LEN=128,REFERENCE_PROB=1.)
     batch=collate_examples([prepare_example(mix(200),random.Random(i),config,task='harmonize') for i in range(3)])
     enc.condition_batch(batch)
-    assert batch['style_mask'].sum()>0 and batch['beat_mask'].sum()>0
+    assert batch['reference_mask'].any()
     model=MelodyRefinementModel(embed_dim=32,n_heads=4,n_kv_heads=2,n_layers=1,num_genres=4,num_instruments=41,dropout=0.)
     loss_for_batch(model,batch).backward()
-    assert model.style_proj[-1].weight.grad.abs().sum()>0
-    assert model.beat_proj[-1].weight.grad.abs().sum()>0
+    assert model.reference_memory.queries.grad.abs().sum()>0
     assert all(p.grad is None for e in (enc.style,enc.beat) for p in e.model.parameters())
 
 

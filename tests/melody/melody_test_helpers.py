@@ -1,4 +1,4 @@
-"""Shared fixtures for current V5 behavior tests."""
+"""Shared fixtures for current V12 behavior tests."""
 import json
 import sqlite3
 import torch
@@ -12,7 +12,10 @@ from improvnet.utils.melody import Note, MelodyTokenizer, ordered, tokens_to_not
 
 
 def settings(**updates):
-    return SimpleNamespace(**dict({k: v for k, v in vars(cfg).items() if k.isupper()}, **updates))
+    values = {k: v for k, v in vars(cfg).items() if k.isupper()}
+    values['REFERENCE_PROB'] = .75  # Most synthetic fixtures exercise optional neighboring references.
+    values.update(updates)
+    return SimpleNamespace(**values)
 
 
 def mix(count=200, genre='jazz'):
@@ -75,7 +78,7 @@ def scripted_inference(script):
     inference = MelodyInference.__new__(MelodyInference)
     inference.tokenizer = tok = MelodyTokenizer()
     inference.device = torch.device('cpu')
-    inference.meta = dict(version=9,seq_len=512, genres=['jazz'])
+    inference.meta = dict(version=16,seq_len=512, genres=['jazz'],harmonize_min_mask_ratio=.9)
     inference.processor = ProcessData()
     calls = []
 
@@ -101,4 +104,3 @@ def attrs(pitch, onset, duration=500, instrument='Acoustic Piano', velocity=90):
 def prompt_source(ex):
  tok=MelodyTokenizer();stream=[tok.id_to_tok[i] for i in ex['input'].tolist()];a=stream.index('<SEP>');b=stream.index('<SEP>',a+1)
  return stream[a+1:b]
-

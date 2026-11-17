@@ -11,7 +11,8 @@ from improvnet.model import melody_config as cfg
 from improvnet.model.encoders.runtime import FrozenConditioners
 from improvnet.utils.melody import MelodyTokenizer, notes_to_tokens
 from improvnet.utils.melody_data import MelodyDataset
-from improvnet.utils.melody_reference import PIANOS
+from improvnet.utils.melody_reference import PIANOS, TRIO_INSTRUMENTS
+from improvnet.utils.melody_stems import percussion_mode
 from improvnet.utils.reference_catalog import (DEFAULT_CATALOG, CATALOG_FORMAT, record_notes,
     rhythm_summary, cosine_clusters, bucket_summaries)
 
@@ -67,7 +68,7 @@ def build_references(output=DEFAULT_CATALOG, per_source=4, seed=42, buckets=4, d
                     continue
                 entry_id = f'{genre}-{source}-{hashlib.sha256(str(identity).encode()).hexdigest()[:10]}'
                 window_seed = int(hashlib.sha256(entry_id.encode()).hexdigest()[:8], 16)
-                view = encoders.style.from_notes(notes, tok, random.Random(window_seed))
+                view = encoders.style.from_notes(notes, tok, random.Random(window_seed),instruments={n.instrument for n in notes}&TRIO_INSTRUMENTS)
                 excerpt = view.pop('_notes')
                 if len(excerpt) < 12 or view['end_ms'] - view['start_ms'] < 2000:
                     raise ValueError('Reference excerpt is too short or sparse')
@@ -77,12 +78,12 @@ def build_references(output=DEFAULT_CATALOG, per_source=4, seed=42, buckets=4, d
                 locator = dict(jsonl=str(row.get('jsonl') or data.prepared), offset=row['offset'])
                 entry = dict(id=entry_id, title=record.get('title') or Path(record['path']).stem,
                     genre=genre, source=source, split='train', path=record['path'], record=locator,
-                    instruments=sorted({n.instrument for n in notes}),
+                    instruments=sorted({n.instrument for n in notes}),percussion_mode=percussion_mode(notes),
                     instrument_note_counts=dict(sorted(Counter(n.instrument for n in notes).items())),
                     excerpt=dict(start_ms=view['start_ms'], end_ms=view['end_ms'], tokens=view['tokens'],
-                        instruments=view['instruments'], seed=window_seed), rhythm=rhythm_summary(excerpt))
+                        instruments=view['instruments'],percussion_mode=percussion_mode(excerpt), seed=window_seed), rhythm=rhythm_summary(excerpt))
                 entries.append(entry)
-                style_vectors.append(view['solo_embedding'].cpu().tolist())
+                style_vectors.append(view['embedding'].cpu().tolist())
                 beat_vectors.append(beat.cpu().tolist())
                 pieces.add(identity)
                 accepted += 1
@@ -95,8 +96,8 @@ def build_references(output=DEFAULT_CATALOG, per_source=4, seed=42, buckets=4, d
             entry[kind + '_bucket'] = f'{kind}_{label}'
     payload = dict(format=CATALOG_FORMAT, manifest=str(cfg.DATA_FILE), seed=seed,
         selection='Training-fold piano references, balanced per genre/source with solo and drum mixtures.',
-        encoder_buckets=dict(style='Cosine clustering of frozen solo-piano style embeddings.',
-                             beat='Cosine clustering of frozen piano/drum (or solo-piano) beat embeddings.',
+        encoder_buckets=dict(style='Cosine clustering of frozen selected piano/drums/acoustic-bass style embeddings; percussion intact.',
+                             beat='Cosine clustering of the same intact piano/drums/acoustic-bass reference excerpt.',
                              caveat='Exploratory similarities; instrument content and tempo may affect groups. No annotated swing/shuffle labels.'),
         encoders={name:dict(checkpoint=getattr(cfg,name.upper()+'_ENCODER'),sha256=getattr(encoders,name).sha256,
                            trained_step=getattr(encoders,name).step) for name in ('style','beat')},

@@ -1,7 +1,7 @@
 """Shared note representation, skyline and ImprovNet-style corruptions.
 
-Times are milliseconds; pulse analysis lives in melody_groove. Corruption names are never
-serialized into a model prompt.
+Times are milliseconds. Corruption names and beat markers are never serialized
+into a model prompt.
 """
 from dataclasses import dataclass, replace
 import random
@@ -11,6 +11,7 @@ from improvnet.tokenizer.absolute import AbsTokenizer
 from improvnet.tokenizer.midi import MidiDict
 from improvnet.utils.melody_midi import read_midi_dict
 
+PREFIX_TOKENS = 34  # Genre + 32 reference-memory positions + instrument mix.
 TASKS = ("refine", "harmonize", "stem")
 # Task IDs are fixed; unused historical vocabulary entries stay reserved.
 TASK_TOKENS = dict(refine="<REFINE>", harmonize="<HARMONIZE>", stem="<ADD_STEM>")
@@ -39,7 +40,11 @@ class Note:
 
 
 def ordered(notes):
-    return sorted(notes, key=lambda n: (n.onset, -n.pitch, n.instrument, n.duration))
+    return sorted(notes,key=lambda n:(n.onset,-n.pitch,n.instrument,n.duration))
+
+
+def combine_notes(*parts):
+    return ordered(n for part in parts for n in part)
 
 
 def melody_voice(notes):
@@ -53,6 +58,7 @@ def melody_voice(notes):
 
 
 def notes_to_tokens(notes, tokenizer=None):
+    """Serialize complete four-attribute notes; BLANK remains an unused reserved ID."""
     tok = tokenizer or MelodyTokenizer()
     tokens, segment = ["<S>"], 0
     for n in ordered(notes):
@@ -141,7 +147,8 @@ def skyline(notes, chord_tolerance_ms=50):
 
 def window(notes, start, end):
     # Ownership is by onset. A held note crosses a boundary with no new attack.
-    return [replace(n, onset=n.onset - start) for n in notes if start <= n.onset < end]
+    result = [replace(n, onset=n.onset - start) for n in notes if start <= n.onset < end]
+    return result
 
 
 def sample_strength(rng):
@@ -149,7 +156,7 @@ def sample_strength(rng):
     return 0. if rng.random() < .05 else rng.randint(1, 10) / 10
 
 
-def harmonize_strength(rng, strength=None, minimum=.6, full_probability=.25):
+def harmonize_strength(rng, strength=None, minimum=.9, full_probability=.25):
     """Severe timing removal, with explicit fully masked training examples."""
     if not .5 < minimum <= 1 or not 0 <= full_probability <= 1:
         raise ValueError('Harmonization masking must stay above 50%')

@@ -15,11 +15,10 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from improvnet.utils.melody_stems import kit_only_notes
-from improvnet.inference.melody_runtime import INFERENCE_SEED
-from improvnet.inference.melody_outputs import stage_output_names
-from improvnet.model.melody_train import autocast
-from improvnet.utils.melody import write_midi_notes
+from improvnet.inference.melody_runtime import INFERENCE_SEED, inference_context
+from improvnet.inference.melody_outputs import stage_output_names, plan_stages
+from improvnet.utils.melody import write_midi_notes, PREFIX_TOKENS
+from improvnet.model.melody_model import PROTOCOL_VERSION
 
 
 @dataclass
@@ -37,6 +36,8 @@ def forward_batch(model, requests):
     Prefills are right padded (causality isolates real prompt tokens). Cached
     steps are left padded, explicitly masked, and use each row's real RoPE
     offset. Neither padding nor another request's keys enters a returned cache.
+    Returned rows are views: attention appends by allocation, so no caller writes
+    into shared past tensors and cloning full histories is unnecessary.
     """
     if not requests:
         return []
@@ -51,14 +52,14 @@ def forward_batch(model, requests):
         width = max(lengths)
         ids = torch.cat([F.pad(r.ids, (0, width - n)) for r, n in zip(requests, lengths)])
         kwargs = dict(use_cache=True)
-        for name in ('genre', 'multi_hot', 'strength', 'style_embedding', 'style_mask', 'beat_embedding', 'beat_mask'):
+        for name in ('genre', 'multi_hot', 'strength', 'reference_features','reference_mask','reference_positions','drum_profile','percussion_mode'):
             values = [r.kwargs.get(name) for r in requests]
             if any(v is not None for v in values):
                 exemplar = next(v for v in values if v is not None)
                 kwargs[name] = torch.cat([v if v is not None else torch.zeros_like(exemplar) for v in values])
         logits, cache = model(ids, **kwargs)
         return [(logits[row:row+1, n-1:n].clone(),
-                 [(k[row:row+1, :n+2].clone(), v[row:row+1, :n+2].clone()) for k, v in cache])
+                 [tuple(t[row:row+1,:n+PREFIX_TOKENS] for t in layer) for layer in cache])
                 for row, n in enumerate(lengths)]
     if any(r.ids.shape != (1, 1) for r in requests):
         raise ValueError('Cached requests must contain exactly one token')
@@ -70,7 +71,7 @@ def forward_batch(model, requests):
     width = max(lengths)
     packed = []
     for layer in range(len(caches[0])):
-        packed.append(tuple(torch.cat([F.pad(c[layer][kv], (0, 0, 0, 0, width-n, 0))
+        packed.append(tuple(torch.cat([(F.pad(c[layer][kv], (0, 0, 0, 0, width-n, 0)) if n < width else c[layer][kv])
                                        for c, n in zip(caches, lengths)]) for kv in (0, 1)))
     ids = torch.cat([r.ids for r in requests])
     positions = torch.tensor(lengths, device=ids.device)
@@ -81,7 +82,7 @@ def forward_batch(model, requests):
         kwargs.update(seq_offset=positions, cache_lengths=positions)
     logits, cache = model(ids, **kwargs)
     return [(logits[row:row+1].clone(),
-             [(k[row:row+1, width-n:].clone(), v[row:row+1, width-n:].clone()) for k, v in cache])
+             [tuple(t[row:row+1,width-n:] for t in layer) for layer in cache])
             for row, n in enumerate(lengths)]
 
 
@@ -130,7 +131,7 @@ class PipelineCoordinator:
 
     @torch.no_grad()
     def run(self):
-        with autocast(self.device), tqdm(desc='Batched pipeline', unit='token request', dynamic_ncols=True,
+        with inference_context(self.device), tqdm(desc='Batched pipeline', unit='token request', dynamic_ncols=True,
                   position=len(self.states)*2) as progress:
             while True:
                 with self.condition:
@@ -193,9 +194,8 @@ class NoteStream:
 
 def run_pipeline(infer, original, tasks, args, requested, original_instruments,
                  reference, output_directory, stem_targets):
-    original = kit_only_notes(original)
-    if infer.meta.get('version', 0) != 11:
-        raise ValueError('Inference requires a dual style/beat checkpoint (protocol 11)')
+    if infer.meta.get('version')!=PROTOCOL_VERSION:
+        raise ValueError('Inference requires a V12 prefix-memory checkpoint (protocol 16)')
     output_directory = Path(output_directory)
     output_directory.mkdir(parents=True, exist_ok=True)
     missing_tasks = set(tasks) - set(infer.meta.get('tasks', ()))
@@ -207,32 +207,9 @@ def run_pipeline(infer, original, tasks, args, requested, original_instruments,
     # Each task owns a fixed random stream, so thread scheduling cannot change
     # its corruptions or multinomial draws. Sequential CLI RNG stays unchanged.
     workers = []
-    targets = iter(stem_targets)
-    planned = []
-    stage_names = stage_output_names(tasks, stem_targets)
-    current_instruments = {n.instrument for n in original}
-    for task in tasks:
-        target = None
-        if task == 'stem':
-            target = next(targets) if args.task == 'pipeline' else args.target_instrument
-            if target is None and 'drum' in requested and 'drum' not in current_instruments:
-                target = 'drum'
-            if target is None:
-                raise ValueError('Stem addition requires --target-instrument')
-            if target in current_instruments:
-                raise ValueError(f'Requested {target} stem already exists')
-            selected = sorted(current_instruments | {target})
-            current_instruments.add(target)
-        elif task in ('refine', 'harmonize'):
-            use_requested = args.task != 'pipeline' or task == 'harmonize'
-            selected = [i for i in requested if i != 'drum'] if use_requested else original_instruments
-            if task == 'harmonize' and args.task == 'pipeline':
-                selected = [i for i in selected if i not in stem_targets] or original_instruments
-            current_instruments = set(selected)
-        else:
-            selected = requested
-            current_instruments = set(requested)
-        planned.append((task, target, selected))
+    planned = plan_stages(original,tasks,requested,original_instruments,stem_targets,
+                          task_mode=args.task,target_instrument=args.target_instrument)
+    stage_names = stage_output_names(tasks,stem_targets)
 
     def worker(index):
         task, target, selected = planned[index]
@@ -250,7 +227,8 @@ def run_pipeline(infer, original, tasks, args, requested, original_instruments,
             strength = args.melody_strength if task == 'refine' else args.rhythm_strength if task == 'harmonize' else 1.
             notes, logs = local.transform(first, task, args.genre, strength,
                 random.Random(INFERENCE_SEED+index*1009), args.temperature,
-                instruments=selected, style_reference=reference,
+                instruments=selected, style_reference=(reference or {}).get('stage_conditions',{}).get(stage_names[index]),
+                percussion_palette='kit',
                 monophonic=True if task == 'harmonize' and 'refine' in tasks[:index] else None,
                 target_instrument=target, source_stream=stream, on_chunk=publish)
             results[index], chunk_logs[index] = notes, logs

@@ -153,7 +153,7 @@ class ContinuityEncoder(nn.Module):
         with torch.no_grad():
             self.token_emb.weight[c.pad_id].zero_()
 
-    def encode(self, ids, attention_mask=None):
+    def encode(self, ids, attention_mask=None, *, return_hidden=False):
         if ids.ndim != 2 or ids.shape[0] < 1 or not 1 <= ids.shape[1] <= self.config.max_length:
             raise ValueError("Need nonempty [batch, length] IDs within the configured limit")
         if ids.dtype not in (torch.int32, torch.int64):
@@ -173,6 +173,8 @@ class ContinuityEncoder(nn.Module):
             else:
                 x = layer(x, mask, positions)
         x = self.out_norm(x).masked_fill(~mask[..., None], 0.)
+        if return_hidden:
+            return x
         pooled = x.float().sum(1) / mask.sum(-1, keepdim=True)
         return F.normalize(self.projector(pooled.to(x.dtype)).float(), dim=-1)
 

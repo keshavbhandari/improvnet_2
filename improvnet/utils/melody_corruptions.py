@@ -52,7 +52,7 @@ def refinement_strength(notes, requested, config):
     return max(requested, removed / len(notes))
 
 
-def refinement_source(notes, strength, rng, tokenizer, config, bounded=False):
+def refinement_source(notes, strength, rng, tokenizer, config):
     """Merge ornaments first, then apply an independent strength-scaled edit.
 
     Strength here is the requested *additional* edit fraction; the model's
@@ -191,7 +191,7 @@ def corrupt_history(notes, rng, fraction=.10, addition_weight=2., deletion_weigh
             result[i] = replace(n, onset=onset, duration=duration)
     # Do not introduce repeated copies of an identical attack into the history.
     unique = {}
-    for n in result:
+    for n, origin in zip(result, origins):
         unique.setdefault((n.instrument, n.pitch, n.onset), n)
     return ordered(unique.values())
 

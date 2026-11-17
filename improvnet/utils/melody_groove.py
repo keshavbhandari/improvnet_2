@@ -1,10 +1,9 @@
 """A common inferred pulse for pitched notes and drums, with expressive offsets.
 
-The pulse is estimated from attacks when beat annotations are unavailable.
+This is catalogue analysis only; no pulse tokens or inference timing biases are emitted.
 Half/double-tempo and downbeat ambiguity remain; four beats per bar is an
 explicit working assumption, not an inferred time signature.
 """
-from collections import defaultdict
 from dataclasses import dataclass
 import math
 import numpy as np
@@ -89,72 +88,3 @@ def groove_statistics(notes,clock,start_ms=0):
                 swing_fraction=swing,timing_offset_ms=float(np.median(offsets)),
                 timing_spread_ms=float(np.clip(np.std(offsets),10,100)),pulse_confidence=clock.confidence,
                 **dict(zip(GROOVE_FEATURES[-8:],hist.tolist())))
-
-
-def reference_windows(notes,melody=None):
-    """Coherent eight-bar windows with sufficient attacks, never a global blend."""
-    from improvnet.utils.melody_style import performance_statistics
-    clock=infer_clock(notes);melody=melody or [n for n in notes if n.instrument!='drum']
-    duration=max((n.onset+n.duration for n in notes),default=0)
-    width=clock.beat_ms*32; result=[]
-    # Visit only occupied windows; allocating a dense list over a stray
-    # year-long gap would defeat the bounded pulse analysis above.
-    occupied=defaultdict(list)
-    limit=max(1,duration-width/2)
-    for note in melody:
-        block=int(note.onset//width)
-        if block*width<limit:
-            occupied[block].append(note)
-    for block,absolute in sorted(occupied.items()):
-        start=block*width
-        if len(absolute)<12:
-            continue
-        stats=performance_statistics(absolute)
-        stats.update(groove_statistics(absolute,clock,float(start)))
-        result.append(dict(start_ms=int(start),end_ms=int(start+width),statistics=stats))
-    return dict(beat_ms=clock.beat_ms,origin_ms=clock.origin_ms,confidence=clock.confidence,
-                meter_assumption=4,windows=result)
-
-
-class GrooveGuide:
-    """One reference and one source clock shared by every generation stage."""
-    def __init__(self,source_notes,reference,rng):
-        self.clock=infer_clock(source_notes)
-        self.reference=reference or {}
-        windows=self.reference.get('groove',{}).get('windows',[])
-        self.windows=windows
-        self.offset=rng.randrange(len(windows)) if windows else 0
-
-    def statistics(self,start_ms,end_ms):
-        if not self.reference:
-            return {}
-        if self.windows:
-            bar=int(max(0,self.clock.phase(start_ms))//32)
-            item=self.windows[(self.offset+bar)%len(self.windows)]
-            stats=dict(item['statistics']) if isinstance(item,dict) else dict(zip(self.reference['groove']['feature_names'],item[2:]))
-        else:
-            stats=dict(self.reference.get('melody_statistics',self.reference.get('statistics',{})))
-        ref_period=stats.get('beat_ms',self.reference.get('groove',{}).get('beat_ms',self.clock.beat_ms))
-        ratio=self.clock.beat_ms/max(1.,ref_period)
-        for key in ('ioi_mean_ms','ioi_std_ms','ioi_q25_ms','ioi_q75_ms','timing_offset_ms','timing_spread_ms'):
-            if key in stats:
-                stats[key]*=ratio
-        phase=2*math.pi*((self.clock.phase(start_ms)/4)%1)
-        stats.update(beat_ms=self.clock.beat_ms,bar_phase_sin=math.sin(phase),bar_phase_cos=math.cos(phase),
-                     pulse_confidence=min(self.clock.confidence,stats.get('pulse_confidence',0.)))
-        return stats
-
-    def onset_bias(self,onsets,start_ms,statistics):
-        """A soft, shared beat-phase prior; never quantize expressive offsets."""
-        confidence=statistics.get('pulse_confidence',0.)
-        if confidence<.15 or not all(k in statistics for k in GROOVE_FEATURES[-8:]):
-            return np.zeros(len(onsets))
-        phase=(np.asarray(onsets)+start_ms-self.clock.origin_ms)/self.clock.beat_ms%1
-        centers=np.asarray((0.,.125,.25,.375,statistics.get('swing_fraction',.5),.625,.75,.875))
-        centers=(centers+statistics.get('timing_offset_ms',0.)/self.clock.beat_ms)%1
-        width=max(.035,min(.15,statistics.get('timing_spread_ms',30.)/self.clock.beat_ms))
-        dist=(phase[:,None]-centers[None,:]+.5)%1-.5
-        weights=np.asarray([statistics[k] for k in GROOVE_FEATURES[-8:]])
-        density=(np.exp(-.5*(dist/width)**2)*weights).sum(axis=1)
-        # Uniform floor prevents hard exclusion of syncopations or pickups.
-        return .5*confidence*np.log(.25+density/max(.01,float(weights.mean())))

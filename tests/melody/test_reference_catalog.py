@@ -38,16 +38,18 @@ def catalog_fixture(tmp_path):
     return path,entry
 
 
-def test_catalog_selection_reuses_saved_excerpt_seed_and_rejects_wrong_genre(tmp_path):
+def test_catalog_selection_loads_entire_piece_and_rejects_wrong_genre(tmp_path):
     path,entry=catalog_fixture(tmp_path)
     seen=[]
     encoder=SimpleNamespace(style=SimpleNamespace(sha256='style'),beat=SimpleNamespace(sha256='beat'))
-    def embed(notes,tok,rng,regions):
-        seen.append(rng.random())
+    def embed(notes,tok,**kwargs):
+        seen.append(notes)
         return dict(style_region={},beat_region={})
     encoder.from_notes=embed
     result=choose_reference(encoder,'blues',random.Random(99),reference_id=entry['id'],catalog_path=path)
-    assert result['id']==entry['id'] and seen==[random.Random(123).random()]
+    assert result['id']==entry['id'] and len(seen)==1 and len(seen[0])==15
+    assert seen[0][0].onset==0 and seen[0][-1].onset==4200
+    assert 'random window or averages all eligible windows' in result['bucket_scope']
     with pytest.raises(ValueError,match='No jazz'):
         choose_reference(encoder,'jazz',random.Random(0),catalog_path=path)
     with pytest.raises(ValueError,match='matches'):

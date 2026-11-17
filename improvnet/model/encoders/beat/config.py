@@ -5,6 +5,7 @@ MANIFEST = '/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/pre
 SAVE_DIR = '/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/beat'  # Directory for model checkpoints, metrics and TensorBoard logs.
 DATASET_CLASS = 'improvnet.model.encoders.beat.data.BeatPairDataset'  # Dataset implementation that constructs contrastive pairs.
 COLLATOR_CLASS = 'improvnet.model.encoders.beat.data.BeatCollator'  # Batch builder including same-piece temporal negatives.
+PERCUSSION_POLICY = 'preserve_all_hits_v1'  # Retain auxiliary percussion; old checkpoints remain loadable but require a fresh run to retrain under this data policy.
 CHECKPOINT_FORMAT = 'beat_v1'  # Checkpoint identifier checked when loading the frozen encoder.
 OBJECTIVE = 'beat'  # Use the beat objective with temporal and cross-piece negatives.
 AUGMENTATION_DESCRIPTION = 'disjoint aligned instrument groups; independent +/-7 pitch shifts and 15-45% span masking; same-piece distant-window and other-piece negatives'  # Human-readable augmentation policy saved in checkpoints.

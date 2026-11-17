@@ -12,7 +12,6 @@ from improvnet.model import melody_config
 from improvnet.utils.melody import MelodyTokenizer, Note, ordered, notes_to_tokens
 from improvnet.utils.melody_data import MelodyDataset
 from improvnet.utils.melody_reference import PIANOS, crop_notes
-from improvnet.utils.melody_stems import kit_only_notes
 
 
 def transpose_view(notes, rng, semitones=7):
@@ -152,7 +151,7 @@ class PiecePairDataset(Dataset):
             try:
                 record = self.base.load_record(row)
                 notes = [Note('Acoustic Piano' if n[0]=='piano' else n[0], *n[1:]) for n in record['notes']]
-                notes += kit_only_notes([Note(*n) for n in record.get('drums', [])])
+                notes += [Note(*n) for n in record.get('drums', [])]
                 result = positive_pair(notes, rng, self.tokenizer, max_tokens=self.max_tokens,
                                        augment=self.augment, max_semitones=self.pitch_range,
                                        aligned=rng.random()<self.aligned_pair_prob,

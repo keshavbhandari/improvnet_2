@@ -4,6 +4,7 @@
 MANIFEST = '/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/jazz_blues_data/prepared/melody_manifest_v5.json'  # Dataset catalogue: source locations, piece splits and deduplication metadata; fixed for this encoder cohort.
 SAVE_DIR = '/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/style'  # Directory for model checkpoints, metrics and TensorBoard logs.
 DATASET_CLASS = 'improvnet.model.encoders.style.data.StylePairDataset'  # Dataset implementation that constructs contrastive pairs.
+PERCUSSION_POLICY = 'preserve_all_hits_v1'  # Retain auxiliary percussion; old checkpoints remain loadable but require a fresh run to retrain under this data policy.
 CHECKPOINT_FORMAT = 'style_v1'  # Checkpoint identifier checked when loading the frozen encoder.
 AUGMENTATION_DESCRIPTION = 'independent +/-7 semitone transpositions; independent 15-45% span masking; no timing shifts'  # Human-readable augmentation policy saved in checkpoints.
 

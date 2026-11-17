@@ -26,3 +26,30 @@ def inference_output_paths(output):
         directory = output.with_name(output.name + '_steps')
     return dict(final=directory / 'final.mid', directory=directory, report=directory / 'report.json',
                 **{name: directory / f'{name}.mid' for name in ('melody', *TASK_TOKENS)})
+
+
+def plan_stages(original, tasks, requested, original_instruments, stem_targets, *, task_mode='pipeline', target_instrument=None):
+    """One instrument plan shared by reference preparation and streaming workers."""
+    current = {n.instrument for n in original}
+    targets = iter(stem_targets)
+    planned = []
+    for task in tasks:
+        target = None
+        if task == 'stem':
+            target = next(targets) if task_mode == 'pipeline' else target_instrument
+            if target is None and 'drum' in requested and 'drum' not in current:
+                target = 'drum'
+            if target is None:
+                raise ValueError('Stem addition requires --target-instrument')
+            if target in current:
+                raise ValueError(f'Requested {target} stem already exists')
+            current = current | {target}
+            selected = sorted(current)
+        else:
+            selected = ([i for i in requested if i != 'drum']
+                        if task_mode != 'pipeline' or task == 'harmonize' else list(original_instruments))
+            if task == 'harmonize' and task_mode == 'pipeline':
+                selected = [i for i in selected if i not in stem_targets] or list(original_instruments)
+            current = set(selected)
+        planned.append((task,target,selected))
+    return planned

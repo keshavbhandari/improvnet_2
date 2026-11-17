@@ -1,4 +1,4 @@
-"""V7 uses the single existing config and separate output artifacts."""
+"""Current standalone configs, corpus sampling and artifact paths."""
 from pathlib import Path
 import ast
 import runpy
@@ -35,11 +35,14 @@ def test_configs_are_standalone_and_settings_are_explained():
         assert 'CONTINUATION_START_STEP' not in values
 
 
-def test_v7_settings_are_in_the_existing_config():
+def test_current_settings_use_the_single_config():
     assert cfg.CLASSICAL_RATIO==2
-    assert cfg.SAVE_DIR.endswith('/melody_refinement_v8')
+    assert cfg.SAVE_DIR.endswith('/melody_refinement_v12')
     assert cfg.DATA_FILE.name=='melody_manifest_v7.json'
-    assert cfg.RUN_NAME=='melody_refinement_v8'
+    assert cfg.RUN_NAME=='melody_refinement_v12'
+    assert cfg.PROTOCOL_VERSION==16 and not hasattr(cfg,'BEAT_TOKENS')
+    assert cfg.MODEL_KWARGS['memory_tokens']==32
+    assert cfg.REFERENCE_WINDOWS==1 and cfg.REFERENCE_PROB==1.
     assert cfg.BATCH_SIZE==24 and cfg.ACCUM_STEPS==1
     assert 'ar_context_split_instrument' in cfg.INIT_CHECKPOINT
     assert '/style/' in cfg.STYLE_ENCODER

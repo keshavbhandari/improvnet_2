@@ -1,6 +1,8 @@
 """Frozen encoder used identically by AR training and MIDI inference."""
+from dataclasses import replace
 import hashlib
 import json
+import random
 from pathlib import Path
 from contextlib import nullcontext
 import tempfile
@@ -8,8 +10,11 @@ import torch
 from improvnet.model.encoders.model import ContinuityConfig
 from improvnet.model.encoders.style.model import StyleEncoder
 from improvnet.model.encoders.beat.model import BeatEncoder
-from improvnet.utils.melody import MelodyTokenizer, notes_to_tokens
+from improvnet.utils.melody import MelodyTokenizer, notes_to_tokens, ordered
 from improvnet.utils.melody_reference import PIANOS, crop_notes
+from improvnet.utils.melody_chunks import chunk_end
+from improvnet.utils.drum_profile import drum_profile, reference_kit, profile_report
+from improvnet.utils.melody_stems import DRUM_KIT_ALIASES
 
 
 def file_digest(path):
@@ -48,6 +53,7 @@ def pin_checkpoint(source, directory):
 class FrozenReferenceEncoder:
     def __init__(self, path, device, *, expected_sha256=None, kind='style'):
         self.device = torch.device(device)
+        self.batch_size=32
         self.path = str(Path(path).resolve())
         self.sha256 = file_digest(path)
         if expected_sha256 and self.sha256 != expected_sha256:
@@ -80,71 +86,154 @@ class FrozenReferenceEncoder:
                 result[present] = self.model.encode(ids[present], attention_mask[present]).float()
         return result
 
-    def condition_batch(self, batch):
-        batch['style_embedding'] = self.encode(batch['style_ids'], batch['style_attention_mask'], batch['style_present'])
-        batch['style_mask'] = batch['style_present'].float()
-        return batch
+    def from_notes(self,notes,tokenizer,rng,*,instruments):
+        required=set(instruments)
+        selected=[n for n in notes if n.instrument in required]
+        if not required or {n.instrument for n in selected}!=required:raise ValueError('Reference is missing requested instruments')
+        for _ in range(64):
+            crop,start,end=crop_notes(selected,rng,self.max_tokens)
+            if {n.instrument for n in crop}==required:break
+        else:raise ValueError('No reference window contains all requested instruments')
+        return dict(embedding=self.embed_notes(crop,tokenizer),start_ms=start,end_ms=end,
+            instruments=sorted(required),tokens=len(notes_to_tokens(crop,tokenizer)),
+            encoder_sha256=self.sha256,encoder_step=self.step,_notes=crop)
 
-    def from_notes(self, notes, tokenizer, rng):
-        # Retain polyphonic piano and kit drums; never skyline a reference.
-        pianos = {n.instrument for n in notes if n.instrument in PIANOS}
-        piano_instrument = ('Acoustic Piano' if 'Acoustic Piano' in pianos else sorted(pianos)[0] if pianos else None)
-        selected = [n for n in notes if n.instrument in (piano_instrument, 'drum')]
-        if not any(n.instrument != 'drum' for n in selected):
-            raise ValueError('Reference MIDI needs a supported piano track (drums are optional)')
-        # Prefer a window where both piano and drums actually play.
-        candidates = []
-        for _ in range(24):
-            crop, start, end = crop_notes(selected, rng, self.max_tokens)
-            if any(n.instrument in PIANOS for n in crop):
-                candidates.append((crop, start, end))
-            if any(n.instrument == 'drum' for n in crop) and any(n.instrument in PIANOS for n in crop):
-                break
-        if not candidates:
-            candidates.append(crop_notes([n for n in selected if n.instrument in PIANOS], rng, self.max_tokens))
-        crop, start, end = candidates[-1]
-        ids = torch.tensor([[tokenizer.tok_to_id[t] for t in notes_to_tokens(crop, tokenizer)]], device=self.device)
-        mixture = self.encode(ids, torch.ones_like(ids, dtype=torch.bool), torch.tensor([True], device=self.device))[0]
-        piano = [n for n in crop if n.instrument in PIANOS]
-        # Exactly the same interval/rebasing as the full piano+drum view.
-        solo_ids = torch.tensor([[tokenizer.tok_to_id[t] for t in notes_to_tokens(piano, tokenizer)]], device=self.device)
-        solo = self.encode(solo_ids, torch.ones_like(solo_ids, dtype=torch.bool), torch.tensor([True], device=self.device))[0]
-        has_drums = any(n.instrument == 'drum' for n in crop)
-        return dict(solo_embedding=solo, mixture_embedding=mixture if has_drums else None,
-                    start_ms=start, end_ms=end, instruments=sorted({n.instrument for n in crop}),
-                    tokens=ids.size(1), solo_tokens=solo_ids.size(1),
-                    encoder_sha256=self.sha256, encoder_step=self.step, _notes=crop)
+    def embed_notes(self,notes,tokenizer):
+        ids=torch.tensor([[tokenizer.tok_to_id[t] for t in notes_to_tokens(notes,tokenizer)]],device=self.device)
+        if ids.size(1)>self.max_tokens:raise ValueError('Reference exceeds the encoder token budget')
+        return self.encode(ids,torch.ones_like(ids,dtype=torch.bool),torch.ones(1,device=self.device,dtype=torch.bool))[0]
+
+    @torch.no_grad()
+    def feature_windows(self,ids,mask,bins):
+        ids,mask=ids.to(self.device),mask.to(self.device)
+        features=torch.zeros(ids.size(0),bins+1,self.dim,device=self.device)
+        valid=torch.zeros(ids.size(0),bins+1,device=self.device,dtype=torch.bool)
+        tok=MelodyTokenizer()
+        onset_values=torch.zeros(tok.vocab_size,device=self.device,dtype=torch.long)
+        instrument=torch.zeros(tok.vocab_size,device=self.device,dtype=torch.bool)
+        for token,index in tok.tok_to_id.items():
+            if isinstance(token,tuple) and token[0]=='onset':onset_values[index]=token[1]
+            if isinstance(token,tuple) and token[0]=='instrument':instrument[index]=True
+        for offset in range(0,len(ids),self.batch_size):
+            block,attention=ids[offset:offset+self.batch_size],mask[offset:offset+self.batch_size]
+            present=attention.any(-1)
+            if not present.any():continue
+            block,attention=block[present],attention[present]
+            context=(torch.autocast('cuda',dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
+                     if self.device.type=='cuda' else nullcontext())
+            with context:
+                hidden=self.model.encode(block,attention,return_hidden=True)
+                global_hidden=hidden.float().sum(1)/attention.sum(1,keepdim=True)
+                note_mask=instrument[block]&attention
+                onsets=onset_values[block.roll(-2,1)]+block.eq(tok.tok_to_id['<T>']).cumsum(1)*tok.abs_time_step_ms
+                maximum=onsets.masked_fill(~note_mask,0).amax(1,keepdim=True).clamp_min(1)
+                groups=(onsets*bins//(maximum+1)).clamp(0,bins-1)
+                pooled=torch.zeros(block.size(0),bins,hidden.size(-1),device=self.device)
+                counts=torch.zeros(block.size(0),bins,device=self.device)
+                pooled.scatter_add_(1,groups[:,:,None].expand_as(hidden),hidden.float()*note_mask[:,:,None])
+                counts.scatter_add_(1,groups,note_mask.float())
+                local=pooled/counts.clamp_min(1)[:,:,None]
+                all_hidden=torch.cat((global_hidden[:,None],local),1).to(hidden.dtype)
+                encoded=torch.nn.functional.normalize(self.model.projector(all_hidden).float(),dim=-1)
+            rows=present.nonzero().flatten()+offset
+            features[rows]=encoded
+            valid[rows,0]=True
+            valid[rows,1:]=counts.gt(0)
+        return features,valid
 
 
 class FrozenConditioners:
     """Two immutable encoders; only the AR conditioning projections are trained."""
-    def __init__(self,style_path,beat_path,device,*,style_sha256=None,beat_sha256=None):
+    def __init__(self,style_path,beat_path,device,*,style_sha256=None,beat_sha256=None,windows=1,local_bins=8,batch_size=32):
+        if min(windows,local_bins,batch_size)<1:raise ValueError('Reference bank sizes must be positive')
+        if windows!=1:raise ValueError('V12 training uses one shared reference window')
+        self.local_bins=local_bins
         self.style=FrozenReferenceEncoder(style_path,device,expected_sha256=style_sha256,kind='style')
         self.beat=FrozenReferenceEncoder(beat_path,device,expected_sha256=beat_sha256,kind='beat')
+        self.style.batch_size=self.beat.batch_size=batch_size
 
     def condition_batch(self,batch):
-        for name,encoder in (('style',self.style),('beat',self.beat)):
-            batch[name+'_embedding']=encoder.encode(batch[name+'_ids'],batch[name+'_attention_mask'],batch[name+'_present'])
-            batch[name+'_mask']=batch[name+'_present'].float()
+        features,mask,positions=self.feature_bank(batch['reference_style_ids'],batch['reference_attention_mask'],beat_ids=batch['reference_beat_ids'])
+        batch.update(reference_features=features,reference_mask=mask,reference_positions=positions)
         return batch
 
-    def from_notes(self,notes,tokenizer,rng,regions='same'):
-        from improvnet.utils.melody_reference import neighboring_reference,PIANOS
-        if regions not in ('same','different'):raise ValueError('Reference regions must be same or different')
-        style=self.style.from_notes(notes,tokenizer,rng)
-        style_notes=style.pop('_notes')
-        beat_notes=style_notes
-        beat_start,beat_end=style['start_ms'],style['end_ms']
-        if regions=='different':
-            selected=[n for n in notes if n.instrument in set(style['instruments'])|{'drum'}]
-            maximum=max(n.onset+n.duration for n in selected)+1
-            neighbor=neighboring_reference(selected,beat_start,beat_end,rng,max_tokens=self.beat.max_tokens,
-                guard_ms=250,max_distance_ms=maximum)
-            if neighbor is None:raise ValueError('Reference is too short for different disjoint regions; use --reference-regions same or a longer MIDI')
-            beat_notes=neighbor['notes'];beat_start,beat_end=neighbor['start_ms'],neighbor['end_ms']
-        ids=torch.tensor([[tokenizer.tok_to_id[t] for t in notes_to_tokens(beat_notes,tokenizer)]],device=self.beat.device)
-        beat_embedding=self.beat.encode(ids,torch.ones_like(ids,dtype=torch.bool),torch.tensor([True],device=self.beat.device))[0]
-        return dict(style_solo_embedding=style.pop('solo_embedding'),style_mixture_embedding=style.pop('mixture_embedding'),
-            beat_embedding=beat_embedding,style_region=style,
-            beat_region=dict(start_ms=beat_start,end_ms=beat_end,tokens=ids.size(1),instruments=sorted({n.instrument for n in beat_notes}),
-                encoder_sha256=self.beat.sha256,encoder_step=self.beat.step),regions=regions)
+    @torch.no_grad()
+    def feature_bank(self,ids,mask,*,beat_ids=None,average=False):
+        # Shared aligned windows enter both independently trained frozen encoders.
+        batch,windows,length=ids.shape
+        parts,masks,coordinates=[],[],[]
+        for kind,encoder in enumerate((self.style,self.beat)):
+            streams=beat_ids if kind==1 and beat_ids is not None else ids
+            features,valid=encoder.feature_windows(streams.reshape(-1,length),mask.reshape(-1,length),self.local_bins)
+            features=features.reshape(batch,windows,self.local_bins+1,encoder.dim)
+            valid=valid.reshape(batch,windows,self.local_bins+1)
+            used_windows=windows
+            if average:
+                features=(features*valid[:,:,:,None]).sum(1,keepdim=True)/valid.sum(1,keepdim=True).clamp_min(1)[:,:,:,None]
+                features=torch.nn.functional.normalize(features,dim=-1)
+                valid=valid.any(1,keepdim=True)
+                used_windows=1
+            present=valid[:,:,0]
+            mean=(features[:,:,0]*present[:,:,None]).sum(1)/present.sum(1,keepdim=True).clamp_min(1)
+            mean=torch.nn.functional.normalize(mean,dim=-1)
+            parts.append(torch.cat((mean[:,None],features.flatten(1,2)),1))
+            masks.append(torch.cat((present.any(1,keepdim=True),valid.flatten(1,2)),1))
+            pos=torch.zeros(batch,1+used_windows*(self.local_bins+1),3,device=ids.device)
+            pos[:,:,2]=kind
+            pos[:,0,:2]=-1
+            for w in range(used_windows):
+                at=1+w*(self.local_bins+1)
+                pos[:,at:at+self.local_bins+1,0]=w/max(1,used_windows-1)
+                pos[:,at,1]=-1
+                pos[:,at+1:at+self.local_bins+1,1]=torch.linspace(0,1,self.local_bins,device=ids.device)
+            coordinates.append(pos)
+        return torch.cat(parts,1),torch.cat(masks,1),torch.cat(coordinates,1)
+
+    def from_notes(self,notes,tokenizer,*,mode='trio',stage_instruments=None,aggregation='window',rng=None):
+        """Global and local features from the same selected windows, cached by instrument view."""
+        from improvnet.utils.melody_reference import reference_instruments
+        if aggregation not in ('window','average'):raise ValueError('Reference aggregation must be window or average')
+        rng=rng or random.Random(42)
+        available={n.instrument for n in notes}
+        stages=stage_instruments or {'reference':sorted(available)}
+        cache,conditions={},{}
+        for stage,target in stages.items():
+            wanted=reference_instruments(target,mode)
+            if mode=='trio' and wanted & PIANOS and not wanted & available & PIANOS:
+                alternatives=sorted(available & PIANOS)
+                if alternatives:wanted=(wanted-PIANOS)|{alternatives[0]}
+            key=tuple(sorted(wanted))
+            if key not in cache:
+                if not wanted or not wanted<=available:
+                    raise ValueError(f'Reference lacks the required {stage} instruments: {sorted(wanted-available)}')
+                selected=ordered([n for n in notes if n.instrument in wanted])
+                streams,regions,instrument_sets,crops=[],[],[],[]
+                begin=0
+                while begin<len(selected):
+                    end=chunk_end(selected,begin,self.style.max_tokens)
+                    crop=selected[begin:end];origin=crop[0].onset
+                    streams.append([tokenizer.tok_to_id[t] for t in notes_to_tokens([replace(n,onset=n.onset-origin) for n in crop],tokenizer)])
+                    regions.append(dict(start_ms=origin,end_ms=max(n.onset+n.duration for n in crop)))
+                    instrument_sets.append({n.instrument for n in crop})
+                    crops.append(crop)
+                    begin=end
+                # Local excerpts must contain every requested instrument.
+                eligible=[i for i,present in enumerate(instrument_sets) if wanted<=present]
+                if not eligible:
+                    raise ValueError(f'Reference has no complete {stage} excerpt containing {sorted(wanted)}')
+                indices=[rng.choice(eligible)] if aggregation=='window' else eligible
+                width=max(len(streams[i]) for i in indices)
+                ids=torch.full((1,len(indices),width),tokenizer.pad_id,device=self.style.device,dtype=torch.long)
+                for w,index in enumerate(indices):ids[0,w,:len(streams[index])]=torch.tensor(streams[index],device=ids.device)
+                features,mask,positions=self.feature_bank(ids,ids.ne(tokenizer.pad_id),average=aggregation=='average')
+                # Inference requests the standard kit. No training target is filtered.
+                palette=reference_kit(selected)
+                profile_notes=[n for i in indices for n in crops[i] if n.instrument!='drum' or DRUM_KIT_ALIASES.get(n.pitch,n.pitch) in palette]
+                profile_notes=[replace(n,pitch=DRUM_KIT_ALIASES.get(n.pitch,n.pitch)) if n.instrument=='drum' else n for n in profile_notes]
+                profile=drum_profile(profile_notes).to(features.device)
+                cache[key]=dict(reference_features=features[0],reference_mask=mask[0],reference_positions=positions[0],
+                    drum_profile=profile,drum_palette=palette,drum_summary=profile_report(profile),
+                    reference_region=dict(candidate_windows=len(streams),selected_windows=[regions[i] for i in indices],aggregation=aggregation,
+                        global_aggregation='normalized_mean_selected_windows',instruments=sorted(wanted)))
+            conditions[stage]=dict(cache[key],reference_mode=mode,output_instruments=list(target))
+        return dict(stage_conditions=conditions,aggregation=aggregation,reference_mode=mode)

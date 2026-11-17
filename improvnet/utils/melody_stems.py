@@ -1,8 +1,7 @@
-"""Instrument preferences, kit-only drum normalization and stem selection."""
-from dataclasses import replace
+"""Percussion palette labels, inference kit constraints and stem selection."""
 
-# A drum-set subset of the General MIDI percussion map. Auxiliary percussion
-# is deliberately excluded; these are sound IDs, not transposable pitches.
+# The inference kit palette, not a training-data filter. Full percussion
+# targets retain every sound ID; these IDs are never transposed as pitches.
 DRUM_KIT_SOUNDS = {
     35: 'Acoustic Bass Drum', 36: 'Bass Drum 1',
     37: 'Side Stick', 38: 'Acoustic Snare', 40: 'Electric Snare',
@@ -13,35 +12,20 @@ DRUM_KIT_SOUNDS = {
     53: 'Ride Bell', 55: 'Splash Cymbal', 57: 'Crash Cymbal 2', 59: 'Ride Cymbal 2',
 }
 DRUM_KIT_PITCHES = frozenset(DRUM_KIT_SOUNDS)
-DRUM_POLICY = 'gm_drum_set_only_v1'
+DRUM_POLICY = 'intact_targets_conditioned_palette_v1'
+PERCUSSION_MODES = {'none': 0, 'kit': 1, 'full': 2}
 # Extended electronic hi-hat edge articulations, documented by Groove MIDI.
 # https://magenta.withgoogle.com/datasets/groove#drum-mapping
+# Recognized as kit for labelling; original IDs are preserved in training.
 DRUM_KIT_ALIASES = {22: 42, 26: 46}
 
 
-def kit_only_notes(notes):
-    """Normalize hi-hat edge hits; retain only kit drums and pitched instruments.
-
-    Coincident aliases/bow hits become one attack with the stronger velocity.
-    Pitched instruments are never filtered, remapped or deduplicated here.
-    """
-    result, attacks = [], {}
-    for n in notes:
-        if n.instrument != 'drum':
-            result.append(n)
-            continue
-        pitch = DRUM_KIT_ALIASES.get(n.pitch, n.pitch)
-        if pitch not in DRUM_KIT_PITCHES:
-            continue
-        if pitch != n.pitch:
-            n = replace(n, pitch=pitch)
-        key = (pitch, n.onset)
-        if key not in attacks:
-            attacks[key] = len(result)
-            result.append(n)
-        elif n.velocity > result[attacks[key]].velocity:
-            result[attacks[key]] = n
-    return result
+def percussion_mode(notes):
+    """Label authentic target content without removing or replacing any attacks."""
+    pitches = [n.pitch for n in notes if n.instrument == 'drum']
+    if not pitches:
+        return 'none'
+    return 'kit' if all(p in DRUM_KIT_PITCHES or p in DRUM_KIT_ALIASES for p in pitches) else 'full'
 
 
 JAZZ_INSTRUMENTS = frozenset(('Tenor Sax','Soprano/Alto Sax','Baritone Sax',

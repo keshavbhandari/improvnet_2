@@ -1,4 +1,4 @@
-"""Current V5 training contracts."""
+"""Current finetuning training contracts."""
 import hashlib
 import json
 import random
@@ -43,15 +43,14 @@ def test_harmonization_is_mono_to_clean_pitched_mix_with_poly_history(history, c
                         for n in rec['notes'] if ex['start_ms'] <= n[3] < ex['end_ms']])
     assert response(ex) == expected  # Corrupted history never changes labels.
     assert ex['multi_hot'].sum() == 2
-    assert len(ex['style_ids']) <= 512
-    assert bool(ex['style_present']) == bool(len(ex['style_ids']))
-    assert ex['source_length'] <= 512 and ex['response_length'] < cfg.MIX_RESPONSE_TOKENS
+    assert ex['reference_ids'].shape==(cfg.REFERENCE_WINDOWS,512)
+    assert ex['source_length'] <= 512 and len(ex['input'])+3<=cfg.SEQ_LEN
     assert ex['history_length'] <= 2048 and len(ex['input']) + 3 <= 8192
 
 
 def test_harmonization_history_probability_and_validation_are_stable():
     rec = dict(mix(50), _augment=True)
-    examples = [prepare_example(rec, random.Random(i), task='harmonize') for i in range(200)]
+    examples = [prepare_example(rec, random.Random(i), settings(), task='harmonize') for i in range(200)]
     present = [x for x in examples if x['history_length']]
     assert 135 <= len(present) <= 165
     assert 25 <= sum(x['history_corrupted'] for x in present) <= 65
@@ -71,12 +70,6 @@ def test_history_addition_bias_and_drum_pitch_safety():
     assert corrupt_history(notes, random.Random(1), 0) == notes
 
 
-def test_no_harmony_features_or_parameters_enter_new_model():
-    model = MelodyRefinementModel(embed_dim=32, n_heads=4, n_kv_heads=2, n_layers=1,
-                                   num_genres=4, num_instruments=41, dropout=0.)
-    assert model.style_proj[0].in_features == 257
-
-
 def test_original_ar_initialization_retains_backbone_and_initializes_new_conditions():
     from improvnet.model.ar_model import ARContextModel
     kwargs=dict(embed_dim=32,n_heads=4,n_kv_heads=2,n_layers=1,num_genres=4,num_instruments=41,dropout=0.)
@@ -91,7 +84,7 @@ def test_original_ar_initialization_retains_backbone_and_initializes_new_conditi
         assert torch.equal(value,actual),key
     assert torch.equal(initial_task,model.token_emb.weight[-1])
     assert model.strength_proj[-1].weight.count_nonzero()==0
-    assert model.style_proj[-1].weight.count_nonzero()==0
+    assert all(not hasattr(layer,'reference_adapter') for layer in model.layers)
 
 
 def test_validation_separates_missing_stem_from_copied_notes():
@@ -101,8 +94,9 @@ def test_validation_separates_missing_stem_from_copied_notes():
         def forward(self,target,**kwargs):
             return torch.tensor([[[4.,0.,0.],[0.,4.,0.],[4.,0.,0.],[4.,0.,0.]]]).expand(2,-1,-1)
     batch = dict(input=torch.zeros(2,4,dtype=torch.long),target=torch.tensor([[0,1,2,-100]]*2),
-        task=torch.tensor([2,2]),genre=torch.tensor([1,1]),multi_hot=torch.zeros(2,41),strength=torch.ones(2),
-        style_embedding=torch.zeros(2,256),style_mask=torch.zeros(2),
+        percussion_mode=torch.ones(2,dtype=torch.long),task=torch.tensor([2,2]),genre=torch.tensor([1,1]),multi_hot=torch.zeros(2,41),strength=torch.ones(2),
+        reference_features=torch.zeros(2,1,256),reference_mask=torch.zeros(2,1,dtype=torch.bool),
+        reference_positions=torch.zeros(2,1,3),drum_profile=torch.zeros(2,400),
         stem_mask=torch.tensor([[False,False,True,False],[False]*4]),
         stem_instrument=torch.tensor([ProcessData().INSTRUMENT_CLASSES.index('drum'),-1]))
     from types import SimpleNamespace
@@ -113,11 +107,11 @@ def test_validation_separates_missing_stem_from_copied_notes():
 
 @pytest.mark.parametrize('task', ('refine','harmonize','stem'))
 def test_repeated_sampling_respects_all_token_caps(task):
-    config = settings(CHUNK_TOKENS=64,MIX_RESPONSE_TOKENS=128,HISTORY_TOKENS=64,SEQ_LEN=256)
+    config = settings(CHUNK_TOKENS=64,HISTORY_TOKENS=64,SEQ_LEN=256)
     for seed in range(30):
         example = prepare_example(dict(mix(200),_augment=True),random.Random(seed),config,task=task,strength=1.)
         assert example['source_length'] <= 64
-        assert example['response_length']+1 <= (128 if task in ('harmonize','stem') else 64)
+        assert len(example['input'])+3<=config.SEQ_LEN
         assert example['history_length'] <= 64
         assert len(example['input'])+3 <= 256
 
@@ -152,7 +146,7 @@ def test_two_rank_training_with_three_task_dataset(tmp_path):
     config,_ = corpus(tmp_path,ratio=1,raw_count=0)
     updates=dict(NUM_WORKERS=0,BATCH_SIZE=1,ACCUM_STEPS=2,INIT_CHECKPOINT=None,N_STEPS=2,
         WARMUP_STEPS=0,DECAY_STEPS=1,VAL_EVERY=1,CHECKPOINT_EVERY=1,
-        CHUNK_TOKENS=48,MIX_RESPONSE_TOKENS=96,HISTORY_TOKENS=64,SEQ_LEN=256,
+        CHUNK_TOKENS=48,HISTORY_TOKENS=64,SEQ_LEN=256,
         SAVE_DIR=str(tmp_path/'ddp'),
         MODEL_KWARGS=dict(embed_dim=32,n_heads=4,n_kv_heads=2,n_layers=1,num_genres=4,num_instruments=41,dropout=0.))
     for key,value in updates.items():setattr(config,key,value)
@@ -211,7 +205,7 @@ def test_tiny_training_resume_and_checkpoint_protocol(tmp_path):
     config.ACCUM_STEPS=1
     config.CHUNK_TOKENS=48
     config.HISTORY_TOKENS=64
-    config.MIX_RESPONSE_TOKENS=96
+
     config.SEQ_LEN=256
     config.N_STEPS=2
     config.WARMUP_STEPS=0
@@ -223,11 +217,13 @@ def test_tiny_training_resume_and_checkpoint_protocol(tmp_path):
     config.MODEL_KWARGS=dict(embed_dim=32,n_heads=4,n_kv_heads=2,n_layers=1,num_genres=4,num_instruments=41,dropout=0.)
     train(config,n_steps=1)
     checkpoint=torch.load(Path(config.SAVE_DIR)/'latest_checkpoint.pt',weights_only=False)
-    assert checkpoint['step']==1 and validate_checkpoint(checkpoint)['harmony_conditioning'] is False
+    assert checkpoint['step']==1 and validate_checkpoint(checkpoint)['reference_architecture']=='self_attention_prefix_memory_v1'
     train(config,n_steps=2)
     checkpoint=torch.load(Path(config.SAVE_DIR)/'latest_checkpoint.pt',weights_only=False)
     assert checkpoint['step']==2 and checkpoint['refinement']['tasks']==['refine','harmonize','stem']
-    assert checkpoint['refinement']['data_policy_revision']==12
+    assert checkpoint['refinement']['data_policy_revision']==17
+    assert checkpoint['refinement']['version']==16
+    assert checkpoint['refinement']['reference_architecture']=='self_attention_prefix_memory_v1'
     assert checkpoint['scheduler_state_dict']['last_epoch']==2
     assert all(state['step']==2 for state in checkpoint['optimizer_state_dict']['state'].values())
     progress=(Path(config.SAVE_DIR)/'training.log').read_text()
@@ -237,15 +233,16 @@ def test_tiny_training_resume_and_checkpoint_protocol(tmp_path):
     assert 'Data (train): retries=' in progress and '% of attempts' in progress
     from improvnet.inference.melody_inference import MelodyInference
     loaded=MelodyInference(Path(config.SAVE_DIR)/'latest_checkpoint.pt')
-    assert loaded.model.style_proj[0].in_features==257 and loaded.checkpoint_step==2
+    assert loaded.model.reference_memory.queries.size(0)==32 and loaded.checkpoint_step==2
 
 
-def test_joint_inference_uses_generated_full_mix_history_and_generates_new_timing():
+def test_joint_inference_uses_generated_full_mix_history_and_generates_new_timing(monkeypatch):
     from improvnet.inference.melody_inference import MelodyInference
     infer=MelodyInference.__new__(MelodyInference)
     infer.tokenizer=tok=MelodyTokenizer()
-    infer.meta=dict(seq_len=512,chunk_tokens=64,history_tokens=100,mix_response_tokens=128,
-                    harmonize_expansion=4.,skyline_tolerance_ms=50)
+    monkeypatch.setattr('improvnet.inference.melody_inference.mask_timing',lambda notes,*a,**kw:notes_to_tokens(notes,tok))
+    infer.meta=dict(seq_len=512,chunk_tokens=64,history_tokens=100,
+                    skyline_tolerance_ms=50,harmonize_min_mask_ratio=.9)
     infer.options=cfg
     melody=[Note('Acoustic Piano',72+i%4,90,i*200,100) for i in range(30)]
     prompts=[]
@@ -253,7 +250,7 @@ def test_joint_inference_uses_generated_full_mix_history_and_generates_new_timin
         prompts.append(prompt)
         assert kw['stop_at_window_end'] and not kw['monophonic']
         assert instruments==['Acoustic Bass','Acoustic Piano']
-        assert kw['style_embedding'] is None
+        assert kw['reference_features'] is None
         source=tokens_to_notes(prompt[prompt.index('<SEP>')+1:-2],tok)
         infer.last_decode_stats=dict(duplicate_attacks_removed=0,end_reason='window_boundary')
         return ([replace(n,onset=n.onset+10) for n in source]
@@ -270,12 +267,13 @@ def test_joint_inference_uses_generated_full_mix_history_and_generates_new_timin
         assert any(n.instrument=='Acoustic Bass' for n in history)
 
 
-def test_joint_inference_early_end_does_not_discard_unprocessed_melody():
+def test_joint_inference_early_end_does_not_discard_unprocessed_melody(monkeypatch):
     from improvnet.inference.melody_inference import MelodyInference
     infer=MelodyInference.__new__(MelodyInference)
     infer.tokenizer=tok=MelodyTokenizer()
-    infer.meta=dict(seq_len=512,chunk_tokens=96,history_tokens=100,mix_response_tokens=256,
-                    harmonize_expansion=3.,skyline_tolerance_ms=50)
+    monkeypatch.setattr('improvnet.inference.melody_inference.mask_timing',lambda notes,*a,**kw:notes_to_tokens(notes,tok))
+    infer.meta=dict(seq_len=512,chunk_tokens=96,history_tokens=100,
+                    skyline_tolerance_ms=50,harmonize_min_mask_ratio=.9)
     infer.options=cfg
     calls=[]
     def generate(prompt,*a,**kw):
@@ -446,9 +444,9 @@ def test_stem_drums_are_prioritized_and_solo_rejected():
  counts=Counter(stem_source(notes,random.Random(i),cfg)[0] for i in range(200))
  assert 150<=counts['drum']<=190
  solo=dict(rec,notes=[['Acoustic Piano',72,90,i*200,100] for i in range(30)])
- assert prepare_example(solo,random.Random(1),task='stem',target_instrument='drum')['stem_name']=='drum'
- with pytest.raises(ValueError,match='Unknown v5 task'):prepare_example(solo,random.Random(1),task='orchestrate')
- with pytest.raises(NoStemWindow):prepare_example(dict(solo,drums=[]),random.Random(1),task='stem')
+ assert prepare_example(solo,random.Random(1),settings(),task='stem',target_instrument='drum')['stem_name']=='drum'
+ with pytest.raises(ValueError,match='Unknown task'):prepare_example(solo,random.Random(1),settings(),task='unsupported_task')
+ with pytest.raises(NoStemWindow):prepare_example(dict(solo,drums=[]),random.Random(1),settings(),task='stem')
 
 
 def test_full_jazz_file_passes_and_auxiliary_mixture_draws_are_both_preserved(tmp_path,monkeypatch):
@@ -458,7 +456,7 @@ def test_full_jazz_file_passes_and_auxiliary_mixture_draws_are_both_preserved(tm
  main=Counter();tasks=Counter();genre=Counter()
  fraction=sum(config.TASK_WEIGHTS[:2])/sum(config.TASK_WEIGHTS)
  for idx in range(len(D)):
-  ex=D[idx];tasks[TASKS[ex['task']]]+=1;genre[ex['genre'].item()]+=1
+  ex=D[(idx,15000)];tasks[TASKS[ex['task']]]+=1;genre[ex['genre'].item()]+=1
   if math.floor((idx+1)*fraction+1e-9)>math.floor(idx*fraction+1e-9):
    if loaded[-1] in D.jazz_blues:main[loaded[-1]['offset']]+=1
  assert list(main.values())==[4]*len(D.jazz_blues)
@@ -476,9 +474,12 @@ def test_new_protocol_rejects_old_resume_and_changed_training_controls(tmp_path)
  validate_checkpoint(dict(refinement=meta),meta)
  for key,value in [('jazz_blues_repeats',3),('task_weights',[.3,.4,.3]),('data_policy_revision',4)]:
   with pytest.raises(ValueError,match='Resume settings differ'):
-   validate_checkpoint(dict(refinement=dict(meta,**{key:value})),meta,allow_data_policy_update=True)
- with pytest.raises(ValueError,match='dual style/beat'):
+   validate_checkpoint(dict(refinement=dict(meta,**{key:value})),meta)
+ with pytest.raises(ValueError,match='protocol 16'):
   validate_checkpoint(dict(refinement=dict(meta,version=7)))
+ for key,value in [('drum_profile_schema','unknown'),('reference_architecture','old_projection')]:
+  with pytest.raises(ValueError,match='protocol 16'):
+   validate_checkpoint(dict(refinement=dict(meta,**{key:value})))
 
 
 def test_stem_eligibility_does_not_rescan_the_full_mix_per_chunk(monkeypatch):
@@ -488,6 +489,47 @@ def test_stem_eligibility_does_not_rescan_the_full_mix_per_chunk(monkeypatch):
   if len(notes)>=5000:scans.append(len(notes))
   return original(notes,*args)
  monkeypatch.setattr(module,'window',counted)
- example=prepare_example(mix(1000),random.Random(17),task='stem')
+ example=prepare_example(mix(1000),random.Random(17),settings(),task='stem')
  assert example['source_length']<=512 and len(scans)<=2
 
+
+
+def test_percussion_condition_learns_independent_kit_and_full_embeddings():
+    model=MelodyRefinementModel(embed_dim=32,n_heads=4,n_kv_heads=2,n_layers=1,num_genres=4,num_instruments=41,dropout=0.)
+    ids=torch.tensor([[3,4,5],[3,4,5]])
+    logits=model(ids,strength=torch.zeros(2),percussion_mode=torch.tensor([1,2]))
+    torch.nn.functional.cross_entropy(logits.flatten(0,1),torch.tensor([6,7,8,9,10,11])).backward()
+    grad=model.percussion_embedding.weight.grad
+    assert grad[1].abs().sum()>0 and grad[2].abs().sum()>0
+    assert grad[0].count_nonzero()==0
+    with pytest.raises(ValueError,match='percussion mode'):
+        model(ids,strength=torch.zeros(2),percussion_mode=torch.tensor([1,3]))
+
+
+def test_kit_requests_select_intact_natural_windows_and_leave_mixed_targets_available():
+    from improvnet.utils.melody_data import NoKitWindow
+    record=mix(300)
+    record['drums'] += [['drum',60,80,i*100,20] for i in range(300)]
+    config=settings(CHUNK_TOKENS=128)
+    for seed in range(8):
+        e=prepare_example(record,random.Random(seed),config,task='stem',target_instrument='drum',require_kit=True)
+        assert e['start_ms']>=30000 and e['percussion_palette']=='kit'
+        expected=[replace(Note(*n),onset=n[3]-e['start_ms']) for n in record['drums'] if e['start_ms']<=n[3]<e['end_ms']]
+        assert Counter(n for n in response(e) if n.instrument=='drum')==Counter(expected)
+    mixed=mix(30);mixed['drums']=[['drum',60,80,i*100,20] for i in range(60)]
+    with pytest.raises(NoKitWindow):
+        prepare_example(mixed,random.Random(1),config,task='stem',target_instrument='drum',require_kit=True)
+    full=prepare_example(mixed,random.Random(1),config,task='stem',target_instrument='drum')
+    assert full['percussion_palette']=='full' and {n.pitch for n in response(full) if n.instrument=='drum'}=={60}
+
+
+def test_curriculum_changes_file_draw_balance_without_changing_splits(tmp_path,monkeypatch):
+    config,_=corpus(tmp_path,ratio=2,raw_count=3)
+    dataset=MelodyDataset(config.DATA_FILE,'train',config)
+    monkeypatch.setattr(dataset,'load_record',lambda row:dict(mix(100,row['genre'])))
+    fraction=sum(config.TASK_WEIGHTS[:2])/sum(config.TASK_WEIGHTS)
+    main=[i for i in range(len(dataset)) if math.floor((i+1)*fraction+1e-9)>math.floor(i*fraction+1e-9)]
+    for step,expected in ((0,2),(10000,2),(15000,4)):
+        samples=[dataset[(i,step)] for i in main]
+        assert sum(int(sample['genre']) in (1,2) for sample in samples)==expected
+    assert len(main)==6 and len(dataset.jazz_blues)==1
