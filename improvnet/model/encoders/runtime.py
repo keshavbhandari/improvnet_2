@@ -11,7 +11,7 @@ from improvnet.model.encoders.model import ContinuityConfig
 from improvnet.model.encoders.style.model import StyleEncoder
 from improvnet.model.encoders.beat.model import BeatEncoder
 from improvnet.utils.melody import MelodyTokenizer, notes_to_tokens, ordered
-from improvnet.utils.melody_reference import PIANOS, crop_notes
+from improvnet.utils.melody_reference import crop_notes
 from improvnet.utils.melody_chunks import chunk_end
 from improvnet.utils.drum_profile import drum_profile, reference_kit, profile_report
 from improvnet.utils.melody_stems import DRUM_KIT_ALIASES
@@ -144,9 +144,9 @@ class FrozenReferenceEncoder:
 
 class FrozenConditioners:
     """Two immutable encoders; only the AR conditioning projections are trained."""
-    def __init__(self,style_path,beat_path,device,*,style_sha256=None,beat_sha256=None,windows=1,local_bins=8,batch_size=32):
+    def __init__(self,style_path,beat_path,device,*,style_sha256=None,beat_sha256=None,windows=2,local_bins=8,batch_size=32):
         if min(windows,local_bins,batch_size)<1:raise ValueError('Reference bank sizes must be positive')
-        if windows!=1:raise ValueError('V12 training uses one shared reference window')
+        if windows!=2:raise ValueError('Conditioning uses a consecutive reference pair')
         self.local_bins=local_bins
         self.style=FrozenReferenceEncoder(style_path,device,expected_sha256=style_sha256,kind='style')
         self.beat=FrozenReferenceEncoder(beat_path,device,expected_sha256=beat_sha256,kind='beat')
@@ -158,8 +158,8 @@ class FrozenConditioners:
         return batch
 
     @torch.no_grad()
-    def feature_bank(self,ids,mask,*,beat_ids=None,average=False):
-        # Shared aligned windows enter both independently trained frozen encoders.
+    def feature_bank(self,ids,mask,*,beat_ids=None):
+        """Keep window axes separate so neither features nor statistics can mix."""
         batch,windows,length=ids.shape
         parts,masks,coordinates=[],[],[]
         for kind,encoder in enumerate((self.style,self.beat)):
@@ -167,27 +167,15 @@ class FrozenConditioners:
             features,valid=encoder.feature_windows(streams.reshape(-1,length),mask.reshape(-1,length),self.local_bins)
             features=features.reshape(batch,windows,self.local_bins+1,encoder.dim)
             valid=valid.reshape(batch,windows,self.local_bins+1)
-            used_windows=windows
-            if average:
-                features=(features*valid[:,:,:,None]).sum(1,keepdim=True)/valid.sum(1,keepdim=True).clamp_min(1)[:,:,:,None]
-                features=torch.nn.functional.normalize(features,dim=-1)
-                valid=valid.any(1,keepdim=True)
-                used_windows=1
-            present=valid[:,:,0]
-            mean=(features[:,:,0]*present[:,:,None]).sum(1)/present.sum(1,keepdim=True).clamp_min(1)
-            mean=torch.nn.functional.normalize(mean,dim=-1)
-            parts.append(torch.cat((mean[:,None],features.flatten(1,2)),1))
-            masks.append(torch.cat((present.any(1,keepdim=True),valid.flatten(1,2)),1))
-            pos=torch.zeros(batch,1+used_windows*(self.local_bins+1),3,device=ids.device)
-            pos[:,:,2]=kind
-            pos[:,0,:2]=-1
-            for w in range(used_windows):
-                at=1+w*(self.local_bins+1)
-                pos[:,at:at+self.local_bins+1,0]=w/max(1,used_windows-1)
-                pos[:,at,1]=-1
-                pos[:,at+1:at+self.local_bins+1,1]=torch.linspace(0,1,self.local_bins,device=ids.device)
+            parts.append(torch.cat((features[:,:,:1],features),2))
+            masks.append(torch.cat((valid[:,:,:1],valid),2))
+            pos=torch.zeros(batch,windows,self.local_bins+2,3,device=ids.device)
+            pos[:,:,:,2]=kind
+            pos[:,:,:,0]=(torch.arange(windows,device=ids.device)%2)[None,:,None]
+            pos[:,:,:2,1]=-1
+            pos[:,:,2:,1]=torch.linspace(0,1,self.local_bins,device=ids.device)
             coordinates.append(pos)
-        return torch.cat(parts,1),torch.cat(masks,1),torch.cat(coordinates,1)
+        return torch.cat(parts,2),torch.cat(masks,2),torch.cat(coordinates,2)
 
     def from_notes(self,notes,tokenizer,*,mode='trio',stage_instruments=None,aggregation='window',rng=None):
         """Global and local features from the same selected windows, cached by instrument view."""
@@ -198,10 +186,7 @@ class FrozenConditioners:
         stages=stage_instruments or {'reference':sorted(available)}
         cache,conditions={},{}
         for stage,target in stages.items():
-            wanted=reference_instruments(target,mode)
-            if mode=='trio' and wanted & PIANOS and not wanted & available & PIANOS:
-                alternatives=sorted(available & PIANOS)
-                if alternatives:wanted=(wanted-PIANOS)|{alternatives[0]}
+            wanted=reference_instruments(target,'exact' if stage=='refine' else mode,available)
             key=tuple(sorted(wanted))
             if key not in cache:
                 if not wanted or not wanted<=available:
@@ -221,19 +206,40 @@ class FrozenConditioners:
                 eligible=[i for i,present in enumerate(instrument_sets) if wanted<=present]
                 if not eligible:
                     raise ValueError(f'Reference has no complete {stage} excerpt containing {sorted(wanted)}')
-                indices=[rng.choice(eligible)] if aggregation=='window' else eligible
+                eligible=set(eligible)
+                pairs=[(i,i+1) for i in range(len(streams)-1) if i in eligible and i+1 in eligible]
+                if not pairs:
+                    raise ValueError(f'Reference has no consecutive {stage} pair containing {sorted(wanted)} in both windows')
+                chosen=[rng.choice(pairs)] if aggregation=='window' else pairs
+                indices=[i for pair in chosen for i in pair]
                 width=max(len(streams[i]) for i in indices)
                 ids=torch.full((1,len(indices),width),tokenizer.pad_id,device=self.style.device,dtype=torch.long)
                 for w,index in enumerate(indices):ids[0,w,:len(streams[index])]=torch.tensor(streams[index],device=ids.device)
-                features,mask,positions=self.feature_bank(ids,ids.ne(tokenizer.pad_id),average=aggregation=='average')
+                features,mask,positions=self.feature_bank(ids,ids.ne(tokenizer.pad_id))
                 # Inference requests the standard kit. No training target is filtered.
                 palette=reference_kit(selected)
-                profile_notes=[n for i in indices for n in crops[i] if n.instrument!='drum' or DRUM_KIT_ALIASES.get(n.pitch,n.pitch) in palette]
-                profile_notes=[replace(n,pitch=DRUM_KIT_ALIASES.get(n.pitch,n.pitch)) if n.instrument=='drum' else n for n in profile_notes]
-                profile=drum_profile(profile_notes).to(features.device)
+                profiles=[]
+                for index in indices:
+                    profile_notes=[n for n in crops[index] if n.instrument!='drum' or DRUM_KIT_ALIASES.get(n.pitch,n.pitch) in palette]
+                    profile_notes=[replace(n,pitch=DRUM_KIT_ALIASES.get(n.pitch,n.pitch)) if n.instrument=='drum' else n for n in profile_notes]
+                    # The crop's own origin makes interval statistics window-local.
+                    origin=crops[index][0].onset
+                    profiles.append(drum_profile([replace(n,onset=n.onset-origin) for n in profile_notes]))
+                profile=torch.stack(profiles).to(features.device).reshape(len(chosen),2,-1).mean(0)
+                if aggregation=='average':
+                    # Average matching positions in consecutive pairs, never merge
+                    # first-window and second-window banks or their drum profiles.
+                    features=features.reshape(1,len(chosen),2,*features.shape[2:])
+                    mask=mask.reshape(1,len(chosen),2,-1)
+                    features=(features*mask[...,None]).sum(1)/mask.sum(1).clamp_min(1)[...,None]
+                    features=torch.nn.functional.normalize(features,dim=-1)
+                    mask=mask.any(1)
+                    positions=positions[:,:2]
                 cache[key]=dict(reference_features=features[0],reference_mask=mask[0],reference_positions=positions[0],
-                    drum_profile=profile,drum_palette=palette,drum_summary=profile_report(profile),
-                    reference_region=dict(candidate_windows=len(streams),selected_windows=[regions[i] for i in indices],aggregation=aggregation,
-                        global_aggregation='normalized_mean_selected_windows',instruments=sorted(wanted)))
-            conditions[stage]=dict(cache[key],reference_mode=mode,output_instruments=list(target))
+                    drum_profile=profile,drum_palette=palette,drum_summary=[profile_report(p) for p in profile],
+                    reference_region=dict(candidate_windows=len(streams),candidate_pairs=len(pairs),
+                        selected_windows=[regions[i] for i in indices],aggregation=aggregation,
+                        global_aggregation='independent_window_banks' if aggregation=='window' else 'normalized_mean_by_pair_position',
+                        instruments=sorted(wanted)))
+            conditions[stage]=dict(cache[key],reference_mode='exact' if stage=='refine' else mode,output_instruments=list(target))
         return dict(stage_conditions=conditions,aggregation=aggregation,reference_mode=mode)

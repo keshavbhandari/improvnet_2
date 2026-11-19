@@ -149,3 +149,38 @@ def test_pinned_encoder_survives_replacing_the_training_checkpoint(tmp_path):
     from pathlib import Path
     Path(path).write_bytes(b'replaced original checkpoint')
     assert FrozenReferenceEncoder(pinned,'cpu',expected_sha256=runtime.sha256).sha256==runtime.sha256
+
+
+def test_reference_pair_is_consecutive_on_one_side_and_never_contains_target_sounds():
+    from improvnet.utils.melody_reference import neighboring_references
+    from improvnet.utils.melody_chunks import chunk_end
+    from improvnet.utils.melody import ordered
+    notes=music()+[Note('Acoustic Piano',100,90,100,100000)]
+    sides=set()
+    for seed in range(20):
+        refs=neighboring_references(notes,20000,30000,random.Random(seed),max_tokens=50,
+            instruments={'Acoustic Piano','drum'})
+        assert len(refs)==2 and refs[0]['start_ms']<refs[1]['start_ms']
+        before=all(r['end_ms']<=19750 for r in refs)
+        after=all(r['start_ms']>=30250 for r in refs)
+        assert before or after
+        sides.add(before)
+        assert not any(n.pitch==100 for r in refs for n in r['notes'])
+        safe=ordered([n for n in notes if n.onset+n.duration<=19750 and n.onset>=-10000] if before else
+                     [n for n in notes if 30250<=n.onset<60000])
+        begin=next(i for i,n in enumerate(safe) if n.onset==refs[0]['start_ms'])
+        stop=chunk_end(safe,begin,50)
+        assert safe[stop].onset==refs[1]['start_ms']
+        assert all(len(style_ids(r,MelodyTokenizer()))<=50 for r in refs)
+    assert sides=={False,True}
+
+
+def test_reference_pair_cannot_join_separate_sides_or_duplicate_a_short_window():
+    from improvnet.utils.melody_reference import neighboring_references,transpose_reference
+    notes=[Note('Acoustic Piano',60,80,t,80) for t in (0,100,200,3000,3100,3200)]
+    assert neighboring_references(notes,1000,2000,random.Random(1),max_tokens=18,
+        instruments={'Acoustic Piano'})==[]
+    # One common legal shift is selected using the pitch range of both windows.
+    edge=[Note('Acoustic Piano',0,80,0,50),Note('Acoustic Piano',127,80,100,50),Note('drum',42,80,0,20)]
+    shifted,shift=transpose_reference(edge,random.Random(1))
+    assert shift==0 and shifted==edge

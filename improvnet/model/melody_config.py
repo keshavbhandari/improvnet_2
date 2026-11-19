@@ -1,10 +1,10 @@
-"""V12: original AR decoder, single-window reference prefix and a genre curriculum."""
+"""V14: original AR decoder, paired-window reference prefix and a genre curriculum."""
 from pathlib import Path
 from improvnet.utils.melody import MelodyTokenizer, TASKS
 
 
 # Tasks and sequence format
-PROTOCOL_VERSION = 16  # Projected-prefix reference-memory training/inference format.
+PROTOCOL_VERSION = 18  # Projected-prefix reference-memory training/inference format.
 TASK_NAMES = TASKS  # Canonical refinement, harmonize and stem task names.
 TASK_WEIGHTS = (.20, .40, .40)  # Relative sampling probabilities for refinement, harmonize and stem.
 
@@ -34,8 +34,8 @@ AR_MIXTURE_SCAN_PER_FILE = 200000  # Maximum records inspected in each original 
 AR_MIXTURE_INDEX = DATA_ROOT / 'prepared' / 'ar_mixtures_v3.json'  # Cached index of eligible AR mixtures.
 
 # Output paths and initialization
-SAVE_DIR = '/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v12'  # Fresh V12 output directory; obsolete numbered melody runs are cleaned separately.
-RUN_NAME = 'melody_refinement_v12'  # Name identifying this finetuning run.
+SAVE_DIR = '/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v14'  # Fresh V14 output directory; Earlier checkpoints remain available for comparison.
+RUN_NAME = 'melody_refinement_v14'  # Name identifying this finetuning run.
 INIT_CHECKPOINT = '/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/ar_context_split_instrument/best_model.pt'  # Pretrained autoregressive weights used for a fresh run.
 RESUME_TRAINING = True  # Resume the latest checkpoint if present; otherwise start fresh.
 GENRES = ['classical', 'jazz', 'blues', 'unknown']  # Genre labels supported by the conditioning vocabulary.
@@ -51,7 +51,7 @@ MODEL_KWARGS = dict(  # Pretrained AR architecture and reference-prefix dimensio
     dropout=.1,  # Dropout probability during training.
     style_dim=256,  # Frozen style-feature width.
     beat_dim=256,  # Frozen rhythm-feature width.
-    memory_tokens=32,  # Compressed reference memory available to the decoder.
+    memory_tokens=64,  # Two independent 32-token banks, ordered by reference-window time.
     memory_dim=256,  # Reference resampler width before projection to the decoder.
     memory_heads=4,  # Heads in the reference resampler; decoder blocks stay unchanged.
 )  # End of model architecture settings.
@@ -59,6 +59,8 @@ MODEL_KWARGS = dict(  # Pretrained AR architecture and reference-prefix dimensio
 # Window sizes and timing masks
 SEQ_LEN = 8192  # Maximum combined prompt and response length in tokens.
 CHUNK_TOKENS = 512  # Maximum source tokens per task window.
+REFINE_MIN_MASK_RATIO = .90  # Minimum fraction of corrupted melody attack groups with onset/duration masked.
+REFINE_FULL_MASK_PROB = .25  # Probability of masking every corrupted-melody attack group during refinement.
 HARMONIZE_MIN_MASK_RATIO = .90  # Minimum fraction of melody timing attributes masked for harmonization.
 HARMONIZE_FULL_MASK_PROB = .25  # Probability of masking all melody timing attributes.
 
@@ -72,12 +74,12 @@ HISTORY_ADDITION_WEIGHT = 2.  # Relative weight of adding history notes.
 HISTORY_DELETION_WEIGHT = 1.  # Relative weight of deleting history notes.
 
 # Frozen style and beat references
-REFERENCE_PROB = 1.0  # Condition both encoders on safe neighboring windows for every harmonize/stem example; route ineligible pieces to refinement.
-REFERENCE_EXACT_PROB = .50  # Half of examples match the full target instrument set; the other half match its jazz-trio subset.
+REFERENCE_PROB = 1.0  # Condition both encoders on safe neighboring windows for every task; resample when no safe pair exists.
+REFERENCE_EXACT_PROB = .50  # Harmonize/stem references: half match all target instruments, half their jazz-trio subset; refinement always matches exactly.
 STYLE_DIM = 256  # Frozen style embedding dimension.
 BEAT_DIM = 256  # Frozen beat embedding dimension.
-REFERENCE_WINDOWS = 1  # One safe shared window per training example and random reference excerpt by default at inference.
-REFERENCE_PITCH_SEMITONES = 7  # Independently transpose pitched notes for each encoder during finetuning; drums remain unchanged.
+REFERENCE_WINDOWS = 2  # Consecutive nearby windows on one side of the target; inference selects a random pair.
+REFERENCE_PITCH_SEMITONES = 7  # One pitch shift per encoder shared across both windows; drums remain unchanged.
 REFERENCE_LOCAL_BINS = 8  # Time bins of local frozen features retained within each reference window.
 REFERENCE_ENCODER_BATCH_SIZE = 32  # Bound frozen-encoder activation memory independently of the AR batch.
 REFERENCE_TOKENS = 512  # Maximum reference-window tokens passed to each encoder.

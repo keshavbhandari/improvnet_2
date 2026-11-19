@@ -1,6 +1,6 @@
 """Short output paths shared by both inference entrypoints."""
 from pathlib import Path
-from improvnet.utils.melody import TASK_TOKENS
+from improvnet.utils.melody import TASK_TOKENS, skyline, melody_voice
 
 
 def stage_output_names(tasks, stem_targets):
@@ -28,7 +28,7 @@ def inference_output_paths(output):
                 **{name: directory / f'{name}.mid' for name in ('melody', *TASK_TOKENS)})
 
 
-def plan_stages(original, tasks, requested, original_instruments, stem_targets, *, task_mode='pipeline', target_instrument=None):
+def plan_stages(original, tasks, requested, original_instruments, stem_targets, *, task_mode='pipeline', target_instrument=None, skyline_tolerance_ms=50):
     """One instrument plan shared by reference preparation and streaming workers."""
     current = {n.instrument for n in original}
     targets = iter(stem_targets)
@@ -46,8 +46,9 @@ def plan_stages(original, tasks, requested, original_instruments, stem_targets, 
             current = current | {target}
             selected = sorted(current)
         else:
-            selected = ([i for i in requested if i != 'drum']
-                        if task_mode != 'pipeline' or task == 'harmonize' else list(original_instruments))
+            selected = ([i for i in requested if i != 'drum'] if task == 'harmonize' else
+                        sorted({n.instrument for n in melody_voice(skyline(
+                            [n for n in original if n.instrument!='drum'],skyline_tolerance_ms)[0])}))
             if task == 'harmonize' and task_mode == 'pipeline':
                 selected = [i for i in selected if i not in stem_targets] or list(original_instruments)
             current = set(selected)

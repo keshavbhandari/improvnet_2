@@ -15,7 +15,7 @@ from improvnet.model import melody_config as cfg
 from improvnet.scripts.melody_prepare import make_record, read_job
 from improvnet.utils.ar_utils import ProcessData
 from improvnet.utils.melody import (Note, MelodyTokenizer, TASKS, make_prompt, mask_timing,
-    PREFIX_TOKENS, melody_voice, notes_to_tokens, ordered, sample_strength, harmonize_strength, skyline, tokens_to_notes, window)
+    PREFIX_TOKENS, normalize_refinement_velocity, melody_voice, notes_to_tokens, ordered, sample_strength, harmonize_strength, skyline, tokens_to_notes, window)
 from improvnet.utils.drum_profile import drum_profile
 from improvnet.utils.melody_chunks import (chunk_bounds, chunk_end, chunk_starts,
                                           history_tokens, trim_history, stem_bounds, shorten_chunk, validate_lengths)
@@ -41,7 +41,7 @@ def retry_reason(error):
 
 
 class NoReferenceWindow(ValueError):
-    """No safe complete neighbor; keep this piece eligible for refinement."""
+    """No safe complete neighboring reference pair for the selected task window."""
 
 
 class NoStemWindow(ValueError):
@@ -147,6 +147,8 @@ def prepare_example(record, rng, config=cfg, task=None, strength=None, target_in
                 if task == 'harmonize' else sample_strength(rng) if strength is None else strength)
     if task == 'stem':
         strength=1.
+    timing_fraction=(harmonize_strength(rng,minimum=config.REFINE_MIN_MASK_RATIO,
+        full_probability=config.REFINE_FULL_MASK_PROB) if task=='refine' else strength if task=='harmonize' else None)
     use_history = rng.random() < (config.HISTORY_PROB if task == 'refine' else config.POLY_HISTORY_PROB)
     if use_history:
         noninitial = [i for i in starts if i > 0]
@@ -184,7 +186,9 @@ def prepare_example(record, rng, config=cfg, task=None, strength=None, target_in
         target_notes = window(target_domain, start, end)
         condition_strength = refinement_strength(core, strength, config) if task == 'refine' else strength
         if task == 'refine':
-            source = refinement_source(core, strength, rng, tok, config)
+            unmasked_source = normalize_refinement_velocity(refinement_source(core, strength, rng, tok, config))
+            corrupted_notes = tokens_to_notes(unmasked_source,tok)
+            source = mask_timing(corrupted_notes,timing_fraction,rng,tok,round_up=True)
         elif task == 'harmonize':
             source = mask_timing(core, strength, rng, tok, round_up=True)
         elif task == 'stem':
@@ -209,30 +213,33 @@ def prepare_example(record, rng, config=cfg, task=None, strength=None, target_in
         except ValueError as error:
             raise ValueError('Complete onset group exceeds the training token budget') from error
     references=[]
-    reference_mode='exact' if rng.random()<config.REFERENCE_EXACT_PROB else 'trio'
+    reference_mode='exact' if task=='refine' or rng.random()<config.REFERENCE_EXACT_PROB else 'trio'
     required_instruments=reference_instruments({n.instrument for n in target_notes},reference_mode)
-    if task in ('harmonize','stem') and required_instruments and rng.random()<config.REFERENCE_PROB:
+    if required_instruments and rng.random()<config.REFERENCE_PROB:
         protected_end=max([end]+[n.onset+n.duration for n in full_mix if start<=n.onset<end])
         references=neighboring_references(full_mix,start,protected_end,rng,count=config.REFERENCE_WINDOWS,
             max_tokens=config.REFERENCE_TOKENS,guard_ms=config.REFERENCE_GUARD_MS,
             max_distance_ms=config.REFERENCE_MAX_DISTANCE_MS,instruments=required_instruments)
-    if task in ('harmonize','stem') and config.REFERENCE_PROB==1. and not references:
-        raise NoReferenceWindow('No safe complete neighboring reference window')
+    if config.REFERENCE_PROB==1. and len(references)!=config.REFERENCE_WINDOWS:
+        raise NoReferenceWindow('No safe complete consecutive reference pair')
     bank=torch.full((config.REFERENCE_WINDOWS,config.REFERENCE_TOKENS),tok.pad_id,dtype=torch.long)
     for i,ref in enumerate(references):
         stream=reference_ids(ref,tok)
         bank[i,:len(stream)]=torch.tensor(stream)
     style_bank,beat_bank=bank.clone(),bank.clone()
-    shifts=[]
-    for i,ref in enumerate(references):
-        pair=[]
-        for destination in (style_bank,beat_bank):
-            notes,shift=transpose_reference(ref['notes'],rng,config.REFERENCE_PITCH_SEMITONES) if record.get('_augment') else (ref['notes'],0)
+    shifts=[[0,0] for _ in references]
+    joined=[n for ref in references for n in ref['notes']]
+    for kind,destination in enumerate((style_bank,beat_bank)):
+        augmented,shift=transpose_reference(joined,rng,config.REFERENCE_PITCH_SEMITONES) if record.get('_augment') else (joined,0)
+        offset=0
+        for i,ref in enumerate(references):
+            notes=augmented[offset:offset+len(ref['notes'])]
+            offset+=len(notes)
             stream=[tok.tok_to_id[t] for t in notes_to_tokens(notes,tok)]
             destination[i,:len(stream)]=torch.tensor(stream)
-            pair.append(shift)
-        shifts.append(pair)
-    profile=drum_profile(references[0]['notes']) if task=='stem' and references else drum_profile([])
+            shifts[i][kind]=shift
+    profile=torch.stack([drum_profile(references[i]['notes']) if task=='stem' and i<len(references)
+        else drum_profile([]) for i in range(config.REFERENCE_WINDOWS)])
     ids = [tok.tok_to_id[t] for t in prompt + target]
     labels = [config.IGNORE_INDEX] * len(prompt) + [tok.tok_to_id[t] for t in target]
     stem_mask, current = [False] * len(prompt), None
@@ -244,8 +251,8 @@ def prepare_example(record, rng, config=cfg, task=None, strength=None, target_in
     changed_fraction = None
     if task == 'refine':
         from collections import Counter
-        clean = Counter(tokens_to_notes(target, tok))
-        changed = Counter(tokens_to_notes(source, tok))
+        clean = Counter((n.instrument,n.pitch,n.onset,n.duration) for n in tokens_to_notes(target, tok))
+        changed = Counter((n.instrument,n.pitch,n.onset,n.duration) for n in tokens_to_notes(unmasked_source, tok))
         changed_fraction = 1 - sum((clean & changed).values()) / max(1, sum(clean.values()))
     genre = record['genre'] if record['genre'] in config.GENRES else 'unknown'
     exposure=torch.zeros(len(TASKS)*2+1,dtype=torch.long)
@@ -268,7 +275,7 @@ def prepare_example(record, rng, config=cfg, task=None, strength=None, target_in
                 input_mono=task in ('refine', 'harmonize'), history_mono=task == 'refine',
                 refinement_changed_fraction=changed_fraction,
                 stem_source_corrupted=stem_corrupted,history_tokens_dropped=original_history_length-len(left),
-                timing_mask_fraction=source.count('<MASK>')/(2*len(core)) if task == 'harmonize' else None, stem_pitch_error_rate=stem_pitch_probability,
+                timing_mask_fraction=source.count('<MASK>')/(2*max(1,len(corrupted_notes if task=='refine' else core))) if task in ('refine','harmonize') else None, stem_pitch_error_rate=stem_pitch_probability,
                 source_length=len(source), response_length=len(target), start_ms=start, end_ms=end,
                 stem_mask=torch.tensor(stem_mask[1:], dtype=torch.bool),
                 stem_instrument=torch.tensor(ProcessData().INSTRUMENT_CLASSES.index(target_instrument) if target_instrument else -1),
@@ -520,6 +527,7 @@ class MelodyDataset(Dataset):
                         prefer_pitched=self.split=='train' and forced_target is None)
                 except (NoStemWindow,NoReferenceWindow) as error:
                     if isinstance(error,NoReferenceWindow):
+                        if task=='refine':raise
                         fallback='refine'
                     else:
                         weights=self.config.TASK_WEIGHTS[:2]
@@ -527,6 +535,7 @@ class MelodyDataset(Dataset):
                     try:
                         result=prepare_example(record,rng,self.config,fallback)
                     except NoReferenceWindow:
+                        if fallback=='refine':raise
                         fallback='refine'
                         result=prepare_example(record,rng,self.config,fallback)
                     self.routed_counts[task+' -> '+fallback]+=1

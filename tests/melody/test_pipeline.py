@@ -1,4 +1,4 @@
-"""Current V12 pipeline contracts."""
+"""Current V14 pipeline contracts."""
 import random
 import pytest
 import torch
@@ -27,9 +27,9 @@ def tiny_model():
 def prefill(owner, length):
     return ForwardRequest(owner, torch.randint(0, 2700, (1, length)), dict(
         genre=torch.tensor([owner % 4]), multi_hot=torch.rand(1, 41),
-        strength=torch.tensor([.1 + owner*.2]), percussion_mode=torch.tensor([owner%3]),reference_features=torch.rand(1,10,256),
-        reference_mask=torch.ones(1,10,dtype=torch.bool),reference_positions=torch.rand(1,10,3),
-        drum_profile=torch.zeros(1,400),use_cache=True))
+        strength=torch.tensor([.1 + owner*.2]), percussion_mode=torch.tensor([owner%3]),reference_features=torch.rand(1,2,10,256),
+        reference_mask=torch.ones(1,2,10,dtype=torch.bool),reference_positions=torch.rand(1,2,10,3),
+        drum_profile=torch.zeros(1,2,400),use_cache=True))
 
 
 @torch.no_grad()
@@ -66,9 +66,9 @@ def test_batched_variable_prompts_and_caches_match_independent_forwards():
 
 
 def fake_reference(*,stage_instruments=None,**kwargs):
-    return dict(stage_conditions={stage:dict(reference_features=torch.ones(10,256),
-        reference_mask=torch.ones(10,dtype=torch.bool),reference_positions=torch.zeros(10,3),
-        drum_profile=torch.zeros(400),drum_palette=[42],output_instruments=instruments)
+    return dict(stage_conditions={stage:dict(reference_features=torch.ones(2,10,256),
+        reference_mask=torch.ones(2,10,dtype=torch.bool),reference_positions=torch.zeros(2,10,3),
+        drum_profile=torch.zeros(2,400),drum_palette=[42],output_instruments=instruments)
         for stage,instruments in (stage_instruments or {}).items()})
 
 
@@ -80,7 +80,7 @@ def fixture_infer():
     infer.processor = ProcessData()
     infer.options = settings()
     infer.encoders = SimpleNamespace(from_notes=lambda *a,**kw:fake_reference(**kw))
-    infer.meta = dict(version=16, tasks=list(TASKS), seq_len=1024, genres=['jazz'], chunk_tokens=26,
+    infer.meta = dict(version=18, tasks=list(TASKS), seq_len=1024, genres=['jazz'], chunk_tokens=26,
                       history_tokens=64,
                       skyline_tolerance_ms=50,harmonize_min_mask_ratio=.9, style_dim=256)
     return infer
@@ -92,7 +92,7 @@ def fixture_generate(self, prompt, genre, strength, instruments, window_ms, **kw
     ids = torch.tensor([[self.tokenizer.tok_to_id[t] for t in prompt]])
     _, cache = self.model(ids, genre=torch.tensor([0]), multi_hot=torch.zeros(1, 41),
                           strength=torch.tensor([strength]), use_cache=True)
-    self.model(ids[:, -1:], past_key_values=cache, seq_offset=len(prompt)+34, use_cache=True)
+    self.model(ids[:, -1:], past_key_values=cache, seq_offset=len(prompt)+66, use_cache=True)
     first = prompt.index('<SEP>')+1
     end = prompt.index('<SEP>', first)
     source, attribute, note_index = [], 0, 0
@@ -177,7 +177,7 @@ def test_canonical_cli_batches_three_tasks_and_harmonizes_requested_pitched_mix(
     from improvnet.inference import melody_inference as module
     from improvnet.utils.melody import write_midi_notes
     infer = fixture_infer()
-    infer.meta.update(version=16, tasks=list(TASKS))
+    infer.meta.update(version=18, tasks=list(TASKS))
     infer.checkpoint_step = 1
     calls = []
     def generate(self, prompt, genre, strength, instruments, *args, **kwargs):
@@ -220,7 +220,7 @@ def test_cli_rejects_retired_orchestration_before_reading_music(tmp_path, monkey
     import sys
     from improvnet.inference import melody_inference as module
     infer = fixture_infer()
-    infer.meta.update(version=16, tasks=list(TASKS))
+    infer.meta.update(version=18, tasks=list(TASKS))
     monkeypatch.setattr(module, 'MelodyInference', lambda _: infer)
     monkeypatch.setattr('improvnet.inference.melody_cli.choose_reference',lambda *a,**kw:fake_reference(**kw))
     monkeypatch.setattr(sys, 'argv', ['inference', '--model', 'fixture', '--input', 'missing.mid',
@@ -365,7 +365,7 @@ def test_cached_logits_with_reused_rotary_factors_match_full_forward():
     _,cache=model(req.ids[:,:4],**req.kwargs)
     outputs=[]
     for pos in range(4,11):
-        logits,cache=model(req.ids[:,pos:pos+1],use_cache=True,past_key_values=cache,seq_offset=pos+34)
+        logits,cache=model(req.ids[:,pos:pos+1],use_cache=True,past_key_values=cache,seq_offset=pos+66)
         outputs.append(logits)
     torch.testing.assert_close(torch.cat(outputs,dim=1),golden[:,4:],rtol=2e-5,atol=2e-6)
 
@@ -404,3 +404,95 @@ def test_fused_inference_context_preserves_cached_logits_and_restores_backends()
         for baseline,candidate in zip(expected_step,actual_step):
             torch.testing.assert_close(baseline,candidate,rtol=.025,atol=.01)
     assert [getattr(torch.backends.cuda,name+'_sdp_enabled')() for name in names]==before
+
+
+@pytest.mark.parametrize('options',[
+    ['--style-reference','reference.mid','--reference-description','slow'],
+    ['--reference-id','retired-id'],['--reference-bucket','retired-bucket'],
+    ['--reference-description','slow fast']])
+def test_cli_rejects_conflicting_or_retired_reference_selection_before_loading(monkeypatch,options):
+    import sys
+    from improvnet.inference.melody_cli import run_cli
+    def load(_):raise AssertionError('Invalid reference options must fail before loading the model')
+    monkeypatch.setattr(sys,'argv',['inference','--model','fixture','--input','input.mid','--output','output.mid',*options])
+    with pytest.raises(SystemExit):run_cli(load)
+
+
+@pytest.mark.parametrize('selection',['description','midi'])
+def test_cli_wires_each_reference_selection_to_the_pipeline(tmp_path,monkeypatch,selection):
+    import json,sys
+    from improvnet.inference.melody_cli import run_cli
+    from improvnet.utils.melody import write_midi_notes
+    infer=fixture_infer();infer.checkpoint_step=1
+    source=tmp_path/'source.mid';reference=tmp_path/'reference.mid'
+    piano=[Note('Acoustic Piano',60,80,i*200,100) for i in range(20)]
+    write_midi_notes(piano,source,infer.tokenizer)
+    write_midi_notes(piano+[Note('Acoustic Bass',48,80,0,100),Note('drum',42,80,0,20)],reference,infer.tokenizer)
+    seen=[]
+    def catalogue(*args,**kwargs):
+        assert selection=='description'
+        seen.append(kwargs['description'])
+        return fake_reference(**kwargs)
+    def supplied(notes,*args,**kwargs):
+        assert selection=='midi'
+        seen.append({n.instrument for n in notes})
+        return fake_reference(**kwargs)
+    monkeypatch.setattr('improvnet.inference.melody_cli.choose_reference',catalogue)
+    infer.encoders.from_notes=supplied
+    def runner(infer,notes,tasks,args,requested,original_instruments,reference,directory,targets):
+        assert reference['stage_conditions']['harmonize']['output_instruments']==['Acoustic Piano']
+        return notes,[],['harmonize'],{}
+    option=['--reference-description','sparse slow'] if selection=='description' else ['--style-reference',str(reference)]
+    monkeypatch.setattr(sys,'argv',['inference','--model','fixture','--input',str(source),'--output',str(tmp_path/'output.mid'),
+        '--task','harmonize','--instruments','Acoustic Piano',*option])
+    run_cli(lambda _:infer,pipeline_runner=runner)
+    report=json.loads((tmp_path/'output'/'report.json').read_text())
+    if selection=='description':
+        assert seen==['slow sparse'] and report['reference_description']=='slow sparse'
+    else:
+        assert seen==[{'Acoustic Piano','Acoustic Bass','drum'}] and report['reference_description'] is None
+
+
+@pytest.mark.parametrize('extra_instruments',[False,True])
+def test_supplied_reference_must_be_an_exact_trio(tmp_path,monkeypatch,extra_instruments):
+    import sys
+    from improvnet.inference.melody_cli import run_cli
+    from improvnet.utils.melody import write_midi_notes
+    infer=fixture_infer();source=tmp_path/'solo.mid'
+    notes=[Note('Acoustic Piano',60,80,0,100)]
+    if extra_instruments:
+        notes += [Note('Acoustic Bass',48,80,0,100),Note('drum',42,80,0,20),Note('Tenor Sax',66,80,0,100)]
+    write_midi_notes(notes,source,infer.tokenizer)
+    monkeypatch.setattr(sys,'argv',['inference','--model','fixture','--input',str(source),'--output',str(tmp_path/'output.mid'),
+        '--style-reference',str(source)])
+    with pytest.raises(SystemExit):run_cli(lambda _:infer)
+    assert not (tmp_path/'output').exists()
+
+
+def test_refine_only_cli_masks_rhythm_and_passes_the_reference_pair_to_generation(tmp_path,monkeypatch):
+    import sys,json
+    from improvnet.inference.melody_cli import run_cli
+    from improvnet.utils.melody import write_midi_notes
+    infer=fixture_infer();infer.checkpoint_step=1
+    source=tmp_path/'source.mid'
+    write_midi_notes([Note('Acoustic Piano',60+i%5,60,i*200,100) for i in range(24)],source,infer.tokenizer)
+    def reference(*args,**kwargs):
+        assert kwargs['stage_instruments']=={'refine':['Acoustic Piano']}
+        return fake_reference(**kwargs)
+    monkeypatch.setattr('improvnet.inference.melody_cli.choose_reference',reference)
+    calls=[]
+    def generate(self,prompt,*args,**kwargs):
+        assert kwargs['reference_features'].shape==(2,10,256)
+        assert kwargs['reference_mask'].all() and kwargs['monophonic']
+        start=prompt.index('<SEP>')+1;end=prompt.index('<SEP>',start)
+        src=prompt[start:end];notes=[t for t in src if isinstance(t,tuple) and t[0]=='note']
+        assert src.count('<MASK>')==2*len(notes) and all(t[2]==90 for t in notes)
+        calls.append(1)
+        return fixture_generate(self,prompt,*args,**kwargs)
+    monkeypatch.setattr(MelodyInference,'generate',generate)
+    monkeypatch.setattr(sys,'argv',['inference','--model','fixture','--input',str(source),'--output',str(tmp_path/'out.mid'),
+        '--task','refine','--melody-strength','.4','--rhythm-strength','1','--reference-description','slow'])
+    run_cli(lambda _:infer)
+    report=json.loads((tmp_path/'out'/'report.json').read_text())
+    assert calls and report['task_order']==['refine']
+    assert all(log['timing_mask_fraction']==1. for log in report['chunks'])

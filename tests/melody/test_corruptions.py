@@ -14,8 +14,8 @@ from collections import Counter
 
 def test_current_run_has_three_tasks_fresh_path_and_original_ar_initialization():
     assert TASKS == ('refine', 'harmonize', 'stem')
-    assert cfg.TASK_WEIGHTS == (.20, .40, .40) and cfg.PROTOCOL_VERSION == 16
-    assert cfg.SAVE_DIR.endswith('/melody_refinement_v12')
+    assert cfg.TASK_WEIGHTS == (.20, .40, .40) and cfg.PROTOCOL_VERSION == 18
+    assert cfg.SAVE_DIR.endswith('/melody_refinement_v14')
     assert cfg.DATA_FILE.name == 'melody_manifest_v7.json'
     assert '/ar_context_split_instrument/' in cfg.INIT_CHECKPOINT
     assert cfg.BATCH_SIZE == 24 and cfg.CHUNK_TOKENS == 512
@@ -203,7 +203,7 @@ def test_model_can_repair_seven_semitones_but_not_change_skyline_or_exceed_cap()
     script=[]
     for note in anchors:script+=attrs(79 if note.pitch==72 else 67,note.onset,200)
     infer,_=scripted_inference(script+['<E>'])
-    infer.meta.update(version=16,stem_pitch_shift_semitones=7,stem_pitch_shift_prob=.05)
+    infer.meta.update(version=18,stem_pitch_shift_semitones=7,stem_pitch_shift_prob=.05)
     result=infer.generate(make_prompt('stem',['<S>','<E>'],target_instrument='drum'),
         'jazz',1.,['Acoustic Piano','drum'],2200,temperature=0.,fixed_notes=anchors,
         stem_add=True,target_instrument='drum',stop_at_window_end=True,max_new_tokens=256)
@@ -215,7 +215,7 @@ def test_model_can_repair_seven_semitones_but_not_change_skyline_or_exceed_cap()
 
 def test_inference_harmonize_enforces_mask_floor_and_reports_actual_fraction(monkeypatch):
     infer,_=scripted_inference([])
-    infer.meta.update(version=16,tasks=list(TASKS),seq_len=512,chunk_tokens=18,history_tokens=64,
+    infer.meta.update(version=18,tasks=list(TASKS),seq_len=512,chunk_tokens=18,history_tokens=64,
                       skyline_tolerance_ms=50)
     infer.options=cfg
     notes=[Note('Acoustic Piano',72,90,t,80) for t in (0,200)]
@@ -336,7 +336,9 @@ def test_training_condition_reflects_mandatory_merge_and_target_stays_clean():
     assert example['requested_strength']==0. and example['strength'].item()==.75
     clean=[replace(n,onset=n.onset-notes[0].onset) for n in notes]
     assert response(example)==clean
-    assert tokens_to_notes(prompt_source(example))==[replace(clean[0],duration=240)]
+    source=prompt_source(example)
+    assert [t for t in source if isinstance(t,tuple) and t[0]=='note']==[('note',clean[0].pitch,90)]
+    assert source.count('<MASK>')==2  # The merged note's timing is deliberately hidden.
     assert example['source_length']<=512 and example['response_length']+1<=512
     assert len(example['input'])+3<=8192
 
@@ -344,7 +346,7 @@ def test_training_condition_reflects_mandatory_merge_and_target_stays_clean():
 @pytest.mark.parametrize('requested', [.1, .9])
 def test_positive_inference_strength_still_accounts_for_mandatory_merges(monkeypatch, requested):
     infer,_=scripted_inference([])
-    infer.meta.update(version=16,tasks=list(TASKS),seq_len=512,chunk_tokens=64,history_tokens=64,
+    infer.meta.update(version=18,tasks=list(TASKS),seq_len=512,chunk_tokens=64,history_tokens=64,
                       skyline_tolerance_ms=50)
     infer.options=cfg
     notes=trill();seen=[]
@@ -360,7 +362,7 @@ def test_positive_inference_strength_still_accounts_for_mandatory_merges(monkeyp
 
 def test_zero_inference_strength_preserves_ornaments_without_corruption_or_generation(monkeypatch):
     infer,calls=scripted_inference([])
-    infer.meta.update(version=16,tasks=list(TASKS),seq_len=512,chunk_tokens=64,history_tokens=64,
+    infer.meta.update(version=18,tasks=list(TASKS),seq_len=512,chunk_tokens=64,history_tokens=64,
                       skyline_tolerance_ms=50)
     infer.options=cfg
     def fail(*args,**kwargs):

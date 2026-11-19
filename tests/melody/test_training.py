@@ -95,8 +95,8 @@ def test_validation_separates_missing_stem_from_copied_notes():
             return torch.tensor([[[4.,0.,0.],[0.,4.,0.],[4.,0.,0.],[4.,0.,0.]]]).expand(2,-1,-1)
     batch = dict(input=torch.zeros(2,4,dtype=torch.long),target=torch.tensor([[0,1,2,-100]]*2),
         percussion_mode=torch.ones(2,dtype=torch.long),task=torch.tensor([2,2]),genre=torch.tensor([1,1]),multi_hot=torch.zeros(2,41),strength=torch.ones(2),
-        reference_features=torch.zeros(2,1,256),reference_mask=torch.zeros(2,1,dtype=torch.bool),
-        reference_positions=torch.zeros(2,1,3),drum_profile=torch.zeros(2,400),
+        reference_features=torch.zeros(2,2,1,256),reference_mask=torch.zeros(2,2,1,dtype=torch.bool),
+        reference_positions=torch.zeros(2,2,1,3),drum_profile=torch.zeros(2,2,400),
         stem_mask=torch.tensor([[False,False,True,False],[False]*4]),
         stem_instrument=torch.tensor([ProcessData().INSTRUMENT_CLASSES.index('drum'),-1]))
     from types import SimpleNamespace
@@ -217,13 +217,13 @@ def test_tiny_training_resume_and_checkpoint_protocol(tmp_path):
     config.MODEL_KWARGS=dict(embed_dim=32,n_heads=4,n_kv_heads=2,n_layers=1,num_genres=4,num_instruments=41,dropout=0.)
     train(config,n_steps=1)
     checkpoint=torch.load(Path(config.SAVE_DIR)/'latest_checkpoint.pt',weights_only=False)
-    assert checkpoint['step']==1 and validate_checkpoint(checkpoint)['reference_architecture']=='self_attention_prefix_memory_v1'
+    assert checkpoint['step']==1 and validate_checkpoint(checkpoint)['reference_architecture']=='paired_self_attention_prefix_memory_v2'
     train(config,n_steps=2)
     checkpoint=torch.load(Path(config.SAVE_DIR)/'latest_checkpoint.pt',weights_only=False)
     assert checkpoint['step']==2 and checkpoint['refinement']['tasks']==['refine','harmonize','stem']
-    assert checkpoint['refinement']['data_policy_revision']==17
-    assert checkpoint['refinement']['version']==16
-    assert checkpoint['refinement']['reference_architecture']=='self_attention_prefix_memory_v1'
+    assert checkpoint['refinement']['data_policy_revision']==19
+    assert checkpoint['refinement']['version']==18
+    assert checkpoint['refinement']['reference_architecture']=='paired_self_attention_prefix_memory_v2'
     assert checkpoint['scheduler_state_dict']['last_epoch']==2
     assert all(state['step']==2 for state in checkpoint['optimizer_state_dict']['state'].values())
     progress=(Path(config.SAVE_DIR)/'training.log').read_text()
@@ -475,10 +475,10 @@ def test_new_protocol_rejects_old_resume_and_changed_training_controls(tmp_path)
  for key,value in [('jazz_blues_repeats',3),('task_weights',[.3,.4,.3]),('data_policy_revision',4)]:
   with pytest.raises(ValueError,match='Resume settings differ'):
    validate_checkpoint(dict(refinement=dict(meta,**{key:value})),meta)
- with pytest.raises(ValueError,match='protocol 16'):
+ with pytest.raises(ValueError,match='protocol 18'):
   validate_checkpoint(dict(refinement=dict(meta,version=7)))
  for key,value in [('drum_profile_schema','unknown'),('reference_architecture','old_projection')]:
-  with pytest.raises(ValueError,match='protocol 16'):
+  with pytest.raises(ValueError,match='protocol 18'):
    validate_checkpoint(dict(refinement=dict(meta,**{key:value})))
 
 

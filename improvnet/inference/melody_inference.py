@@ -10,7 +10,7 @@ from tqdm import tqdm
 from improvnet.model.melody_model import MelodyRefinementModel, validate_checkpoint
 from improvnet.utils.ar_utils import ProcessData
 from improvnet.utils.melody import (MelodyTokenizer, TASKS, make_prompt, mask_timing,
-    PREFIX_TOKENS, combine_notes, melody_voice, notes_to_tokens, ordered, skyline, window, harmonize_strength)
+    PREFIX_TOKENS, normalize_refinement_velocity, combine_notes, melody_voice, notes_to_tokens, ordered, skyline, window, harmonize_strength, tokens_to_notes)
 from improvnet.utils.melody_chunks import (chunk_bounds, chunk_end, group_end,
                                           history_tokens, trim_history, stem_bounds, shorten_chunk)
 from improvnet.utils.melody_corruptions import refinement_source, refinement_strength
@@ -57,7 +57,7 @@ class MelodyInference:
         return generate_notes(self, *args, **kwargs)
 
     def transform(self, notes, task, genre, strength, rng, temperature=1.,
-                  instruments=None, style_reference=None, monophonic=None, target_instrument=None, *, source_stream=None, on_chunk=None,percussion_palette='kit'):
+                  instruments=None, style_reference=None, monophonic=None, target_instrument=None, *, timing_strength=None, source_stream=None, on_chunk=None,percussion_palette='kit'):
         stage_label = ('Drums' if target_instrument == 'drum' else
                        'Bass' if target_instrument == 'Acoustic Bass' else
                        f'Stem {target_instrument}' if task == 'stem' else task.capitalize())
@@ -68,6 +68,8 @@ class MelodyInference:
         # Inference strength zero means an exact skyline pass-through, rather
         # than training's "ornament merges but no additional corruption" case.
         bypass_refinement = task == 'refine' and strength == 0
+        refinement_timing = (harmonize_strength(rng,.95 if timing_strength is None else timing_strength,
+            self.meta.get('refine_min_mask_ratio',.9)) if task=='refine' and not bypass_refinement else None)
         tok = self.tokenizer
         def prepare_source(raw):
             pitched = [n for n in raw if n.instrument != 'drum']
@@ -161,7 +163,8 @@ class MelodyInference:
                     if bypass_refinement:
                         source = notes_to_tokens(core, tok)
                     elif task == 'refine':
-                        source = refinement_source(core, strength, rng, tok, self.options)
+                        unmasked_source = normalize_refinement_velocity(refinement_source(core, strength, rng, tok, self.options))
+                        source = mask_timing(tokens_to_notes(unmasked_source,tok),refinement_timing,rng,tok,round_up=True)
                     elif task == 'harmonize':
                         source = mask_timing(core, strength, rng, tok, round_up=True)
                     else:
@@ -198,7 +201,7 @@ class MelodyInference:
                 else:
                     generated = self.generate(prompt, genre, chunk_strength, output_instruments, end - start,
                         temperature=temperature, monophonic=task == 'refine', max_new_tokens=None,
-                        **condition,drum_palette=palette, stop_at_window_end=task in ('harmonize', 'stem'),
+                        **condition,drum_palette=palette, stop_at_window_end=True,
                         fixed_notes=ordered(core) if task in ('stem',) else None,
                         stem_add=task=='stem', target_instrument=target_instrument,
                         protected_pitches=protected_pitches,
@@ -225,7 +228,7 @@ class MelodyInference:
                     history_tokens_dropped=self.last_decode_stats.get('history_tokens_dropped',0),
                     total_token_budget=len(prompt) + budget + 2,
                     consumed_input_notes=consumed - begin, strength=chunk_strength, requested_strength=strength, early_end=consumed < stop,
-                    timing_mask_fraction=source.count('<MASK>')/(2*len(core)) if task == 'harmonize' else None,
+                    timing_mask_fraction=source.count('<MASK>')/(2*max(1,sum(isinstance(t,tuple) and t[0]=='note' for t in source))) if task in ('refine','harmonize') and not bypass_refinement else None,
                     target_instrument=target_instrument, added_stem_notes=sum(n.instrument == target_instrument for n in generated) if task in ('stem',) else None,
                     percussion_mode=percussion_palette if target_instrument=='drum' else percussion_mode(core),
                     reference_conditioned=condition['reference_features'] is not None, decoding=dict(self.last_decode_stats)))

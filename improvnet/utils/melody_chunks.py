@@ -97,7 +97,9 @@ def trim_history(tokens, max_tokens, tokenizer):
 
 
 def validate_lengths(config):
-    if config.REFERENCE_WINDOWS!=1:raise ValueError('V12 training uses exactly one reference window')
+    if not .9<=config.REFINE_MIN_MASK_RATIO<=1:
+        raise ValueError('Refinement timing masking must be between 90% and 100%')
+    if config.REFERENCE_WINDOWS!=2:raise ValueError('V14 training uses exactly two consecutive reference windows')
     if not 0<=config.REFERENCE_PITCH_SEMITONES<=7 or int(config.REFERENCE_PITCH_SEMITONES)!=config.REFERENCE_PITCH_SEMITONES:
         raise ValueError('Reference pitch augmentation must use integer semitones up to seven')
     if not 0<=config.JAZZ_RAMP_START_STEP<config.JAZZ_RAMP_END_STEP or config.JAZZ_BLUES_REPEATS<1:
@@ -106,14 +108,14 @@ def validate_lengths(config):
         if getattr(config,name)<1 or int(getattr(config,name))!=getattr(config,name):
             raise ValueError(f'{name} must be a positive integer')
     if not PREFIX_TOKENS+16 <= config.SEQ_LEN <= 8192:
-        raise ValueError('SEQ_LEN must fit the 34-position prefix and music within 8192 positions')
+        raise ValueError('SEQ_LEN must fit the 66-position prefix and music within 8192 positions')
     if not 6 <= config.CHUNK_TOKENS < config.SEQ_LEN - 6:
         raise ValueError('CHUNK_TOKENS must leave room for response and separators')
     if not 0 <= config.HISTORY_TOKENS < config.SEQ_LEN or not 0 <= config.HISTORY_PROB <= 1:
         raise ValueError('Invalid history token cap or probability')
     for name in ('POLY_HISTORY_PROB', 'HISTORY_CORRUPTION_PROB', 'REFERENCE_PROB',
                  'STEM_DRUM_PROB', 'STEM_SOURCE_CORRUPTION_PROB', 'AR_MIXTURE_PROB', 'STEM_PITCH_SHIFT_PROB', 'GENERIC_MERGE_PROB',
-                 'STEM_PITCH_SHIFT_MIN_PROB', 'STEM_PITCH_CLEAN_PROB', 'HARMONIZE_FULL_MASK_PROB',
+                 'STEM_PITCH_SHIFT_MIN_PROB', 'STEM_PITCH_CLEAN_PROB', 'REFINE_FULL_MASK_PROB', 'HARMONIZE_FULL_MASK_PROB',
                  'KIT_DRUM_EXAMPLE_PROB','REFERENCE_EXACT_PROB'):
         if not 0 <= getattr(config, name) <= 1:
             raise ValueError(f'{name} must be in [0,1]')

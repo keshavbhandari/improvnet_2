@@ -7,13 +7,26 @@ PIANOS = frozenset(('Acoustic Piano', 'Electric Piano', 'Bright Piano', 'Honky-t
 TRIO_INSTRUMENTS = PIANOS | {'drum', 'Acoustic Bass'}
 
 
-def reference_instruments(target_instruments, mode):
+def trio_instruments(instruments):
+    """Accept a whole piece only when its sole instruments are one piano, drums and double bass."""
+    available=set(instruments)
+    if len(available)!=3 or not {'drum','Acoustic Bass'}<=available or len(available & PIANOS)!=1:
+        return set()
+    return available
+
+
+def reference_instruments(target_instruments, mode, available=None):
     """Exact output instrumentation or its piano/drums/double-bass subset."""
     instruments = set(target_instruments)
     if mode == 'exact':
         return instruments
     if mode == 'trio':
-        return instruments & TRIO_INSTRUMENTS
+        wanted = instruments & TRIO_INSTRUMENTS
+        if available is not None and wanted & PIANOS and not wanted & set(available) & PIANOS:
+            alternatives = sorted(set(available) & PIANOS)
+            if alternatives:
+                wanted = (wanted - PIANOS) | {alternatives[0]}
+        return wanted
     raise ValueError('Reference mode must be exact or trio')
 
 
@@ -88,17 +101,37 @@ def reference_ids(reference, tokenizer):
     return [tokenizer.tok_to_id[t] for t in notes_to_tokens(reference['notes'], tokenizer)]
 
 
-def neighboring_references(notes,target_start,target_end,rng,*,count=1,**kwargs):
-    """Distinct nearby windows, excluding target attacks and held releases."""
-    remaining=list(notes)
-    result=[]
-    for _ in range(count):
-        ref=neighboring_reference(remaining,target_start,target_end,rng,**kwargs)
-        if ref is None:break
-        result.append(ref)
-        left,right=ref['start_ms'],ref['end_ms']
-        remaining=[n for n in remaining if n.onset+n.duration<=left or n.onset>=right]
-    return sorted(result,key=lambda r:r['start_ms'])
+def neighboring_references(notes,target_start,target_end,rng,*,count=2,max_tokens=512,
+                           guard_ms=250,max_distance_ms=30000,instruments=None):
+    """Two consecutive attack windows, both safely before or both after the target.
+
+    Held releases can cross the boundary between the two references, but never
+    the protected target. No onset group is skipped between the selected windows.
+    """
+    if count!=2:raise ValueError('Reference conditioning requires two consecutive windows')
+    required=set(instruments or ())
+    notes=ordered([n for n in notes if not required or n.instrument in required])
+    pools=[[n for n in notes if target_start-max_distance_ms<=n.onset
+            and n.onset+n.duration<=target_start-guard_ms],
+           [n for n in notes if target_end+guard_ms<=n.onset<target_end+max_distance_ms]]
+    rng.shuffle(pools)
+    for pool in pools:
+        starts=[i for i,n in enumerate(pool) if i==0 or n.onset!=pool[i-1].onset]
+        rng.shuffle(starts)
+        for begin in starts:
+            try:
+                middle=chunk_end(pool,begin,max_tokens)
+                if middle==len(pool):continue
+                stop=chunk_end(pool,middle,max_tokens)
+            except ValueError:
+                continue
+            crops=(pool[begin:middle],pool[middle:stop])
+            if required and any({n.instrument for n in crop}!=required for crop in crops):continue
+            return [dict(notes=[replace(n,onset=n.onset-crop[0].onset) for n in crop],
+                         start_ms=crop[0].onset,end_ms=max(n.onset+n.duration for n in crop),
+                         view='solo' if len(required)==1 and 'drum' not in required else 'mixture')
+                    for crop in crops]
+    return []
 
 
 def transpose_reference(notes,rng,semitones=7):

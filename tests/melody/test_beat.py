@@ -134,8 +134,8 @@ def test_dual_references_both_exclude_target_and_held_releases():
             for a,b in ex['reference_bounds']:
                 assert b<=ex['start_ms']-250 or a>=end+250
             assert ex['reference_ids'].size(-1)<=512
-    batch=collate_examples([prepare_example(rec,random.Random(1),settings(),task='refine')])
-    assert not batch['reference_ids'].ne(2).any()
+    batch=collate_examples([prepare_example(rec,random.Random(1),settings(REFERENCE_PROB=1.),task='refine')])
+    assert batch['reference_ids'].ne(2).any()
 
 
 def test_other_performance_of_same_piece_is_not_a_temporal_negative():

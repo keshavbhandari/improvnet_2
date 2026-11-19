@@ -11,10 +11,16 @@ from improvnet.tokenizer.absolute import AbsTokenizer
 from improvnet.tokenizer.midi import MidiDict
 from improvnet.utils.melody_midi import read_midi_dict
 
-PREFIX_TOKENS = 34  # Genre + 32 reference-memory positions + instrument mix.
+PREFIX_TOKENS = 66  # Genre + two independent 32-token reference banks + instrument mix.
+
 TASKS = ("refine", "harmonize", "stem")
 # Task IDs are fixed; unused historical vocabulary entries stay reserved.
 TASK_TOKENS = dict(refine="<REFINE>", harmonize="<HARMONIZE>", stem="<ADD_STEM>")
+
+
+def normalize_refinement_velocity(tokens):
+    """Keep pitches/structure intact and make current refinement inputs uniformly loud."""
+    return [(t[0], t[1], 90) if isinstance(t, tuple) and t[0] == 'note' else t for t in tokens]
 
 
 class MelodyTokenizer(AbsTokenizer):

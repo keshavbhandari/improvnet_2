@@ -195,7 +195,7 @@ class NoteStream:
 def run_pipeline(infer, original, tasks, args, requested, original_instruments,
                  reference, output_directory, stem_targets):
     if infer.meta.get('version')!=PROTOCOL_VERSION:
-        raise ValueError('Inference requires a V12 prefix-memory checkpoint (protocol 16)')
+        raise ValueError('Inference requires a V14 prefix-memory checkpoint (protocol 18)')
     output_directory = Path(output_directory)
     output_directory.mkdir(parents=True, exist_ok=True)
     missing_tasks = set(tasks) - set(infer.meta.get('tasks', ()))
@@ -208,7 +208,8 @@ def run_pipeline(infer, original, tasks, args, requested, original_instruments,
     # its corruptions or multinomial draws. Sequential CLI RNG stays unchanged.
     workers = []
     planned = plan_stages(original,tasks,requested,original_instruments,stem_targets,
-                          task_mode=args.task,target_instrument=args.target_instrument)
+                          task_mode=args.task,target_instrument=args.target_instrument,
+                          skyline_tolerance_ms=infer.meta['skyline_tolerance_ms'])
     stage_names = stage_output_names(tasks,stem_targets)
 
     def worker(index):
@@ -228,7 +229,7 @@ def run_pipeline(infer, original, tasks, args, requested, original_instruments,
             notes, logs = local.transform(first, task, args.genre, strength,
                 random.Random(INFERENCE_SEED+index*1009), args.temperature,
                 instruments=selected, style_reference=(reference or {}).get('stage_conditions',{}).get(stage_names[index]),
-                percussion_palette='kit',
+                percussion_palette='kit',timing_strength=args.rhythm_strength if task=='refine' else None,
                 monophonic=True if task == 'harmonize' and 'refine' in tasks[:index] else None,
                 target_instrument=target, source_stream=stream, on_chunk=publish)
             results[index], chunk_logs[index] = notes, logs
