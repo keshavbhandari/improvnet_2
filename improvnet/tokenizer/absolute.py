@@ -314,7 +314,7 @@ class AbsTokenizer(Tokenizer):
         # If non-drum channel is missing from instrument_msgs, default to piano
         for c in channels_used:
             if channel_to_instrument.get(c) is None and c != 9:
-                channel_to_instrument[c] = "piano"
+                channel_to_instrument[c] = midi_dict.program_to_instrument[0]
 
         if self.include_pedal:
             if len(channel_to_instrument.keys()) > 1:
@@ -324,7 +324,7 @@ class AbsTokenizer(Tokenizer):
                     "does not officially support multiple channels. You must "
                     "manually ensure that channels don't overlap.",
                 )
-            assert set(channel_to_instrument.values()) == {"piano"}, (
+            assert set(channel_to_instrument.values()) == {midi_dict.program_to_instrument[0]}, (
                 "AbsTokenizer config setting include_pedal=True only supports piano"
             )
 

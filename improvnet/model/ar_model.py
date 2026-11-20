@@ -54,24 +54,34 @@ class RotaryEmbedding(nn.Module):
     def __init__(self, head_dim, base=500000.0):
         super().__init__()
         self.head_dim = head_dim
+        self.base = base
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, qk, seq_pos):
-        freqs = torch.einsum("bt,f->btf", seq_pos.float(), self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos().unsqueeze(2).to(dtype=qk.dtype)
-        sin = emb.sin().unsqueeze(2).to(dtype=qk.dtype)
+    def forward(self, qk, seq_pos, rotary_cache=None):
+        # All decoder layers share positions, frequencies and projection dtype.
+        # Reuse factors within this inference forward; never persist across
+        # positions, change checkpoint state, or alter the training graph.
+        key = (self.head_dim, self.base, qk.dtype, qk.device)
+        factors = None if rotary_cache is None else rotary_cache.get(key)
+        if factors is None:
+            freqs = torch.einsum("bt,f->btf", seq_pos.float(), self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            factors = emb.cos().unsqueeze(2).to(dtype=qk.dtype), emb.sin().unsqueeze(2).to(dtype=qk.dtype)
+            if rotary_cache is not None:
+                rotary_cache[key] = factors
+        cos, sin = factors
         return (qk * cos) + (rotate_half(qk) * sin)
 
-def sdpa_attn_func(q, k, v, dropout_p=0.0, causal=True):
+def sdpa_attn_func(q, k, v, dropout_p=0.0, causal=True, native_gqa=False):
     """flash_attn_func-compatible fallback. q:(B,Tq,Hq,D) k,v:(B,Tk,Hkv,D)"""
     B, Tq, Hq, D = q.shape
     Tk, Hkv = k.shape[1], k.shape[2]
 
     q, k, v = (t.transpose(1, 2) for t in (q, k, v))   # -> (B, H, T, D)
 
-    if Hq != Hkv:                                       # torch>=2.5: pass enable_gqa=True instead
+    native_gqa = native_gqa and Hq != Hkv
+    if Hq != Hkv and not native_gqa:
         k = k.repeat_interleave(Hq // Hkv, dim=1)
         v = v.repeat_interleave(Hq // Hkv, dim=1)
 
@@ -85,7 +95,7 @@ def sdpa_attn_func(q, k, v, dropout_p=0.0, causal=True):
             attn_mask = ki <= qi
 
     o = F.scaled_dot_product_attention(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal
+        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, enable_gqa=native_gqa
     )
     return o.transpose(1, 2).contiguous()                # -> (B, Tq, Hq, D)
 
@@ -95,21 +105,21 @@ class CausalGroupedQueryAttention(nn.Module):
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = embed_dim // n_heads
-        
+
         self.q_proj = nn.Linear(embed_dim, n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(embed_dim, n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(embed_dim, n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, embed_dim, bias=False)
-        
+
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
         self.dropout = nn.Dropout(dropout)
         self.rope = RotaryEmbedding(self.head_dim)
         self.attn_fn = flash_attn_func if HAS_FLASH else sdpa_attn_func
 
-    def forward(self, x, seq_pos, use_cache=False, kv_cache=None):
+    def forward(self, x, seq_pos, use_cache=False, kv_cache=None, cache_lengths=None, rotary_cache=None):
         B, T, C = x.shape
-        
+
         q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim)
         k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim)
         v = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim)
@@ -118,8 +128,8 @@ class CausalGroupedQueryAttention(nn.Module):
         k = self.k_norm(k)
 
         # Apply pure 1D RoPE based on the absolute sequence position
-        q = self.rope(q, seq_pos)
-        k = self.rope(k, seq_pos)
+        q = self.rope(q, seq_pos, rotary_cache)
+        k = self.rope(k, seq_pos, rotary_cache)
 
         if use_cache:
             if kv_cache is not None:
@@ -131,14 +141,30 @@ class CausalGroupedQueryAttention(nn.Module):
             new_kv_cache = None
 
         dropout_p = self.dropout.p if self.training else 0.0
-        
+
         # Flash Attention Causal Router Quirk:
-        # If Q length is 1 (Step-by-step inference), we disable causal masking 
+        # If Q length is 1 (Step-by-step inference), we disable causal masking
         # so the single token can attend to the entire historical KV cache.
         is_causal = True if q.size(1) > 1 else False
 
         # attn_out = flash_attn_func(q, k, v, dropout_p=dropout_p, causal=is_causal)
-        attn_out = self.attn_fn(q, k, v, dropout_p=dropout_p, causal=True)
+        attn_options = ({'native_gqa': use_cache and not self.training and not torch.is_grad_enabled()}
+                        if self.attn_fn is sdpa_attn_func else {})
+        if cache_lengths is None:
+            attn_out = self.attn_fn(q, k, v, dropout_p=dropout_p, causal=True, **attn_options)
+        else:
+            # Continuous batching left-pads independent caches. Only real keys
+            # may participate; RoPE positions remain local to each request.
+            if T != 1 or kv_cache is None:
+                raise ValueError('Variable cache lengths require one cached token per row')
+            valid = torch.arange(k.size(1), device=x.device)[None, :] >= (k.size(1)-1-cache_lengths[:, None])
+            kt, vt = k.transpose(1, 2), v.transpose(1, 2)
+            repeats = self.n_heads // self.n_kv_heads
+            if repeats != 1:
+                kt, vt = kt.repeat_interleave(repeats, 1), vt.repeat_interleave(repeats, 1)
+            attn_out = F.scaled_dot_product_attention(
+                q.transpose(1, 2), kt, vt, attn_mask=valid[:, None, None, :],
+                dropout_p=dropout_p).transpose(1, 2).contiguous()
         out = self.o_proj(attn_out.reshape(B, T, C))
         return out, new_kv_cache
 
@@ -151,9 +177,9 @@ class ARTransformerBlock(nn.Module):
         self.attn  = CausalGroupedQueryAttention(embed_dim, n_heads, n_kv_heads, dropout)
         self.ffn = SwiGLU(embed_dim, mult=ffn_mult, dropout=dropout)
 
-    def forward(self, x, seq_pos, use_cache=False, kv_cache=None):
+    def forward(self, x, seq_pos, use_cache=False, kv_cache=None, cache_lengths=None, rotary_cache=None):
         attn_out, new_kv_cache = self.attn(
-            self.norm1(x), seq_pos=seq_pos, use_cache=use_cache, kv_cache=kv_cache
+            self.norm1(x), seq_pos=seq_pos, use_cache=use_cache, kv_cache=kv_cache, cache_lengths=cache_lengths, rotary_cache=rotary_cache
         )
         x = x + attn_out
         x = x + self.ffn(self.norm2(x))
@@ -162,23 +188,26 @@ class ARTransformerBlock(nn.Module):
 
 
 class ARContextModel(nn.Module):
-    def __init__(self):
+    def __init__(self, vocab_size=VOCAB_SIZE, embed_dim=EMBED_DIM,
+                 n_heads=N_HEADS, n_kv_heads=N_KV_HEADS, n_layers=N_LAYERS,
+                 num_genres=NUM_GENRES, num_instruments=NUM_INSTRUMENTS,
+                 dropout=0.1):
         super().__init__()
-        
-        self.token_emb = nn.Embedding(VOCAB_SIZE, EMBED_DIM)
-        
+
+        self.token_emb = nn.Embedding(vocab_size, embed_dim)
+
         # Conditioning Embeddings
-        self.genre_emb = nn.Embedding(NUM_GENRES, EMBED_DIM)
-        self.multihot_proj = nn.Linear(NUM_INSTRUMENTS, EMBED_DIM, bias=False)
-        
+        self.genre_emb = nn.Embedding(num_genres, embed_dim)
+        self.multihot_proj = nn.Linear(num_instruments, embed_dim, bias=False)
+
         self.layers = nn.ModuleList([
             ARTransformerBlock(
-                EMBED_DIM, N_HEADS, N_KV_HEADS, ffn_mult=8/3, dropout=0.1
-            ) for _ in range(N_LAYERS)
+                embed_dim, n_heads, n_kv_heads, ffn_mult=8/3, dropout=dropout
+            ) for _ in range(n_layers)
         ])
-        
-        self.out_norm = RMSNorm(EMBED_DIM)
-        self.lm_head = nn.Linear(EMBED_DIM, VOCAB_SIZE, bias=False)
+
+        self.out_norm = RMSNorm(embed_dim)
+        self.lm_head = nn.Linear(embed_dim, vocab_size, bias=False)
         self._init_weights()
 
     def _init_weights(self):
@@ -194,45 +223,59 @@ class ARContextModel(nn.Module):
                 nn.init.normal_(p, mean=0.0, std=0.02)
 
     def forward(
-        self, target, genre=None, multi_hot=None, 
-        seq_offset=0, use_cache=False, past_key_values=None, return_hidden=False
+        self, target, genre=None, multi_hot=None,
+        seq_offset=0, use_cache=False, past_key_values=None, return_hidden=False,
+        extra_condition=None, cache_lengths=None, prefix_memory=None,
     ):
         B, T = target.shape
         device = target.device
 
-        x = self.token_emb(target) 
-        
+        x = self.token_emb(target)
+
         # We only prepend the condition tokens if this is the very first step of generation/prefill.
         # If past_key_values exists, the model is in step-by-step inference and the conditions are already cached.
         is_first_step = past_key_values is None
-        
+
+        prefix_length = 0
+        scalar_offset = seq_offset if not torch.is_tensor(seq_offset) else 0
         if is_first_step:
             if genre is None: genre = torch.zeros(B, dtype=torch.long, device=device)
-            if multi_hot is None: multi_hot = torch.zeros((B, NUM_INSTRUMENTS), dtype=torch.float32, device=device)
-            
-            # Prepend the 2 stylistic control vectors to the very start of the sequence
+            if multi_hot is None: multi_hot = torch.zeros((B, self.multihot_proj.in_features), dtype=torch.float32, device=device)
+
+            # Insert optional reference tokens between the genre and instrument controls.
             e_genre = self.genre_emb(genre).unsqueeze(1)
+            if extra_condition is not None:
+                e_genre = e_genre + extra_condition.unsqueeze(1)
             e_mh = self.multihot_proj(multi_hot).unsqueeze(1)
-            
-            x = torch.cat([e_genre, e_mh, x], dim=1) 
-            
-            # The 2 condition tokens consume the first 2 RoPE indices
-            seq_pos = torch.arange(seq_offset, seq_offset + x.size(1), device=device).unsqueeze(0).expand(B, -1)
+
+            controls = [e_genre]
+            if prefix_memory is not None:
+                if prefix_memory.ndim != 3 or prefix_memory.shape[0] != B or prefix_memory.shape[-1] != x.shape[-1]:
+                    raise ValueError('Reference prefix must match batch and decoder width')
+                controls.append(prefix_memory)
+            x = torch.cat([*controls, e_mh, x], dim=1)
+            prefix_length = x.size(1) - T
+
+            # Every prefix position consumes its own RoPE index.
+            seq_pos = torch.arange(scalar_offset, scalar_offset + x.size(1), device=device).unsqueeze(0).expand(B, -1)
         else:
             # During inference decoding, just compute the absolute position of the new token
-            seq_pos = torch.arange(seq_offset, seq_offset + T, device=device).unsqueeze(0).expand(B, -1)
-            
+            seq_pos = torch.arange(scalar_offset, scalar_offset + T, device=device).unsqueeze(0).expand(B, -1)
+
+        if torch.is_tensor(seq_offset):
+            seq_pos = seq_offset.to(device=device).reshape(B, 1) + torch.arange(x.size(1), device=device)[None, :]
         h = x
         next_key_values = [] if use_cache else None
-        
+        rotary_cache = {} if use_cache and not self.training and not torch.is_grad_enabled() else None
+
         for i, layer in enumerate(self.layers):
             current_kv = past_key_values[i] if not is_first_step else None
-            
+
             if not use_cache and self.training:
                 layer_out = checkpoint(layer, h, seq_pos, use_cache, current_kv, use_reentrant=False)
             else:
-                layer_out = layer(h, seq_pos=seq_pos, use_cache=use_cache, kv_cache=current_kv)
-            
+                layer_out = layer(h, seq_pos=seq_pos, use_cache=use_cache, kv_cache=current_kv, cache_lengths=cache_lengths, rotary_cache=rotary_cache)
+
             if use_cache:
                 h, new_kv = layer_out
                 next_key_values.append(new_kv)
@@ -240,11 +283,11 @@ class ARContextModel(nn.Module):
                 h = layer_out
 
         h = self.out_norm(h)
-        
-        # If we injected the 2 Condition tokens at the start, drop their corresponding output predictions.
+
+        # Drop control positions so returned predictions align with the music targets.
         # This perfectly aligns the output logits [B, T, V] with the input targets [B, T] for CrossEntropy.
         if is_first_step:
-            h = h[:, 2:, :]
+            h = h[:, prefix_length:, :]
 
         if return_hidden:
             if use_cache:
@@ -253,6 +296,6 @@ class ARContextModel(nn.Module):
 
         logits = self.lm_head(h)
 
-        if use_cache: 
+        if use_cache:
             return logits, next_key_values
         return logits

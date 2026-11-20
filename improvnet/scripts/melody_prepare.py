@@ -1,0 +1,295 @@
+"""Prepare raw MIDI/MusicXML once; sample corruptions later in the DataLoader."""
+import argparse
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import nullcontext
+from dataclasses import astuple, replace
+import hashlib
+import json
+import os
+from itertools import islice
+from pathlib import Path
+import re
+import sqlite3
+
+from improvnet.model import melody_config as cfg
+from improvnet.utils.melody import MelodyTokenizer, Note, ordered, read_midi_notes, skyline, record_instruments
+
+
+def title_key(text):
+    text = re.sub(r'\([^)]*\)|\[[^]]*\]', '', text.lower())
+    text = re.sub(r'[-_]\d+$', '', text)  # Alternate take suffix, e.g. Weimar -2.
+    key = re.sub('[^a-z0-9]', '', text)
+    return key if len(key) >= 7 and not key.isdigit() else ''
+
+
+def discover(root):
+    """Use only known labelled sources; DTL metadata and unlabelled scores are excluded."""
+    root = Path(root)
+    aria = root / 'aria_jazz_blues'
+    if (aria / 'manifest.jsonl').exists():
+        for line in (aria / 'manifest.jsonl').open():
+            row = json.loads(line)
+            yield aria / row['path'], row['genre'].lower(), 'aria', '', False
+    titles = {}
+    db = root / 'weimar/wjazzd.db'
+    if db.exists():
+        with sqlite3.connect(f'file:{db}?mode=ro', uri=True) as con:
+            for performer, title in con.execute('select performer, title from solo_info'):
+                titles[title_key(performer + title)] = title
+    for directory, source, mono in [('weimar/raw', 'weimar', True),
+                                    ('pijama-retranscribed', 'pijama', False),
+                                    ('doug_mcenzie_jazz', 'doug', False)]:
+        for path in sorted((root / directory).rglob('*')):
+            if path.is_file() and path.suffix.lower() in ('.mid', '.midi'):
+                stem = re.sub(r'_FINAL$', '', path.stem)
+                title = titles.get(title_key(stem), stem.split('_', 1)[-1]) if source == 'weimar' else stem
+                yield path, 'jazz', source, title, mono
+    subset = root / 'wikifonia/wikimt_subset'
+    manifest = subset / 'jazz_manifest.jsonl'
+    if manifest.exists():
+        for line in manifest.open():
+            row = json.loads(line)
+            yield subset / row['path'], 'jazz', 'wikifonia', row['title'], True
+    # More scores can be explicitly curated without changing this script.
+    extra = root / 'curated_scores.jsonl'
+    if extra.exists():
+        for line in extra.open():
+            row = json.loads(line)
+            yield root / row['path'], row['genre'].lower(), 'curated', row.get('title', ''), row.get('monophonic', True)
+
+
+def read_score_notes(path, tokenizer):
+    from music21 import converter, note, chord, harmony
+    score = converter.parse(str(path))
+    # Written repeats are performed repeats. A malformed repeat map is a parse
+    # failure recorded in the report, not silently a different harmonization.
+    score = score.expandRepeats()
+    notes = []
+    for event in score.flatten().secondsMap:
+        element = event['element']
+        if isinstance(element, harmony.Harmony) or not isinstance(element, (note.Note, chord.Chord)):
+            continue
+        pitches = element.pitches if isinstance(element, chord.Chord) else [element.pitch]
+        start = max(0, round(event['offsetSeconds'] * 100) * 10)
+        duration = tokenizer._quantize_dur(max(10, round(event['durationSeconds'] * 1000)))
+        velocity = tokenizer._quantize_velocity(element.volume.velocity or 90)
+        notes.extend(Note('Acoustic Piano', int(p.midi), velocity, start, duration) for p in pitches)
+    return ordered(notes)
+
+
+def read_job(job):
+    path = job[0]
+    try:
+        tok = MelodyTokenizer()
+        digest = hashlib.file_digest(path.open('rb'), 'sha256').hexdigest()
+        notes = (read_score_notes(path, tok) if path.suffix.lower() in ('.mxl', '.xml', '.musicxml')
+                 else read_midi_notes(path, tok, include_drums=True))
+        return job, digest, notes, None
+    except Exception as exc:
+        return job, None, None, f'{type(exc).__name__}: {exc}'
+
+
+def make_record(job, notes):
+    """Build the common pitched/melody/drum record for every labelled corpus."""
+    path, genre, source, title, mono = job
+    if genre not in ('jazz', 'blues', 'classical'):
+        raise ValueError(f'Unrecognized genre {genre}')
+    if not any(n.instrument != 'drum' for n in notes):
+        raise ValueError('No pitched notes')
+    offset = min(n.onset for n in notes)
+    notes = [replace(n, onset=n.onset - offset) for n in ordered(notes)]
+    drums = [n for n in notes if n.instrument == 'drum']
+    notes = [n for n in notes if n.instrument != 'drum']
+    melody, harmony = (notes, []) if mono else skyline(notes, cfg.SKYLINE_TOLERANCE_MS)
+    selected = {id(n) for n in melody}
+    record = dict(path=str(path), source=source, genre=genre, title=title,
+                  notes=[astuple(n) for n in notes],
+                  melody_indices=[i for i, n in enumerate(notes) if id(n) in selected],
+                  has_harmony=not mono and bool(harmony),
+                  drums=[astuple(n) for n in drums], has_drums=bool(drums))
+    return record, melody_fingerprint(record)
+
+
+def melody_fingerprint(record):
+    """Identify complete transposed copies without grouping shared short licks."""
+    melody = [record['notes'][i] for i in record['melody_indices']]
+    return hashlib.sha256(json.dumps([
+        (n[1] - melody[0][1], n[3] - melody[0][3], n[4]) for n in melody]).encode()).hexdigest()
+
+
+def recover_labelled_failures(config=cfg):
+    """Revisit excluded labelled assets; retain originals and report every result."""
+    output=Path(config.RECOVERED_DATA_FILE)
+    if output.exists() and output.with_suffix('.index.json').exists():
+        previous_index=json.loads(output.with_suffix('.index.json').read_text())
+        if previous_index.get('version')==2:
+            return json.loads(output.with_suffix('.report.json').read_text())
+    else:
+        previous_index=dict(rows=[])
+    original_report=Path(config.BASE_DATA_FILE).with_suffix('.report.json')
+    if not original_report.exists():
+        return None
+    jobs={str(job[0]):job for job in discover(config.DATA_ROOT)}
+    rows=json.loads(config.PREPARED_DATA_FILE.with_suffix('.index.json').read_text())['rows']
+    known_hashes={r['sha256'] for r in rows}
+    title_pattern=re.compile(rb'"title"\s*:\s*("(?:[^"\\]|\\.)*")')
+    titles={}
+    with config.PREPARED_DATA_FILE.open('rb') as handle:
+        for row in rows:
+            if row['genre'] not in ('jazz','blues'):
+                continue
+            prefix=os.pread(handle.fileno(),1024,row['offset']).split(b'\n',1)[0]
+            match=title_pattern.search(prefix)
+            key=title_key(json.loads(match[1])) if match else ''
+            if key:
+                titles[key]=row
+    output.parent.mkdir(parents=True,exist_ok=True)
+    recovered=list(previous_index['rows'])
+    previous_report=json.loads(output.with_suffix('.report.json').read_text()) if recovered else {}
+    errors=list(previous_report.get('unrecoverable',[]))
+    duplicates=list(previous_report.get('duplicate_paths',[]))
+    checked={r['path'] for r in recovered}|{r['path'] for r in errors}|set(duplicates)
+    known_hashes.update(r['sha256'] for r in recovered)
+    pending=[jobs[r['path']] for r in json.loads(original_report.read_text()).get('errors',[])
+             if r['path'] in jobs and r['path'] not in checked]
+    indexed={}
+    with sqlite3.connect(Path(config.CLASSICAL_INDEX).resolve().as_uri()+'?mode=ro',uri=True) as db:
+        for path,genre,group,split in db.execute("SELECT path,genre,group_id,split FROM files WHERE collection='gigamidi' AND genre IN ('jazz','blues') ORDER BY group_id,path"):
+            if group in {r['group'] for r in indexed.values()} or '/drums-only/' in path:
+                continue
+            indexed[path]=dict(group=group,split=split)
+            if path not in checked:
+                pending.append((Path(path),genre,'gigamidi',Path(path).stem,False))
+    old_manifest=json.loads(Path(config.DATA_FILE).read_text()) if Path(config.DATA_FILE).exists() else {}
+    previous_training_sources={r.get('raw_path') or r.get('path') for r in old_manifest.get('ar_mixtures',[])+old_manifest.get('raw_train',[])}
+    temporary=output.with_suffix('.tmp')
+    with temporary.open('wb') as handle:
+        if recovered:
+            handle.write(output.read_bytes())
+        for number,job in enumerate(pending):
+            job,digest,notes,error=read_job(job)
+            try:
+                if error:
+                    raise ValueError(error)
+                if digest in known_hashes:
+                    duplicates.append(str(job[0]))
+                    continue
+                record,fingerprint=make_record(job,notes)
+                prior=titles.get(title_key(job[3]))
+                instruments=record_instruments(record)
+                indexed_row=indexed.get(str(job[0]))
+                split=prior['split'] if prior else indexed_row['split'] if indexed_row else 'train'
+                if str(job[0]) in previous_training_sources:
+                    split='train'
+                row=dict(offset=handle.tell(),jsonl=str(output),source=job[2],genre=job[1],
+                         split=split,
+                         group=(prior.get('group') or prior.get('source_group')) if prior else indexed_row['group'] if indexed_row else digest,
+                         sha256=digest,instruments=instruments,has_drums=record['has_drums'],
+                         has_multi_instrument=len(instruments)>=2,fingerprint=fingerprint,path=str(job[0]))
+                handle.write((json.dumps(record,separators=(',',':'))+'\n').encode())
+                recovered.append(row)
+                known_hashes.add(digest)
+            except Exception as exc:
+                errors.append(dict(path=str(job[0]),error=f'{type(exc).__name__}: {exc}'))
+            if (number+1)%25==0:
+                print(f'Checked {number+1}/{len(pending)} additional labelled files.',flush=True)
+    temporary.replace(output)
+    output.with_suffix('.index.json').write_text(json.dumps(dict(version=2,rows=recovered)))
+    report=dict(recovered=len(recovered),recovered_paths=[r['path'] for r in recovered],
+                duplicate_paths=duplicates,unrecoverable=errors,indexed_jazz_blues_candidates=len(indexed),
+                policy='Ignore invalid key metadata/SysEx only; do not infer corrupt notes or ambiguous score repeats.')
+    output.with_suffix('.report.json').write_text(json.dumps(report,indent=2))
+    print(f'Recovered {len(recovered)} labelled performances; {len(errors)} remain unusable.',flush=True)
+    return report
+
+
+def prepare(root=cfg.DATA_ROOT, output=cfg.BASE_DATA_FILE, max_files=0, workers=0):
+    root, output = Path(root), Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.exists() or output.with_suffix('.index.json').exists():
+        raise FileExistsError(f'Choose a fresh output path: {output}')
+    tok = MelodyTokenizer()
+    rows, errors, seen_hashes, parents, keys = [], [], set(), [], {}
+    counts, drum_counts = Counter(), Counter()
+    def find(i):
+        while parents[i] != i:
+            parents[i] = parents[parents[i]]
+            i = parents[i]
+        return i
+    def connect(i, key):
+        if not key:
+            return
+        if key in keys:
+            parents[find(i)] = find(keys[key])
+        else:
+            keys[key] = i
+    temporary = output.with_suffix('.jsonl.tmp')
+    if max_files < 0 or workers < 0:
+        raise ValueError('File limit and worker count must be nonnegative')
+    jobs = list(islice(discover(root), max_files)) if max_files else list(discover(root))
+    manager = ProcessPoolExecutor(max_workers=workers) if workers else nullcontext()
+    with temporary.open('wb') as handle, manager as pool:
+        results = pool.map(read_job, jobs, chunksize=8) if pool else map(read_job, jobs)
+        for (path, genre, source, title, mono), digest, notes, error in results:
+            try:
+                if error:
+                    raise ValueError(error)
+                if digest in seen_hashes:
+                    counts['duplicate_files'] += 1
+                    continue
+                record, fingerprint = make_record((path, genre, source, title, mono), notes)
+                has_harmony = record['has_harmony']
+                idx = len(rows)
+                parents.append(idx)
+                connect(idx, 'melody:' + fingerprint)
+                normalized_title = title_key(title)
+                connect(idx, 'title:' + normalized_title if normalized_title else '')
+                instruments = record_instruments(record)
+                rows.append(dict(offset=handle.tell(), source=source, genre=genre,
+                                 instruments=instruments, has_multi_instrument=len(instruments) >= 2,
+                                 has_harmony=has_harmony, has_drums=record['has_drums'], sha256=digest))
+                handle.write((json.dumps(record, separators=(',', ':')) + '\n').encode())
+                seen_hashes.add(digest)
+                counts[source] += 1
+                if record['has_drums']:
+                    drum_counts[source] += 1
+                if len(rows) % 250 == 0:
+                    print(f'Prepared {len(rows)} performances; {len(errors)} failures', flush=True)
+            except Exception as exc:
+                errors.append(dict(path=str(path), error=f'{type(exc).__name__}: {exc}'))
+    group_members = {}
+    for i, row in enumerate(rows):
+        group_members.setdefault(find(i), []).append(row['sha256'])
+    for i, row in enumerate(rows):
+        group = min(group_members[find(i)])
+        number = int(hashlib.sha256(f'{cfg.DATA_SPLIT_SEED}:{group}'.encode()).hexdigest()[:12], 16) / 16**12
+        row['group'] = group
+        row['split'] = ('train' if number < cfg.DATA_SPLIT_RATIOS['train'] else
+                        'validation' if number < cfg.DATA_SPLIT_RATIOS['train'] + cfg.DATA_SPLIT_RATIOS['validation'] else 'test')
+    index = dict(version=4, tokenizer=tok.signature(),
+                 skyline_tolerance_ms=cfg.SKYLINE_TOLERANCE_MS, rows=rows)
+    report = dict(prepared=len(rows), sources=dict(counts),
+                  splits=dict(Counter(r['split'] for r in rows)), errors=errors,
+                  drum_performances=dict(drum_counts),
+                  drum_splits=dict(Counter(r['split'] for r in rows if r['has_drums'])),
+                  excluded='DTL metadata and unlabelled Wikifonia mirror scores',
+                  pretraining_overlap_audited=False)
+    if not rows:
+        temporary.unlink(missing_ok=True)
+        raise ValueError(f'No usable records: {errors[:3]}')
+    temporary.replace(output)
+    output.with_suffix('.index.json').write_text(json.dumps(index))
+    output.with_suffix('.report.json').write_text(json.dumps(report, indent=2))
+    print(json.dumps({k: v for k, v in report.items() if k != 'errors'}, indent=2))
+    return report
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--root', type=Path, default=cfg.DATA_ROOT)
+    parser.add_argument('--output', type=Path, default=cfg.BASE_DATA_FILE)
+    parser.add_argument('--max-files', type=int, default=0, help='Limit for a preparation smoke test')
+    parser.add_argument('--workers', type=int, default=cfg.NUM_WORKERS, help='CPU conversion processes; 0 runs serially')
+    args = parser.parse_args()
+    prepare(args.root, args.output, args.max_files, args.workers)

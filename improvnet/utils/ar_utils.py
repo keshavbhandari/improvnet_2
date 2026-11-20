@@ -372,6 +372,9 @@ def _epoch_indices(loader: DataLoader, epoch: int) -> list[int]:
     return list(range(dataset_len))
 
 def _loader_from_indices(loader: DataLoader, indices: list[int]) -> DataLoader:
+    options={}
+    if loader.num_workers:
+        options["prefetch_factor"]=loader.prefetch_factor
     return DataLoader(
         loader.dataset,
         batch_size=loader.batch_size,
@@ -379,7 +382,9 @@ def _loader_from_indices(loader: DataLoader, indices: list[int]) -> DataLoader:
         num_workers=loader.num_workers,
         pin_memory=loader.pin_memory,
         drop_last=loader.drop_last,
-        collate_fn=loader.collate_fn
+        collate_fn=loader.collate_fn,
+        generator=loader.generator,
+        **options,
     )
 
 def resume_epoch_loader(
@@ -509,6 +514,7 @@ def save_checkpoint(
     is_best=False,
     rng_state=None,
     config=None,
+    metadata=None,
 ):
     os.makedirs(_cfg("SAVE_DIR", config=config), exist_ok=True)
     model_to_save = model.module if isinstance(model, DDP) else model
@@ -533,6 +539,8 @@ def save_checkpoint(
         checkpoint['scaler_state_dict'] = scaler.state_dict()
     if rng_state is not None:
         checkpoint['rng_state'] = rng_state
+    if metadata is not None:
+        checkpoint['refinement'] = metadata
     latest_path = checkpoint_path(config=config)
     latest_tmp_path = f"{latest_path}.tmp.{os.getpid()}"
     torch.save(checkpoint, latest_tmp_path)

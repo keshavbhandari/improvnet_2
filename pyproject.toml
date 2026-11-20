@@ -17,10 +17,15 @@ dependencies = [
     "transformers>=4.57.1",
     "accelerate>=1.10.1",
     "tensorboard",
+    "tqdm",
     "einops",
     "ipdb",
-    "mido>=1.3.3"
+    "mido>=1.3.3",
+    "music21>=9.1"
 ]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -28,3 +33,6 @@ include = ["improvnet", "improvnet.*"]
 
 [tool.setuptools.exclude-package-data]
 "improvnet" = ["artifacts/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/melody"]
