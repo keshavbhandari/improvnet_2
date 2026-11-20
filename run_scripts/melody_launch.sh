@@ -30,12 +30,12 @@ if command -v git >/dev/null 2>&1; then
     git status --short
 fi
 
-if [[ -n "${CHECKPOINT_REQUEST_FILE:-}" && "$CHECKPOINT_REQUEST_FILE" != */melody_refinement_v14/* ]]; then
-    echo "Refusing to turn an older run's automatic continuation into V14. Submit V14 explicitly after review." >&2
+if [[ -n "${CHECKPOINT_REQUEST_FILE:-}" && "$CHECKPOINT_REQUEST_FILE" != */melody_refinement_v15/* ]]; then
+    echo "Refusing to turn an older run's automatic continuation into V15. Submit V15 explicitly after review." >&2
     exit 1
 fi
 
-CHECKPOINT_REQUEST_FILE="/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v14/.checkpoint-request-${SLURM_JOB_ID}"
+CHECKPOINT_REQUEST_FILE="/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v15/.checkpoint-request-${SLURM_JOB_ID}"
 export CHECKPOINT_REQUEST_FILE
 mkdir -p "$(dirname "$CHECKPOINT_REQUEST_FILE")"
 rm -f "$CHECKPOINT_REQUEST_FILE"

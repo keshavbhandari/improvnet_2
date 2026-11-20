@@ -1,4 +1,4 @@
-"""V14 prefix memory, source-safe controls, frozen weights and cached attention."""
+"""V15 prefix memory, source-safe controls, frozen weights and cached attention."""
 from dataclasses import replace
 import random
 from types import SimpleNamespace
@@ -229,7 +229,9 @@ def test_inference_normalizes_only_current_refinement_source(monkeypatch):
     def generate(prompt,*args,**kwargs):
         prompts.append(prompt)
         start=prompt.index('<SEP>')+1
-        source=tokens_to_notes(prompt[start:prompt.index('<SEP>',start)],tok)
+        source_tokens=prompt[start:prompt.index('<SEP>',start)]
+        assert '<T>' not in source_tokens
+        source=tokens_to_notes(source_tokens,tok)
         assert source and all(n.velocity==90 for n in source)
         infer.last_decode_stats={}
         return [replace(n,velocity=80) for n in source]
@@ -257,6 +259,8 @@ def test_refinement_masks_rhythm_and_conditions_on_exact_output_instruments(inst
     note_tokens=[t for t in source if isinstance(t,tuple) and t[0]=='note']
     assert source.count('<MASK>')==2*len(note_tokens) and ex['timing_mask_fraction']==1.
     assert all(t[2]==90 for t in note_tokens)
+    assert '<T>' not in source
+    assert '<T>' in [MelodyTokenizer().id_to_tok[i] for i in ex['target'].tolist() if i>=0]
     assert ex['refinement_changed_fraction']==0.  # Rhythm masks/velocity normalization are separate from melodic edit severity.
     assert ex['reference_mode']=='exact' and len(ex['reference_bounds'])==2
     assert all(n.instrument==instrument for n in response(ex))
@@ -274,3 +278,10 @@ def test_refinement_cannot_reuse_its_target_when_no_safe_reference_exists():
         notes=[('Acoustic Piano',60,80,0,100)])
     with pytest.raises(NoReferenceWindow):
         prepare_example(record,random.Random(0),settings(REFERENCE_PROB=1.),'refine')
+
+
+def test_refinement_time_removal_preserves_masks_and_note_attributes():
+    from improvnet.utils.melody import remove_refinement_time_tokens
+    tokens=['<S>','<T>','<T>',('instrument','Acoustic Piano'),('onset',120),('note',60,90),'<MASK>','<T>','<E>']
+    assert remove_refinement_time_tokens(tokens)==[t for t in tokens if t!='<T>']
+    assert tokens.count('<T>')==3  # Never mutate history/reference/target streams.

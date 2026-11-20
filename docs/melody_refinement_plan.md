@@ -1,9 +1,9 @@
-# V14 melody refinement, harmonization and stem addition
+# V15 melody refinement, harmonization and stem addition
 
-V14 initializes from the original pretrained AR model. The two contrastive
+V15 initializes from the original pretrained AR model. The two contrastive
 encoders stay frozen. There are no beat-marker tokens and no cross-attention
 modules in the decoder. Previous finetuning checkpoints are incompatible;
-checkpoint protocol 18 rejects them explicitly.
+checkpoint protocol 19 rejects them explicitly.
 
 ## Model and context
 
@@ -48,7 +48,9 @@ response needs more space. No partial chord or target tail is silently trimmed.
    Targets and history retain their expressive velocities. After those edits,
    onset and duration are masked together for **90–100% of the corrupted melody's
    attack groups**; 25% of training draws mask every group. The source keeps its
-   pitches, instruments, velocity-90 note tokens and structural timing bins.
+   pitches, instruments and velocity-90 note tokens. Every `<T>` one-second
+   time-advance token is removed from this current source; targets, history and
+   reference windows retain them.
    Both frozen encoders supply a safe consecutive reference pair from the same
    output instrument(s), with exact matching even for non-piano instruments.
    The response reconstructs the clean melody, including rhythm and expression.
@@ -131,9 +133,9 @@ no new dashboard cards are added.
 
 ```
 python -m improvnet.inference.parallel_inference \
-  --model /e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v14/best_model.pt \
+  --model /e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v15/best_model.pt \
   --input improvnet/inference/examples/debussy-clair-de-lune_original.mid \
-  --output improvnet/inference/claire_v14.mid \
+  --output improvnet/inference/claire_v15.mid \
   --task pipeline --genre jazz \
   --melody-strength .4 --rhythm-strength .95 \
   --instruments "Acoustic Piano" drum \
@@ -273,35 +275,34 @@ instrumentation and explicit failure for unavailable genre/activity requests.
 
 The sole finetuning config is `improvnet/model/melody_config.py`; the canonical
 one-node/four-GPU launcher is `run_scripts/melody_launch.sh`, with synchronized
-checkpointing and automatic resubmission near its 12-hour limit. V14 outputs go
-to `melody_refinement_v14`, initialized from `ar_context_split_instrument`.
+checkpointing and automatic resubmission near its 12-hour limit. V15 outputs go
+to `melody_refinement_v15`, initialized from `ar_context_split_instrument`.
 
-V14 uses a fresh run directory; V13 and earlier checkpoints and user-generated
-MIDI outputs are preserved. Pretrained AR and reference-encoder checkpoints are
-reused. Batch size remains 24 per GPU with accumulation 1. No job has been
-submitted for V14; the canonical launcher is prepared for later approval.
+V15 uses a fresh run directory and retains V14. Older melody-finetuning
+checkpoint directories are removed; user-generated MIDI outputs are preserved. Pretrained AR and reference-encoder checkpoints are
+reused. Batch size remains 24 per GPU with accumulation 1. The canonical launcher starts V15 from the original AR weights.
 
 
-## V14 preflight validation
+## V15 change and validation
 
-On 18 November 2026, 310 CPU melody tests passed (one CUDA-only test skipped).
-They cover timing masking, exact instrument reference matching including violin,
-reference exclusion, preserved expressive targets/history, zero-strength bypass,
-standalone refinement, batched stage handoffs, two-rank training/resume, and
-checkpoint protocol 18 rejecting prior training contracts.
+V15 removes every `<T>` one-second time-advance token from the **current
+refinement input only**, after applying the existing V14 melody corruptions,
+velocity-90 normalization and 90–100% onset/duration masking. Targets, prompt
+history, reference windows, harmonization and stem inputs keep their normal
+time tokens. The model must generate the time-advance tokens in its response.
+Zero-strength refinement remains an unchanged pass-through.
 
-A 36-example production-data audit passed across train/validation/test and all
-three tasks. Every example had two safe reference windows with consistent paired
-pitch shifts; refinement/harmonization timing-mask fractions were at least 90%.
-The largest sampled response contained 1990 tokens and its context fit within
-8192 positions (maximum observed context 4610). Empty or oversized corruption
-cases retain the existing complete-target and history-first budgeting behavior.
+Architecture, frozen encoders, double reference windows, batch size and all other
+V14 training settings are unchanged. Protocol 19 records this new input contract
+and prevents a V14 checkpoint from silently using V15 inference preparation.
 
-A small-decoder GPU smoke with the actual frozen style/beat checkpoints passed
-two optimizer updates using real examples from all three tasks. Losses and
-reference-projection gradients were finite, and the encoders remained frozen;
-peak allocated memory was 0.75 GiB. This checks the conditioning path, not the
-full-size training memory requirement. The full-size login-GPU training smoke
-was deferred when spare memory fell below its safety threshold. The original AR decoder architecture and 64-token prefix
-are unchanged. Fresh V14 checkpoints require V14 training; V13 checkpoints are
-rejected by the updated inference script rather than receiving unfamiliar masks.
+A 36-example real-data audit passed across train/validation/test and all tasks.
+It verified that refinement sources contain no `<T>`, both safe instrument-matched
+reference windows remain present, and all contexts fit the 8192-token limit.
+The maximum observed response was 1990 tokens and context was 4610 tokens.
+
+On 19 November 2026, the final suite passed: 311 tests, one CUDA-only skip.
+V15 was submitted as Slurm job **3015487**, one node/four GPUs, using
+`run_scripts/melody_launch.sh` with automatic checkpoint/resubmission enabled.
+Removed only the old V12/V13 melody-finetuning run directories; V14 best/latest
+and all other project checkpoint directories remain intact.

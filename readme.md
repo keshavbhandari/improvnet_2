@@ -1,6 +1,6 @@
 # ImprovNet: classical-to-jazz/blues MIDI transfer
 
-The current branch implements V14 melody refinement, rhythm/harmonization and
+The current branch implements V15 melody refinement, rhythm/harmonization and
 stem addition. It initializes from the pretrained AR model and keeps both
 contrastive reference encoders frozen.
 
@@ -12,7 +12,7 @@ Training uses a consistent pitch shift across each encoder's reference pair.
 
 Refinement inputs keep their pitches but use velocity 90 in training and
 inference; clean targets and history retain expressive velocities. Refinement
-now also masks 90–100% of onset/duration groups and uses two reference windows
+also removes every `<T>` one-second separator from the current input, masks 90–100% of onset/duration groups and uses two reference windows
 matched exactly to the melody's output instruments. Harmonization keeps the same
 severe timing-mask policy. `--rhythm-strength` controls masking in both stages. Jazz/blues sampling stays unboosted
 through 10k updates, then ramps to 4x by 15k; the non-jazz pool remains 2x.
@@ -33,5 +33,4 @@ sequence construction, prompt history, pitch augmentation, safety boundaries,
 commands, sampling and validation. The sole config is
 `improvnet/model/melody_config.py`; the launcher is `run_scripts/melody_launch.sh`.
 
-V14 is prepared for training but has not been submitted. It uses a fresh
-`melody_refinement_v14` checkpoint path and preserves previous runs.
+V15 uses a fresh `melody_refinement_v15` checkpoint path. V14 is retained; older melody-finetuning checkpoints are removed. Other project checkpoints are untouched.

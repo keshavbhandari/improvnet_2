@@ -59,7 +59,7 @@ def test_required_references_never_use_target_when_no_neighbor_exists():
 def test_decoder_rebuilds_cache_without_discarding_response():
     from improvnet.inference.melody_note_decode import generate_notes
     infer,_=scripted_inference([])
-    infer.meta.update(version=18,seq_len=256)
+    infer.meta.update(version=19,seq_len=256)
     infer.progress_disabled=True
     tok=infer.tokenizer
     script=[]

@@ -99,7 +99,7 @@ def trim_history(tokens, max_tokens, tokenizer):
 def validate_lengths(config):
     if not .9<=config.REFINE_MIN_MASK_RATIO<=1:
         raise ValueError('Refinement timing masking must be between 90% and 100%')
-    if config.REFERENCE_WINDOWS!=2:raise ValueError('V14 training uses exactly two consecutive reference windows')
+    if config.REFERENCE_WINDOWS!=2:raise ValueError('V15 training uses exactly two consecutive reference windows')
     if not 0<=config.REFERENCE_PITCH_SEMITONES<=7 or int(config.REFERENCE_PITCH_SEMITONES)!=config.REFERENCE_PITCH_SEMITONES:
         raise ValueError('Reference pitch augmentation must use integer semitones up to seven')
     if not 0<=config.JAZZ_RAMP_START_STEP<config.JAZZ_RAMP_END_STEP or config.JAZZ_BLUES_REPEATS<1:

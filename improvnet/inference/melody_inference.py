@@ -10,7 +10,7 @@ from tqdm import tqdm
 from improvnet.model.melody_model import MelodyRefinementModel, validate_checkpoint
 from improvnet.utils.ar_utils import ProcessData
 from improvnet.utils.melody import (MelodyTokenizer, TASKS, make_prompt, mask_timing,
-    PREFIX_TOKENS, normalize_refinement_velocity, combine_notes, melody_voice, notes_to_tokens, ordered, skyline, window, harmonize_strength, tokens_to_notes)
+    PREFIX_TOKENS, normalize_refinement_velocity, remove_refinement_time_tokens, combine_notes, melody_voice, notes_to_tokens, ordered, skyline, window, harmonize_strength, tokens_to_notes)
 from improvnet.utils.melody_chunks import (chunk_bounds, chunk_end, group_end,
                                           history_tokens, trim_history, stem_bounds, shorten_chunk)
 from improvnet.utils.melody_corruptions import refinement_source, refinement_strength
@@ -164,7 +164,7 @@ class MelodyInference:
                         source = notes_to_tokens(core, tok)
                     elif task == 'refine':
                         unmasked_source = normalize_refinement_velocity(refinement_source(core, strength, rng, tok, self.options))
-                        source = mask_timing(tokens_to_notes(unmasked_source,tok),refinement_timing,rng,tok,round_up=True)
+                        source = remove_refinement_time_tokens(mask_timing(tokens_to_notes(unmasked_source,tok),refinement_timing,rng,tok,round_up=True))
                     elif task == 'harmonize':
                         source = mask_timing(core, strength, rng, tok, round_up=True)
                     else:

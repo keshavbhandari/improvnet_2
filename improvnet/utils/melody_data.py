@@ -15,7 +15,7 @@ from improvnet.model import melody_config as cfg
 from improvnet.scripts.melody_prepare import make_record, read_job
 from improvnet.utils.ar_utils import ProcessData
 from improvnet.utils.melody import (Note, MelodyTokenizer, TASKS, make_prompt, mask_timing,
-    PREFIX_TOKENS, normalize_refinement_velocity, melody_voice, notes_to_tokens, ordered, sample_strength, harmonize_strength, skyline, tokens_to_notes, window)
+    PREFIX_TOKENS, normalize_refinement_velocity, remove_refinement_time_tokens, melody_voice, notes_to_tokens, ordered, sample_strength, harmonize_strength, skyline, tokens_to_notes, window)
 from improvnet.utils.drum_profile import drum_profile
 from improvnet.utils.melody_chunks import (chunk_bounds, chunk_end, chunk_starts,
                                           history_tokens, trim_history, stem_bounds, shorten_chunk, validate_lengths)
@@ -188,7 +188,7 @@ def prepare_example(record, rng, config=cfg, task=None, strength=None, target_in
         if task == 'refine':
             unmasked_source = normalize_refinement_velocity(refinement_source(core, strength, rng, tok, config))
             corrupted_notes = tokens_to_notes(unmasked_source,tok)
-            source = mask_timing(corrupted_notes,timing_fraction,rng,tok,round_up=True)
+            source = remove_refinement_time_tokens(mask_timing(corrupted_notes,timing_fraction,rng,tok,round_up=True))
         elif task == 'harmonize':
             source = mask_timing(core, strength, rng, tok, round_up=True)
         elif task == 'stem':

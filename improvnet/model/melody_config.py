@@ -1,10 +1,10 @@
-"""V14: original AR decoder, paired-window reference prefix and a genre curriculum."""
+"""V15: original AR decoder, paired-window reference prefix and a genre curriculum."""
 from pathlib import Path
 from improvnet.utils.melody import MelodyTokenizer, TASKS
 
 
 # Tasks and sequence format
-PROTOCOL_VERSION = 18  # Projected-prefix reference-memory training/inference format.
+PROTOCOL_VERSION = 19  # Projected-prefix reference-memory training/inference format.
 TASK_NAMES = TASKS  # Canonical refinement, harmonize and stem task names.
 TASK_WEIGHTS = (.20, .40, .40)  # Relative sampling probabilities for refinement, harmonize and stem.
 
@@ -34,8 +34,8 @@ AR_MIXTURE_SCAN_PER_FILE = 200000  # Maximum records inspected in each original 
 AR_MIXTURE_INDEX = DATA_ROOT / 'prepared' / 'ar_mixtures_v3.json'  # Cached index of eligible AR mixtures.
 
 # Output paths and initialization
-SAVE_DIR = '/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v14'  # Fresh V14 output directory; Earlier checkpoints remain available for comparison.
-RUN_NAME = 'melody_refinement_v14'  # Name identifying this finetuning run.
+SAVE_DIR = '/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v15'  # Fresh V15 output directory; V14 remains available for comparison.
+RUN_NAME = 'melody_refinement_v15'  # Name identifying this finetuning run.
 INIT_CHECKPOINT = '/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/ar_context_split_instrument/best_model.pt'  # Pretrained autoregressive weights used for a fresh run.
 RESUME_TRAINING = True  # Resume the latest checkpoint if present; otherwise start fresh.
 GENRES = ['classical', 'jazz', 'blues', 'unknown']  # Genre labels supported by the conditioning vocabulary.

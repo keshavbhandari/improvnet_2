@@ -1,4 +1,4 @@
-"""Current V14 pipeline contracts."""
+"""Current V15 pipeline contracts."""
 import random
 import pytest
 import torch
@@ -80,7 +80,7 @@ def fixture_infer():
     infer.processor = ProcessData()
     infer.options = settings()
     infer.encoders = SimpleNamespace(from_notes=lambda *a,**kw:fake_reference(**kw))
-    infer.meta = dict(version=18, tasks=list(TASKS), seq_len=1024, genres=['jazz'], chunk_tokens=26,
+    infer.meta = dict(version=19, tasks=list(TASKS), seq_len=1024, genres=['jazz'], chunk_tokens=26,
                       history_tokens=64,
                       skyline_tolerance_ms=50,harmonize_min_mask_ratio=.9, style_dim=256)
     return infer
@@ -177,7 +177,7 @@ def test_canonical_cli_batches_three_tasks_and_harmonizes_requested_pitched_mix(
     from improvnet.inference import melody_inference as module
     from improvnet.utils.melody import write_midi_notes
     infer = fixture_infer()
-    infer.meta.update(version=18, tasks=list(TASKS))
+    infer.meta.update(version=19, tasks=list(TASKS))
     infer.checkpoint_step = 1
     calls = []
     def generate(self, prompt, genre, strength, instruments, *args, **kwargs):
@@ -220,7 +220,7 @@ def test_cli_rejects_retired_orchestration_before_reading_music(tmp_path, monkey
     import sys
     from improvnet.inference import melody_inference as module
     infer = fixture_infer()
-    infer.meta.update(version=18, tasks=list(TASKS))
+    infer.meta.update(version=19, tasks=list(TASKS))
     monkeypatch.setattr(module, 'MelodyInference', lambda _: infer)
     monkeypatch.setattr('improvnet.inference.melody_cli.choose_reference',lambda *a,**kw:fake_reference(**kw))
     monkeypatch.setattr(sys, 'argv', ['inference', '--model', 'fixture', '--input', 'missing.mid',

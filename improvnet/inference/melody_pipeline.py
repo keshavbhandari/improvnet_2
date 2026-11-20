@@ -195,7 +195,7 @@ class NoteStream:
 def run_pipeline(infer, original, tasks, args, requested, original_instruments,
                  reference, output_directory, stem_targets):
     if infer.meta.get('version')!=PROTOCOL_VERSION:
-        raise ValueError('Inference requires a V14 prefix-memory checkpoint (protocol 18)')
+        raise ValueError('Inference requires a V15 prefix-memory checkpoint (protocol 19)')
     output_directory = Path(output_directory)
     output_directory.mkdir(parents=True, exist_ok=True)
     missing_tasks = set(tasks) - set(infer.meta.get('tasks', ()))

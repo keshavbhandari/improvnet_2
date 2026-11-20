@@ -221,8 +221,8 @@ def test_tiny_training_resume_and_checkpoint_protocol(tmp_path):
     train(config,n_steps=2)
     checkpoint=torch.load(Path(config.SAVE_DIR)/'latest_checkpoint.pt',weights_only=False)
     assert checkpoint['step']==2 and checkpoint['refinement']['tasks']==['refine','harmonize','stem']
-    assert checkpoint['refinement']['data_policy_revision']==19
-    assert checkpoint['refinement']['version']==18
+    assert checkpoint['refinement']['data_policy_revision']==20
+    assert checkpoint['refinement']['version']==19
     assert checkpoint['refinement']['reference_architecture']=='paired_self_attention_prefix_memory_v2'
     assert checkpoint['scheduler_state_dict']['last_epoch']==2
     assert all(state['step']==2 for state in checkpoint['optimizer_state_dict']['state'].values())
@@ -475,10 +475,10 @@ def test_new_protocol_rejects_old_resume_and_changed_training_controls(tmp_path)
  for key,value in [('jazz_blues_repeats',3),('task_weights',[.3,.4,.3]),('data_policy_revision',4)]:
   with pytest.raises(ValueError,match='Resume settings differ'):
    validate_checkpoint(dict(refinement=dict(meta,**{key:value})),meta)
- with pytest.raises(ValueError,match='protocol 18'):
+ with pytest.raises(ValueError,match='protocol 19'):
   validate_checkpoint(dict(refinement=dict(meta,version=7)))
  for key,value in [('drum_profile_schema','unknown'),('reference_architecture','old_projection')]:
-  with pytest.raises(ValueError,match='protocol 18'):
+  with pytest.raises(ValueError,match='protocol 19'):
    validate_checkpoint(dict(refinement=dict(meta,**{key:value})))
 
 

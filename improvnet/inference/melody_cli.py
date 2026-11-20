@@ -19,7 +19,7 @@ def run_cli(inference_factory, pipeline_runner=None):
     parser.add_argument('--model', required=True)
     parser.add_argument('--input', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True,
-                        help='Run name/path: claire_v14.mid writes all outputs inside claire_v14/, including final.mid')
+                        help='Run name/path: claire_v15.mid writes all outputs inside claire_v15/, including final.mid')
     parser.add_argument('--genre', choices=['jazz', 'blues'], default='jazz')
     parser.add_argument('--task', choices=['pipeline', *TASKS],
                         metavar='{pipeline,refine,harmonize,stem}', default='pipeline')
