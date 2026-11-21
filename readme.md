@@ -1,13 +1,15 @@
 # ImprovNet: classical-to-jazz/blues MIDI transfer
 
-The current branch implements V14 melody refinement, rhythm/harmonization and
+The current branch prepares V15 melody refinement, rhythm/harmonization and
 stem addition. It initializes from the pretrained AR model and keeps both
 contrastive reference encoders frozen.
 
 Two consecutive nearby reference windows supply style and rhythmic features.
-Each produces its own 32-token memory bank, including that window's drum
-statistics. The 64 tokens are projected to decoder width 2048 and placed between
-the genre and instrument-mix tokens. Original AR decoder blocks stay unchanged.
+Each produces 32 reference tokens and eight separate drum-statistics tokens.
+The 80 tokens use separate reference/statistics projections to decoder width
+2048 and sit between the genre and instrument-mix tokens (82 prefix positions
+in total). Statistics are supplied for stem addition; other tasks have zero
+explicit drum slots. Original AR decoder blocks stay unchanged.
 Training uses a consistent pitch shift across each encoder's reference pair.
 
 Refinement inputs keep their pitches but use velocity 90 in training and
@@ -15,7 +17,8 @@ inference; clean targets and history retain expressive velocities. Refinement
 now also masks 90–100% of onset/duration groups and uses two reference windows
 matched exactly to the melody's output instruments. Harmonization keeps the same
 severe timing-mask policy. `--rhythm-strength` controls masking in both stages. Jazz/blues sampling stays unboosted
-through 10k updates, then ramps to 4x by 15k; the non-jazz pool remains 2x.
+through 10k updates, then ramps to 2x by 15k; the non-jazz pool remains 2x,
+giving a final 1:1 base sampling mix.
 Batch size is unchanged. Inference defaults to a random consecutive reference
 pair; `--reference-aggregation average` averages matching positions across pairs.
 
@@ -33,9 +36,11 @@ sequence construction, prompt history, pitch augmentation, safety boundaries,
 commands, sampling and validation. The sole config is
 `improvnet/model/melody_config.py`; the launcher is `run_scripts/melody_launch.sh`.
 
-The working tree has been restored to `97a0e0a` (`v14 best version added`).
-Use the existing `melody_refinement_v14/best_model.pt`; refinement input `<T>`
-tokens are retained. No retraining is needed for the inference changes below.
+V15 retains the V14 refinement policy, including source `<T>` tokens. Its
+separate statistics banks require fresh finetuning from AR; no job has been
+submitted. The discarded old V15 checkpoint directory has been removed.
+The existing `melody_refinement_v14/best_model.pt` remains usable: inference
+loads its original 64-token layout without changing its conditioning.
 
 Reference tempo stays unchanged by default. Add `--reference-tempo source` to
 retime its notes to the source's estimated pulse **before** reference encoding.

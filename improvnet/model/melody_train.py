@@ -223,7 +223,7 @@ def train(config=cfg, n_steps=None):
                f'authentic-kit requests={config.KIT_DRUM_EXAMPLE_PROB:.0%} of drum draws; '
                f'harmonize/stem exact/trio references={config.REFERENCE_EXACT_PROB:.0%}/{1-config.REFERENCE_EXACT_PROB:.0%}; '
                f'neighbor-reference visibility={config.REFERENCE_PROB:.0%}; '
-               f'consecutive reference windows={config.REFERENCE_WINDOWS}, memory tokens/window=32, local bins/window={config.REFERENCE_LOCAL_BINS}; '
+               f'consecutive reference windows={config.REFERENCE_WINDOWS}, memory tokens/window=32 reference + 8 drum statistics, local bins/window={config.REFERENCE_LOCAL_BINS}; '
                f'history refine/mix={config.HISTORY_PROB:.0%}/{config.POLY_HISTORY_PROB:.0%}; history corruption={config.HISTORY_CORRUPTION_PROB:.0%}; '
                f'refinement=ornaments first + balanced 10%-100% independent edits (5% none), current-input velocity=90, '
                f'timing masking>={config.REFINE_MIN_MASK_RATIO:.0%}, fully masked={config.REFINE_FULL_MASK_PROB:.0%}, exact-instrument references; '

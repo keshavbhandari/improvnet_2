@@ -1,35 +1,41 @@
-# V14 melody refinement, harmonization and stem addition
+# V15 melody refinement, harmonization and stem addition
 
-V14 initializes from the original pretrained AR model. The two contrastive
-encoders stay frozen. There are no beat-marker tokens and no cross-attention
-modules in the decoder. Previous finetuning checkpoints are incompatible;
-checkpoint protocol 18 rejects them explicitly.
+V15 initializes from the original pretrained AR model. Both contrastive encoders
+stay frozen, and the original decoder blocks remain unchanged. There are no beat
+markers or cross-attention modules. New training uses protocol 20. Inference also
+loads V14 protocol-18 checkpoints with their original 64-token layout; they cannot
+resume V15 training. The discarded protocol-19 V15 experiment remains rejected.
 
 ## Model and context
 
 The input layout is:
 
 ```
-[Genre] [32 tokens: window 1] [32 tokens: window 2] [Instrument mix] [Task + history + input] -> Response
+[Genre] [W1 reference: 32] [W1 drums: 8] [W2 reference: 32] [W2 drums: 8] [Instrument mix] [Task + history + input] -> Response
 ```
 
-A small learned resampler combines the frozen style/beat features, relative-time
-coordinates and that window's projected drum profile into 32 vectors of width 256.
-The same resampler processes each window independently, producing 64 ordered
-memory tokens in total. Features and statistics cannot mix between the two
-32-token banks before the decoder. A learned bias-free projection maps them to decoder width 2048. The original AR decoder
-blocks consume the entire sequence through causal self-attention; their weights
-and structure are reused unchanged. Reference tokens appear only during prefill
-and remain in the ordinary self-attention K/V cache thereafter. There are no
-separate reference K/V caches, per-layer gates or decoder adapters.
+A learned resampler converts each window's frozen style/beat features and
+relative-time coordinates into 32 vectors of width 256. A separate learned MLP
+maps its 400-value drum profile to eight additional vectors of the same width.
+The reference resampler never reads the explicit drum statistics. Separate
+bias-free projections map the reference and drum banks to decoder width 2048.
+The two windows share these modules but remain separate batch rows until their
+outputs are concatenated chronologically: 40 slots per window, 80 total.
 
-All tasks reserve 66 conditioning positions: genre, 64 memory tokens and mix.
-All three tasks now populate the reference prefix during training. Refinement
-uses exact output-instrument references, normally solo piano. Music logits
-exclude the entire prefix and align with the normal shifted labels. Loss applies
-only to response tokens. Both frozen encoders remain immutable.
+Explicit drum slots are exactly zero when no drum profile is supplied. Profiles
+are supplied for stem addition; refinement/harmonization keep their frozen-encoder
+reference conditioning and zero explicit drum profiles. The reference encoders
+can still represent rhythmic information independently of the explicit profiles.
+Separation gives the decoder dedicated statistics slots; it does not guarantee
+better drum alignment, which needs comparison against V14 after training.
 
-The combined context, including these 66 positions, is at most 8192 tokens.
+All tasks reserve 82 conditioning positions: genre, 80 memory tokens and mix.
+The original AR blocks consume them through causal self-attention. They appear
+only during prefill and remain in the ordinary K/V cache thereafter. There are no
+per-layer adapters or additional reference caches. Logits exclude the prefix and
+loss applies only to response tokens. Both frozen encoders remain immutable.
+
+The combined context, including these 82 positions, is at most 8192 tokens.
 Source chunks contain at most 512 tokens and history at most 2048. Complete target
 responses are retained. History is shortened first; if source plus the complete
 response alone cannot fit, the whole time interval is shortened at an onset-group
@@ -98,8 +104,9 @@ Each encoder returns its global vector and eight relative-time-bin vectors for
 each window. Each window has its own 20-vector feature bank: two global summaries
 plus two sets of nine features. Empty bins are masked. The two banks are encoded
 as separate attention batch rows, then concatenated in chronological order:
-**first 32 slots = window 1; next 32 slots = window 2**. Both are projected from
-256 to 2048 dimensions and inserted as the causal decoder prefix.
+**first 40 slots = window 1 (32 reference + 8 statistics); next 40 = window 2**.
+The two slot types use separate 256-to-2048 projections before insertion into
+the causal decoder prefix.
 
 For stem examples, each drum profile describes its own **reference window**,
 rather than the target or the other reference window. It carries coarse sound
@@ -113,12 +120,13 @@ The existing manifest and held-out splits are reused. The non-jazz/blues candida
 pool stays at 2x. No new corpus preprocessing is required.
 
 - Through optimizer step 10,000: jazz/blues weight 1, without oversampling.
-- Steps 10,000–15,000: increase that weight linearly from 1 to 4.
-- From step 15,000 onward: retain weight 4, matching the previous final balance.
+- Steps 10,000–15,000: increase that weight linearly from 1 to 2.
+- From step 15,000 onward: retain weight 2, reducing jazz/blues oversampling.
 
 These are relative file-draw weights; with non-jazz weight 2, the requested
-jazz/blues proportions are approximately 1/3 initially and 2/3 finally. Eligibility
-routing can change the per-task exposure. Every file stays eligible. Fixed-length
+jazz/blues proportions are approximately 1/3 initially and 1/2 finally (a 1:1
+base mix). Eligibility, task routing and retries can change observed per-task
+exposure. This halves the previous repeat weight of 4. Every file stays eligible. Fixed-length
 sampling epochs count candidate draws rather than promise literal single file
 traversals during the changing curriculum. Validation remains fixed.
 
@@ -128,6 +136,10 @@ accumulation accounted for. Existing retry/exposure text logs remain available;
 no new dashboard cards are added.
 
 ## Inference
+
+The example uses the existing V14 checkpoint. Once V15 has been trained, replace
+its model path with `melody_refinement_v15/best_model.pt`; the same CLI supports
+both layouts using the checkpoint metadata. No V15 checkpoint exists yet.
 
 ```
 python -m improvnet.inference.parallel_inference \
@@ -273,15 +285,40 @@ instrumentation and explicit failure for unavailable genre/activity requests.
 
 The sole finetuning config is `improvnet/model/melody_config.py`; the canonical
 one-node/four-GPU launcher is `run_scripts/melody_launch.sh`, with synchronized
-checkpointing and automatic resubmission near its 12-hour limit. V14 outputs go
-to `melody_refinement_v14`, initialized from `ar_context_split_instrument`.
+checkpointing and automatic resubmission near its 12-hour limit. New V15 outputs
+go to `melody_refinement_v15`, initialized from `ar_context_split_instrument`.
 
 The current V14 checkpoint directory is retained. V12/V13 melody checkpoints
 were removed during V15 preparation; the discarded V15 checkpoint directory was
 subsequently removed while V14 and user-generated MIDI outputs were retained. Pretrained AR and reference-encoder checkpoints are reused. Batch size
-remains 24 per GPU with accumulation 1. The V14 rollback uses its existing
-checkpoint; no training was submitted as part of the rollback.
+remains 24 per GPU with accumulation 1. The new V15 directory starts empty;
+no V15 job has been submitted. V14 remains available for inference.
 
+
+## V15 preflight validation (21 November 2026)
+
+329 CPU melody tests passed; the CUDA-only attention test also passed separately.
+Checks include reference/statistics bank isolation, per-window isolation, missing
+profile neutrality, gradients into both projections, cache offsets, history-first
+budgets, training/resume, and the reduced sampling curriculum.
+
+A 36-example real-data audit across all tasks and splits verified safe paired
+references, consistent paired pitch shifts, velocity normalization, timing masks
+of at least 90%, complete responses and contexts within 8192 positions. Maximum
+sampled context was 4626 positions and maximum response 1990 tokens.
+
+The full-size 900M-parameter model initialized from the original AR checkpoint
+passed one validation-only optimizer update on real examples from all three
+tasks, using the actual frozen encoder checkpoints. Loss was finite (1.1026),
+reference/statistics projection gradients were nonzero, and encoders received
+no gradients. Peak allocated GPU memory was 14.18 GiB for this three-example
+smoke; this does not establish peak memory for the configured 24-example batch.
+No checkpoints or training run were created by the smoke.
+
+The actual V14 best checkpoint also passed strict weight loading and cached GPU
+decoding using its original 66-position prefix. The separate-memory V15 contract
+uses 82 positions. The canonical launcher's syntax check passed; it is ready for
+review and has not been submitted.
 
 ## V14 preflight validation
 
@@ -382,7 +419,8 @@ No retraining, new attention package or environment change was needed.
 Final validation: **323 tests passed, one CUDA-only test skipped** in the CPU
 suite. Separate GPU benchmarks used the actual V14 checkpoint and checked exact
 logits/seeded note outputs. Launcher syntax and Git whitespace checks passed.
-The V14 and V15 checkpoints and generated MIDI outputs were retained; no job
+At that point V14/V15 checkpoints and generated MIDI outputs were retained; the
+discarded V15 directory was subsequently deleted during the new V15 preparation. No job
 was submitted.
 
 ### Saved reference MIDI files

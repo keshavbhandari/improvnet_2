@@ -97,9 +97,11 @@ def trim_history(tokens, max_tokens, tokenizer):
 
 
 def validate_lengths(config):
+    if (config.MODEL_KWARGS.get('memory_tokens',80),config.MODEL_KWARGS.get('drum_memory_tokens',16))!=(80,16):
+        raise ValueError('V15 training requires 80 memory tokens, including 16 separate drum tokens')
     if not .9<=config.REFINE_MIN_MASK_RATIO<=1:
         raise ValueError('Refinement timing masking must be between 90% and 100%')
-    if config.REFERENCE_WINDOWS!=2:raise ValueError('V14 training uses exactly two consecutive reference windows')
+    if config.REFERENCE_WINDOWS!=2:raise ValueError('V15 training uses exactly two consecutive reference windows')
     if not 0<=config.REFERENCE_PITCH_SEMITONES<=7 or int(config.REFERENCE_PITCH_SEMITONES)!=config.REFERENCE_PITCH_SEMITONES:
         raise ValueError('Reference pitch augmentation must use integer semitones up to seven')
     if not 0<=config.JAZZ_RAMP_START_STEP<config.JAZZ_RAMP_END_STEP or config.JAZZ_BLUES_REPEATS<1:
@@ -108,7 +110,7 @@ def validate_lengths(config):
         if getattr(config,name)<1 or int(getattr(config,name))!=getattr(config,name):
             raise ValueError(f'{name} must be a positive integer')
     if not PREFIX_TOKENS+16 <= config.SEQ_LEN <= 8192:
-        raise ValueError('SEQ_LEN must fit the 66-position prefix and music within 8192 positions')
+        raise ValueError('SEQ_LEN must fit the 82-position prefix and music within 8192 positions')
     if not 6 <= config.CHUNK_TOKENS < config.SEQ_LEN - 6:
         raise ValueError('CHUNK_TOKENS must leave room for response and separators')
     if not 0 <= config.HISTORY_TOKENS < config.SEQ_LEN or not 0 <= config.HISTORY_PROB <= 1:

@@ -3,6 +3,8 @@ from pathlib import Path
 import ast
 import runpy
 import tokenize
+from types import SimpleNamespace
+import pytest
 from improvnet.model import melody_config as cfg
 from improvnet.model.encoders.style import config as encoder_config
 from improvnet.model.encoders.beat import config as beat_config
@@ -37,11 +39,11 @@ def test_configs_are_standalone_and_settings_are_explained():
 
 def test_current_settings_use_the_single_config():
     assert cfg.CLASSICAL_RATIO==2
-    assert cfg.SAVE_DIR.endswith('/melody_refinement_v14')
+    assert cfg.SAVE_DIR.endswith('/melody_refinement_v15')
     assert cfg.DATA_FILE.name=='melody_manifest_v7.json'
-    assert cfg.RUN_NAME=='melody_refinement_v14'
-    assert cfg.PROTOCOL_VERSION==18 and not hasattr(cfg,'BEAT_TOKENS')
-    assert cfg.MODEL_KWARGS['memory_tokens']==64
+    assert cfg.RUN_NAME=='melody_refinement_v15'
+    assert cfg.PROTOCOL_VERSION==20 and not hasattr(cfg,'BEAT_TOKENS')
+    assert cfg.MODEL_KWARGS['memory_tokens']==80
     assert cfg.REFERENCE_WINDOWS==2 and cfg.REFERENCE_PROB==1.
     assert cfg.REFINE_MIN_MASK_RATIO==.9 and cfg.REFINE_FULL_MASK_PROB==.25
     assert cfg.BATCH_SIZE==24 and cfg.ACCUM_STEPS==1
@@ -62,4 +64,13 @@ def test_lower_ratio_preserves_jazz_passes_and_held_out_files(tmp_path):
     training=MelodyDataset(config.DATA_FILE,'train',config)
     validation=MelodyDataset(config.DATA_FILE,'validation',config)
     assert training.main_slots()==len(training.jazz_blues)*(2+config.JAZZ_BLUES_REPEATS)
-    assert config.JAZZ_BLUES_REPEATS==4 and len(validation)==2
+    assert config.JAZZ_BLUES_REPEATS==2 and len(validation)==2
+
+
+def test_training_rejects_legacy_memory_layout():
+    from improvnet.utils.melody_chunks import validate_lengths
+    config=SimpleNamespace(**{name:getattr(cfg,name) for name in dir(cfg) if name.isupper()})
+    validate_lengths(config)
+    config.MODEL_KWARGS=dict(cfg.MODEL_KWARGS,memory_tokens=64,drum_memory_tokens=0)
+    with pytest.raises(ValueError,match='80 memory tokens'):
+        validate_lengths(config)

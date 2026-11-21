@@ -22,7 +22,7 @@ def test_complete_dense_target_uses_over_2048_tokens_and_reclaims_history():
     ex=prepare_example(rec,random.Random(3),settings(POLY_HISTORY_PROB=1.,HISTORY_CORRUPTION_PROB=0.),'harmonize')
     clean=response(ex)
     assert ex['response_length']>2048 and ex['history_tokens_dropped']>0
-    assert len(ex['input'])+66<=8192 and ex['source_length']<=512
+    assert len(ex['input'])+82<=8192 and ex['source_length']<=512
     expected=ordered([replace(Note(*n),onset=n[3]-ex['start_ms']) for n in rec['notes'] if ex['start_ms']<=n[3]<ex['end_ms']])
     assert clean==expected
     source_notes=sum(isinstance(t,tuple) and t[0]=='note' for t in prompt_source(ex))
@@ -33,7 +33,7 @@ def test_unavoidably_oversized_mix_shortens_whole_window_never_partial_targets()
     rec=dense_piece(20)
     ex=prepare_example(rec,random.Random(3),settings(POLY_HISTORY_PROB=1.),'harmonize')
     clean=response(ex)
-    assert len(ex['input'])+66<=8192 and ex['response_length']>2048
+    assert len(ex['input'])+82<=8192 and ex['response_length']>2048
     assert len(clean)%20==0
     assert clean==ordered([replace(Note(*n),onset=n[3]-ex['start_ms']) for n in rec['notes'] if ex['start_ms']<=n[3]<ex['end_ms']])
 
@@ -59,7 +59,7 @@ def test_required_references_never_use_target_when_no_neighbor_exists():
 def test_decoder_rebuilds_cache_without_discarding_response():
     from improvnet.inference.melody_note_decode import generate_notes
     infer,_=scripted_inference([])
-    infer.meta.update(version=18,seq_len=256)
+    infer.meta.update(version=20,seq_len=256)
     infer.progress_disabled=True
     tok=infer.tokenizer
     script=[]
@@ -88,4 +88,4 @@ def test_decoder_rebuilds_cache_without_discarding_response():
     assert len(prefills)==2 and len(prefills[1])>len(source)+4
     assert len(out)==20
     assert infer.last_decode_stats['history_tokens_dropped']==len(history)
-    assert all(len(p)+66<=256 for p in prefills)
+    assert all(len(p)+82<=256 for p in prefills)

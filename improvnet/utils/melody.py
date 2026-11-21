@@ -11,7 +11,9 @@ from improvnet.tokenizer.absolute import AbsTokenizer
 from improvnet.tokenizer.midi import MidiDict
 from improvnet.utils.melody_midi import read_midi_dict
 
-PREFIX_TOKENS = 66  # Genre + two independent 32-token reference banks + instrument mix.
+REFERENCE_MEMORY_PER_WINDOW = 32
+DRUM_MEMORY_PER_WINDOW = 8
+PREFIX_TOKENS = 2 + 2 * (REFERENCE_MEMORY_PER_WINDOW + DRUM_MEMORY_PER_WINDOW)  # Genre + two separate reference/drum banks + instrument mix.
 
 TASKS = ("refine", "harmonize", "stem")
 # Task IDs are fixed; unused historical vocabulary entries stay reserved.

@@ -72,6 +72,7 @@ class MelodyInference:
         refinement_timing = (harmonize_strength(rng,.95 if timing_strength is None else timing_strength,
             self.meta.get('refine_min_mask_ratio',.9)) if task=='refine' and not bypass_refinement else None)
         tok = self.tokenizer
+        prefix_tokens = self.meta.get('prefix_tokens', PREFIX_TOKENS)
         def prepare_source(raw):
             pitched = [n for n in raw if n.instrument != 'drum']
             source = list(raw) if task == 'stem' else pitched
@@ -124,7 +125,7 @@ class MelodyInference:
                   position=getattr(self, 'progress_position', None)) as progress:
             while begin < len(source_notes) or source_stream is not None and not source_stream.done:
                 left = history_tokens(result, self.meta['history_tokens'], tok)
-                available = self.meta['seq_len'] - PREFIX_TOKENS - len(left) - 4 - 2*int(target_instrument is not None)
+                available = self.meta['seq_len'] - prefix_tokens - len(left) - 4 - 2*int(target_instrument is not None)
                 response_cap=self.meta['seq_len']
                 input_cap=self.meta['chunk_tokens']
                 # One complete lookahead group makes streaming chunk boundaries
@@ -172,9 +173,9 @@ class MelodyInference:
                         source = notes_to_tokens(core, tok)
                     # Reserve a complete retained/source response before adding history.
                     response_floor = len(notes_to_tokens(core, tok)) - 1
-                    room = self.meta['seq_len'] - PREFIX_TOKENS - len(make_prompt(task,source,(),target_instrument)) - response_floor
+                    room = self.meta['seq_len'] - prefix_tokens - len(make_prompt(task,source,(),target_instrument)) - response_floor
                     left = trim_history(left, max(0,room), tok)
-                    available = self.meta['seq_len'] - PREFIX_TOKENS - len(left) - 4 - 2*int(target_instrument is not None)
+                    available = self.meta['seq_len'] - prefix_tokens - len(left) - 4 - 2*int(target_instrument is not None)
                     if (len(source) <= self.meta['chunk_tokens']
                             and len(source) + response_floor <= available
                             and response_floor <= response_cap-1):

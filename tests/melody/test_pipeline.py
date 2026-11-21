@@ -1,4 +1,4 @@
-"""Current V14 pipeline contracts."""
+"""Current V15 pipeline contracts."""
 import random
 import pytest
 import torch
@@ -80,7 +80,7 @@ def fixture_infer():
     infer.processor = ProcessData()
     infer.options = settings()
     infer.encoders = SimpleNamespace(from_notes=lambda *a,**kw:fake_reference(**kw))
-    infer.meta = dict(version=18, tasks=list(TASKS), seq_len=1024, genres=['jazz'], chunk_tokens=26,
+    infer.meta = dict(version=20, tasks=list(TASKS), seq_len=1024, genres=['jazz'], chunk_tokens=26,
                       history_tokens=64,
                       skyline_tolerance_ms=50,harmonize_min_mask_ratio=.9, style_dim=256)
     return infer
@@ -92,7 +92,7 @@ def fixture_generate(self, prompt, genre, strength, instruments, window_ms, **kw
     ids = torch.tensor([[self.tokenizer.tok_to_id[t] for t in prompt]])
     _, cache = self.model(ids, genre=torch.tensor([0]), multi_hot=torch.zeros(1, 41),
                           strength=torch.tensor([strength]), use_cache=True)
-    self.model(ids[:, -1:], past_key_values=cache, seq_offset=len(prompt)+66, use_cache=True)
+    self.model(ids[:, -1:], past_key_values=cache, seq_offset=len(prompt)+82, use_cache=True)
     first = prompt.index('<SEP>')+1
     end = prompt.index('<SEP>', first)
     source, attribute, note_index = [], 0, 0
@@ -178,7 +178,7 @@ def test_canonical_cli_batches_three_tasks_and_harmonizes_requested_pitched_mix(
     from improvnet.inference import melody_inference as module
     from improvnet.utils.melody import write_midi_notes
     infer = fixture_infer()
-    infer.meta.update(version=18, tasks=list(TASKS))
+    infer.meta.update(version=20, tasks=list(TASKS))
     infer.checkpoint_step = 1
     calls = []
     def generate(self, prompt, genre, strength, instruments, *args, **kwargs):
@@ -221,7 +221,7 @@ def test_cli_rejects_retired_orchestration_before_reading_music(tmp_path, monkey
     import sys
     from improvnet.inference import melody_inference as module
     infer = fixture_infer()
-    infer.meta.update(version=18, tasks=list(TASKS))
+    infer.meta.update(version=20, tasks=list(TASKS))
     monkeypatch.setattr(module, 'MelodyInference', lambda _: infer)
     monkeypatch.setattr('improvnet.inference.melody_cli.choose_reference',lambda *a,**kw:fake_reference(**kw))
     monkeypatch.setattr(sys, 'argv', ['inference', '--model', 'fixture', '--input', 'missing.mid',
@@ -366,7 +366,7 @@ def test_cached_logits_with_reused_rotary_factors_match_full_forward():
     _,cache=model(req.ids[:,:4],**req.kwargs)
     outputs=[]
     for pos in range(4,11):
-        logits,cache=model(req.ids[:,pos:pos+1],use_cache=True,past_key_values=cache,seq_offset=pos+66)
+        logits,cache=model(req.ids[:,pos:pos+1],use_cache=True,past_key_values=cache,seq_offset=pos+82)
         outputs.append(logits)
     torch.testing.assert_close(torch.cat(outputs,dim=1),golden[:,4:],rtol=2e-5,atol=2e-6)
 

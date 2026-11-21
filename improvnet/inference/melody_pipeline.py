@@ -19,7 +19,7 @@ from tqdm import tqdm
 from improvnet.inference.melody_runtime import INFERENCE_SEED, inference_context
 from improvnet.inference.melody_outputs import stage_output_names, plan_stages
 from improvnet.utils.melody import write_midi_notes, PREFIX_TOKENS
-from improvnet.model.melody_model import PROTOCOL_VERSION
+from improvnet.model.melody_model import INFERENCE_PROTOCOLS
 
 
 @dataclass
@@ -43,6 +43,7 @@ def forward_batch(model, requests):
     """
     if not requests:
         return []
+    prefix_tokens = getattr(model,'prefix_tokens',PREFIX_TOKENS)
     if len(requests) == 1:
         req = requests[0]
         return [model(req.ids, **req.kwargs)]
@@ -61,7 +62,7 @@ def forward_batch(model, requests):
                 kwargs[name] = torch.cat([v if v is not None else torch.zeros_like(exemplar) for v in values])
         logits, cache = model(ids, **kwargs)
         return [(logits[row:row+1, n-1:n].clone(),
-                 [tuple(t[row:row+1,:n+PREFIX_TOKENS] for t in layer) for layer in cache])
+                 [tuple(t[row:row+1,:n+prefix_tokens] for t in layer) for layer in cache])
                 for row, n in enumerate(lengths)]
     if any(r.ids.shape != (1, 1) for r in requests):
         raise ValueError('Cached requests must contain exactly one token')
@@ -210,8 +211,8 @@ class NoteStream:
 
 def run_pipeline(infer, original, tasks, args, requested, original_instruments,
                  reference, output_directory, stem_targets):
-    if infer.meta.get('version')!=PROTOCOL_VERSION:
-        raise ValueError('Inference requires a V14 prefix-memory checkpoint (protocol 18)')
+    if infer.meta.get('version') not in INFERENCE_PROTOCOLS:
+        raise ValueError('Inference requires a V14 protocol 18 or new V15 protocol 20 checkpoint')
     output_directory = Path(output_directory)
     output_directory.mkdir(parents=True, exist_ok=True)
     missing_tasks = set(tasks) - set(infer.meta.get('tasks', ()))

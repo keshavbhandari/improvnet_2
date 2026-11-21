@@ -217,13 +217,13 @@ def test_tiny_training_resume_and_checkpoint_protocol(tmp_path):
     config.MODEL_KWARGS=dict(embed_dim=32,n_heads=4,n_kv_heads=2,n_layers=1,num_genres=4,num_instruments=41,dropout=0.)
     train(config,n_steps=1)
     checkpoint=torch.load(Path(config.SAVE_DIR)/'latest_checkpoint.pt',weights_only=False)
-    assert checkpoint['step']==1 and validate_checkpoint(checkpoint)['reference_architecture']=='paired_self_attention_prefix_memory_v2'
+    assert checkpoint['step']==1 and validate_checkpoint(checkpoint)['reference_architecture']=='paired_separate_drum_prefix_memory_v3'
     train(config,n_steps=2)
     checkpoint=torch.load(Path(config.SAVE_DIR)/'latest_checkpoint.pt',weights_only=False)
     assert checkpoint['step']==2 and checkpoint['refinement']['tasks']==['refine','harmonize','stem']
-    assert checkpoint['refinement']['data_policy_revision']==19
-    assert checkpoint['refinement']['version']==18
-    assert checkpoint['refinement']['reference_architecture']=='paired_self_attention_prefix_memory_v2'
+    assert checkpoint['refinement']['data_policy_revision']==21
+    assert checkpoint['refinement']['version']==20
+    assert checkpoint['refinement']['reference_architecture']=='paired_separate_drum_prefix_memory_v3'
     assert checkpoint['scheduler_state_dict']['last_epoch']==2
     assert all(state['step']==2 for state in checkpoint['optimizer_state_dict']['state'].values())
     progress=(Path(config.SAVE_DIR)/'training.log').read_text()
@@ -459,9 +459,9 @@ def test_full_jazz_file_passes_and_auxiliary_mixture_draws_are_both_preserved(tm
   ex=D[(idx,15000)];tasks[TASKS[ex['task']]]+=1;genre[ex['genre'].item()]+=1
   if math.floor((idx+1)*fraction+1e-9)>math.floor(idx*fraction+1e-9):
    if loaded[-1] in D.jazz_blues:main[loaded[-1]['offset']]+=1
- assert list(main.values())==[4]*len(D.jazz_blues)
+ assert list(main.values())==[2]*len(D.jazz_blues)
  assert sum(tasks.values())==len(D) and tasks['stem']>0 and tasks['orchestrate']==0
- assert D.main_slots()==len(D.jazz_blues)*12
+ assert D.main_slots()==len(D.jazz_blues)*10
  # Evaluation is still unique, deterministic and unexpanded.
  V=MelodyDataset(config.DATA_FILE,'validation',config)
  assert len(V)==2 and torch.equal(V[0]['input'],V[0]['input'])
@@ -475,10 +475,10 @@ def test_new_protocol_rejects_old_resume_and_changed_training_controls(tmp_path)
  for key,value in [('jazz_blues_repeats',3),('task_weights',[.3,.4,.3]),('data_policy_revision',4)]:
   with pytest.raises(ValueError,match='Resume settings differ'):
    validate_checkpoint(dict(refinement=dict(meta,**{key:value})),meta)
- with pytest.raises(ValueError,match='protocol 18'):
+ with pytest.raises(ValueError,match='protocol 20'):
   validate_checkpoint(dict(refinement=dict(meta,version=7)))
  for key,value in [('drum_profile_schema','unknown'),('reference_architecture','old_projection')]:
-  with pytest.raises(ValueError,match='protocol 18'):
+  with pytest.raises(ValueError,match='protocol 20'):
    validate_checkpoint(dict(refinement=dict(meta,**{key:value})))
 
 
@@ -529,7 +529,18 @@ def test_curriculum_changes_file_draw_balance_without_changing_splits(tmp_path,m
     monkeypatch.setattr(dataset,'load_record',lambda row:dict(mix(100,row['genre'])))
     fraction=sum(config.TASK_WEIGHTS[:2])/sum(config.TASK_WEIGHTS)
     main=[i for i in range(len(dataset)) if math.floor((i+1)*fraction+1e-9)>math.floor(i*fraction+1e-9)]
-    for step,expected in ((0,2),(10000,2),(15000,4)):
+    for step,expected in ((0,1),(10000,1),(15000,2)):
         samples=[dataset[(i,step)] for i in main]
         assert sum(int(sample['genre']) in (1,2) for sample in samples)==expected
-    assert len(main)==6 and len(dataset.jazz_blues)==1
+    assert len(main)==4 and len(dataset.jazz_blues)==1
+
+
+def test_v14_metadata_is_inference_compatible_but_rejected_for_v15_resume(tmp_path):
+    config,_=corpus(tmp_path)
+    current=checkpoint_metadata(MelodyRefinementModel(embed_dim=32,n_heads=4,n_kv_heads=2,n_layers=1),config)
+    legacy=dict(current,version=18,prefix_tokens=66,reference_architecture='paired_self_attention_prefix_memory_v2',
+                model_kwargs=MelodyRefinementModel(embed_dim=32,n_heads=4,n_kv_heads=2,n_layers=1,memory_tokens=64).model_kwargs)
+    for name in ('reference_memory_tokens_per_window','drum_memory_tokens_per_window'):legacy.pop(name)
+    assert validate_checkpoint(dict(refinement=legacy))['version']==18
+    with pytest.raises(ValueError,match='Resume settings differ'):validate_checkpoint(dict(refinement=legacy),current)
+    with pytest.raises(ValueError,match='protocol 20'):validate_checkpoint(dict(refinement=dict(legacy,version=19)))

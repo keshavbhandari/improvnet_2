@@ -1,4 +1,4 @@
-"""V14 prefix memory, source-safe controls, frozen weights and cached attention."""
+"""V15 prefix memory, source-safe controls, frozen weights and cached attention."""
 from dataclasses import replace
 import random
 from types import SimpleNamespace
@@ -36,23 +36,27 @@ def test_prefix_order_original_decoder_blocks_and_absent_reference_neutrality():
     handle=model.layers[0].register_forward_pre_hook(lambda m,args,kwargs:captured.append(args[0].detach()),with_kwargs=True)
     actual=model(ids,strength=torch.ones(1),**supplied)
     handle.remove()
-    memory=model.memory_projection(model.reference_memory(supplied['reference_features'],supplied['reference_mask'],supplied['reference_positions'],supplied['drum_profile']))
-    assert captured[0].shape==(1,66+ids.size(1),32)
-    torch.testing.assert_close(captured[0][:,1:65],memory)
-    torch.testing.assert_close(captured[0][:,66:],model.token_emb(ids))
+    memory=model.project_memory(model.reference_memory(supplied['reference_features'],supplied['reference_mask'],supplied['reference_positions'],supplied['drum_profile']))
+    assert captured[0].shape==(1,82+ids.size(1),32)
+    torch.testing.assert_close(captured[0][:,1:81],memory)
+    torch.testing.assert_close(captured[0][:,82:],model.token_emb(ids))
     torch.testing.assert_close(actual,ar(ids,prefix_memory=memory))
     supplied['reference_mask'].zero_()
     torch.testing.assert_close(model(ids,strength=torch.ones(1),**supplied),model(ids,strength=torch.ones(1)),rtol=0,atol=0)
 
 
-def test_64_memory_tokens_and_projection_receive_gradients_on_first_update():
+def test_80_memory_tokens_and_projection_receive_gradients_on_first_update():
     model=tiny();inputs=condition();ids=torch.tensor([[3,4,5]])
+    inputs['drum_profile'][:,:,38]=1
+    inputs['drum_profile'][:,:,384]=.75
     seen=[]
     handle=model.reference_memory.register_forward_hook(lambda m,a,out:seen.append(out.shape))
     model(ids,strength=torch.ones(1),**inputs).square().mean().backward()
-    assert seen==[torch.Size((1,64,32))]
+    assert seen==[torch.Size((1,80,32))]
     assert model.memory_projection.weight.grad.abs().sum()>0
     assert model.reference_memory.queries.grad.abs().sum()>0
+    assert model.drum_memory_projection.weight.grad.abs().sum()>0
+    assert model.reference_memory.profile[0].weight.grad.abs().sum()>0
     handle.remove()
 
 
@@ -63,13 +67,13 @@ def test_reference_prefix_is_cached_once_and_cached_logits_match_full_decoding()
     calls=[]
     handle=model.reference_memory.register_forward_hook(lambda *a:calls.append(1))
     _,cache=model(ids[:,:2],strength=torch.ones(1),use_cache=True,**inputs)
-    assert all(len(layer)==2 and layer[0].size(1)==68 for layer in cache)
-    saved=cache[0][0][:,:66].clone()
+    assert all(len(layer)==2 and layer[0].size(1)==84 for layer in cache)
+    saved=cache[0][0][:,:82].clone()
     decoded=[]
     for i in range(2,5):
-        logits,cache=model(ids[:,i:i+1],past_key_values=cache,use_cache=True,seq_offset=i+66)
+        logits,cache=model(ids[:,i:i+1],past_key_values=cache,use_cache=True,seq_offset=i+82)
         decoded.append(logits)
-        torch.testing.assert_close(cache[0][0][:,:66],saved)
+        torch.testing.assert_close(cache[0][0][:,:82],saved)
     torch.testing.assert_close(torch.cat(decoded,1),expected[:,2:],rtol=2e-5,atol=2e-6)
     assert calls==[1];handle.remove()
 
@@ -196,8 +200,8 @@ def test_each_memory_half_uses_only_its_own_window_and_drum_statistics():
         inputs['reference_features'][:,index].add_(3.)
         inputs['drum_profile'][:,index,38]=1
         changed=memory()
-        own=slice(index*32,(index+1)*32)
-        other=slice((1-index)*32,(2-index)*32)
+        own=slice(index*40,(index+1)*40)
+        other=slice((1-index)*40,(2-index)*40)
         torch.testing.assert_close(changed[:,other],original[:,other],rtol=0,atol=0)
         assert not torch.equal(changed[:,own],original[:,own])
         original=changed
@@ -274,3 +278,47 @@ def test_refinement_cannot_reuse_its_target_when_no_safe_reference_exists():
         notes=[('Acoustic Piano',60,80,0,100)])
     with pytest.raises(NoReferenceWindow):
         prepare_example(record,random.Random(0),settings(REFERENCE_PROB=1.),'refine')
+
+
+@torch.no_grad()
+def test_drum_statistics_and_reference_features_cannot_change_each_others_banks():
+    model=tiny();inputs=condition()
+    inputs['drum_profile'][:,:,38]=1
+    def memory():return model.project_memory(model.reference_memory(inputs['reference_features'],inputs['reference_mask'],inputs['reference_positions'],inputs['drum_profile'])).reshape(1,2,40,-1)
+    initial=memory()
+    inputs['drum_profile'][:,0,384]=2.
+    changed=memory()
+    torch.testing.assert_close(changed[:,:,:32],initial[:,:,:32],rtol=0,atol=0)
+    torch.testing.assert_close(changed[:,1],initial[:,1],rtol=0,atol=0)
+    assert not torch.equal(changed[:,0,32:],initial[:,0,32:])
+    inputs['reference_features'][:,0].add_(3.)
+    feature_changed=memory()
+    torch.testing.assert_close(feature_changed[:,:,32:],changed[:,:,32:],rtol=0,atol=0)
+    torch.testing.assert_close(feature_changed[:,1],changed[:,1],rtol=0,atol=0)
+    assert not torch.equal(feature_changed[:,0,:32],changed[:,0,:32])
+
+
+@torch.no_grad()
+def test_missing_drums_have_zero_stat_slots_but_do_not_hide_reference_memory():
+    model=tiny();inputs=condition()
+    def memory():return model.project_memory(model.reference_memory(inputs['reference_features'],inputs['reference_mask'],inputs['reference_positions'],inputs['drum_profile'])).reshape(1,2,40,-1)
+    result=memory()
+    assert result[:,:,:32].abs().sum()>0 and result[:,:,32:].eq(0).all()
+    inputs['reference_mask'].zero_();inputs['drum_profile'][:,:,38]=1
+    result=memory()
+    assert result[:,:,:32].eq(0).all() and result[:,:,32:].abs().sum()>0
+
+
+@torch.no_grad()
+def test_v14_shared_memory_and_variable_batch_cache_loading_remain_supported():
+    from improvnet.inference.melody_pipeline import forward_batch
+    from test_pipeline import prefill
+    model=tiny(memory_tokens=64)
+    assert model.prefix_tokens==66 and model.drum_memory_projection is None
+    restored=tiny(memory_tokens=64);restored.load_state_dict(model.state_dict())
+    requests=[prefill(i,n) for i,n in enumerate((3,9))]
+    actual=forward_batch(restored,requests)
+    for request,(logits,cache) in zip(requests,actual):
+        expected,_=model(request.ids,**request.kwargs)
+        torch.testing.assert_close(logits,expected[:,-1:],rtol=2e-5,atol=2e-6)
+        assert all(layer[0].size(1)==request.ids.size(1)+66 for layer in cache)

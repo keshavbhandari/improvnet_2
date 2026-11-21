@@ -1,4 +1,4 @@
-"""V14: original AR blocks conditioned by a projected reference-memory prefix."""
+"""V15: original AR blocks conditioned by a projected reference-memory prefix."""
 import hashlib
 from pathlib import Path
 
@@ -6,34 +6,54 @@ import torch
 from torch import nn
 
 from improvnet.model.ar_model import ARContextModel
-from improvnet.utils.melody import MelodyTokenizer, TASKS, TASK_TOKENS, PREFIX_TOKENS
+from improvnet.utils.melody import MelodyTokenizer, TASKS, TASK_TOKENS
 from improvnet.utils.melody_stems import DRUM_POLICY, DRUM_KIT_PITCHES, DRUM_KIT_ALIASES, PERCUSSION_MODES
 
 from improvnet.model.reference_memory import ReferenceMemory
 from improvnet.utils.drum_profile import DRUM_PROFILE_DIM, DRUM_PROFILE_SCHEMA
 
-PROTOCOL_VERSION = 18
+PROTOCOL_VERSION = 20
+INFERENCE_PROTOCOLS = (18, PROTOCOL_VERSION)
 
 
 class MelodyRefinementModel(ARContextModel):
-    def __init__(self, style_dim=256, beat_dim=256, memory_tokens=64, memory_dim=256,
-                 memory_heads=4, **kwargs):
+    def __init__(self, style_dim=256, beat_dim=256, memory_tokens=80, memory_dim=256,
+                 memory_heads=4, drum_memory_tokens=None, **kwargs):
         if style_dim!=256 or beat_dim!=256:raise ValueError('Reference feature width must be 256')
-        if memory_tokens!=64 or memory_dim<4 or memory_heads<1 or memory_dim%memory_heads:
-            raise ValueError('V14 requires 64 memory tokens and a valid resampler width/head count')
+        if drum_memory_tokens is None:
+            drum_memory_tokens=0 if memory_tokens==64 else 16
+        if ((memory_tokens,drum_memory_tokens) not in ((64,0),(80,16))
+                or memory_dim<4 or memory_heads<1 or memory_dim%memory_heads):
+            raise ValueError('Expected V15 80-token separate memory or V14 64-token shared memory')
+        self.memory_tokens=memory_tokens
+        self.drum_memory_tokens=drum_memory_tokens
+        self.prefix_tokens=2+memory_tokens
         kwargs.setdefault('vocab_size',MelodyTokenizer().vocab_size)
         super().__init__(**kwargs)
         dim=self.token_emb.embedding_dim
         width=min(128,dim)
         self.strength_proj=nn.Sequential(nn.Linear(1,width),nn.SiLU(),nn.Linear(width,dim,bias=False))
         self.percussion_embedding=nn.Embedding(len(PERCUSSION_MODES),dim,padding_idx=0)
-        self.reference_memory=ReferenceMemory(256,memory_dim,memory_tokens//2,memory_heads)
+        self.reference_memory=ReferenceMemory(256,memory_dim,32,memory_heads,drum_memory_tokens//2)
         self.memory_projection=nn.Linear(memory_dim,dim,bias=False)
+        self.drum_memory_projection=nn.Linear(memory_dim,dim,bias=False) if drum_memory_tokens else None
         nn.init.normal_(self.memory_projection.weight,std=.02)
+        if self.drum_memory_projection is not None:
+            nn.init.normal_(self.drum_memory_projection.weight,std=.02)
         nn.init.zeros_(self.strength_proj[-1].weight)
         nn.init.zeros_(self.percussion_embedding.weight)
         self.model_kwargs=dict(kwargs,style_dim=style_dim,beat_dim=beat_dim,memory_tokens=memory_tokens,
             memory_dim=memory_dim,memory_heads=memory_heads)
+        if drum_memory_tokens:
+            self.model_kwargs['drum_memory_tokens']=drum_memory_tokens
+
+    def project_memory(self,memory):
+        if not self.drum_memory_tokens:
+            return self.memory_projection(memory)
+        memory=memory.reshape(memory.size(0),2,self.memory_tokens//2,-1)
+        references=self.memory_projection(memory[:,:,:32])
+        drums=self.drum_memory_projection(memory[:,:,32:])
+        return torch.cat((references,drums),2).flatten(1,2)
 
     def forward(self,target,strength=None,percussion_mode=None,reference_features=None,
                 reference_mask=None,reference_positions=None,drum_profile=None,**kwargs):
@@ -61,7 +81,7 @@ class MelodyRefinementModel(ARContextModel):
                 raise ValueError('Invalid reference features/mask/positions or drum profile')
             if not all(torch.isfinite(t).all() for t in (reference_features,reference_positions,drum_profile)):
                 raise ValueError('Reference features and drum profiles must be finite')
-            memory=self.memory_projection(self.reference_memory(reference_features,reference_mask,reference_positions,drum_profile))
+            memory=self.project_memory(self.reference_memory(reference_features,reference_mask,reference_positions,drum_profile))
         return super().forward(target,extra_condition=extra,prefix_memory=memory,**kwargs)
 
 
@@ -89,7 +109,7 @@ def initialize_from_ar(model, checkpoint):
         else:
             raise ValueError(f'Architecture mismatch for {key}: {value.shape}')
     missing = set(expected) - set(migrated)
-    if any(not (k.startswith(('reference_memory.', 'memory_projection.', 'strength_proj.', 'percussion_embedding.'))) for k in missing):
+    if any(not (k.startswith(('reference_memory.', 'memory_projection.', 'drum_memory_projection.', 'strength_proj.', 'percussion_embedding.'))) for k in missing):
         raise ValueError(f'Missing parameters: {missing}')
     model.load_state_dict(migrated, strict=False)
 
@@ -113,7 +133,8 @@ def checkpoint_metadata(model, config):
                 beat_dim=config.BEAT_DIM,beat_encoder=str(config.BEAT_ENCODER),beat_encoder_sha256=config.BEAT_ENCODER_SHA256,
                 reference_tokens=config.REFERENCE_TOKENS,reference_guard_ms=config.REFERENCE_GUARD_MS,
                 reference_max_distance_ms=config.REFERENCE_MAX_DISTANCE_MS,
-                reference_architecture='paired_self_attention_prefix_memory_v2',prefix_tokens=PREFIX_TOKENS,drum_profile_schema=DRUM_PROFILE_SCHEMA,
+                reference_architecture='paired_separate_drum_prefix_memory_v3',prefix_tokens=model.prefix_tokens,
+                reference_memory_tokens_per_window=32,drum_memory_tokens_per_window=8,drum_profile_schema=DRUM_PROFILE_SCHEMA,
                 tasks=list(TASKS),task_tokens={task:TASK_TOKENS[task] for task in TASKS},task_weights=list(config.TASK_WEIGHTS),
                 **{name.lower():getattr(config,name) for name in fields},
                 data_file=str(manifest.resolve()),
@@ -131,7 +152,7 @@ def checkpoint_metadata(model, config):
                 refinement_additional_strength_sampling='5_percent_zero_otherwise_equal_10_to_100_percent_levels',
                 refinement_pitch_timing_rate='requested_fraction_of_remaining_notes_or_attack_groups',
                 reference_policy='two_consecutive_safe_shared_windows_pairwise_pitch_augmentation_exact_or_trio_v5',
-                refinement_input_velocity=90,reference_conditioned_tasks=list(TASKS),refinement_timing='90_to_100_percent_masked_after_melodic_corruptions',data_policy_revision=19,prepared_split_ratios=dict(config.DATA_SPLIT_RATIOS),
+                refinement_input_velocity=90,reference_conditioned_tasks=list(TASKS),refinement_timing='90_to_100_percent_masked_after_melodic_corruptions',data_policy_revision=21,prepared_split_ratios=dict(config.DATA_SPLIT_RATIOS),
                 validation_sampling='one_window_per_file',ar_header_revision=3,
                 midi_recovery_policy='invalid_or_truncated_key_time_signature_metadata_and_sysex_only',
                 jazz_blues_sampling='step_scheduled_jazz_weight_with_fixed_task_weights',
@@ -140,12 +161,20 @@ def checkpoint_metadata(model, config):
 
 def validate_checkpoint(checkpoint,expected=None):
     meta=checkpoint.get('refinement',{})
-    if (meta.get('version')!=PROTOCOL_VERSION or meta.get('prefix_tokens')!=PREFIX_TOKENS or meta.get('percussion_modes')!=PERCUSSION_MODES
+    version=meta.get('version')
+    legacy=version==18
+    prefix,architecture=(66,'paired_self_attention_prefix_memory_v2') if legacy else (82,'paired_separate_drum_prefix_memory_v3')
+    model_kwargs=meta.get('model_kwargs',{})
+    if (version not in INFERENCE_PROTOCOLS or meta.get('prefix_tokens')!=prefix
+            or meta.get('percussion_modes')!=PERCUSSION_MODES
             or meta.get('reference_windows')!=2 or meta.get('refinement_input_velocity')!=90
             or meta.get('reference_conditioned_tasks')!=list(TASKS)
-            or meta.get('reference_architecture')!='paired_self_attention_prefix_memory_v2'
+            or meta.get('reference_architecture')!=architecture
+            or model_kwargs.get('memory_tokens')!=(64 if legacy else 80)
+            or (not legacy and (model_kwargs.get('drum_memory_tokens')!=16
+                or meta.get('drum_memory_tokens_per_window')!=8 or meta.get('reference_memory_tokens_per_window')!=32))
             or meta.get('drum_profile_schema')!=DRUM_PROFILE_SCHEMA):
-        raise ValueError('Expected V14 prefix-memory checkpoint (protocol 18); initialize from pretrained AR')
+        raise ValueError('Expected V15 protocol 20 separate-memory or V14 protocol 18 checkpoint; initialize fresh training from pretrained AR')
     if meta.get('tokenizer') != MelodyTokenizer().signature() or meta.get('style_dim') != 256 or not meta.get('style_encoder_sha256') or meta.get('beat_dim') != 256 or not meta.get('beat_encoder_sha256'):
         raise ValueError('Tokenizer or reference encoder metadata differ')
     if meta.get('tasks') != list(TASKS):

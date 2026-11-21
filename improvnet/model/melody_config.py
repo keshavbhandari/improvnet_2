@@ -1,10 +1,10 @@
-"""V14: original AR decoder, paired-window reference prefix and a genre curriculum."""
+"""V15: original AR decoder, paired-window reference prefix and a genre curriculum."""
 from pathlib import Path
 from improvnet.utils.melody import MelodyTokenizer, TASKS
 
 
 # Tasks and sequence format
-PROTOCOL_VERSION = 18  # Projected-prefix reference-memory training/inference format.
+PROTOCOL_VERSION = 20  # Projected-prefix reference-memory training/inference format.
 TASK_NAMES = TASKS  # Canonical refinement, harmonize and stem task names.
 TASK_WEIGHTS = (.20, .40, .40)  # Relative sampling probabilities for refinement, harmonize and stem.
 
@@ -19,7 +19,7 @@ PARSED_CACHE = DATA_ROOT / 'prepared' / 'round2_lazy_cache'  # Reuse parsed note
 FALLBACK_PARSED_CACHE = Path('/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/beat_annotations/parsed_cache')  # Reuse existing plain-note parsing cache; no annotation database is read.
 CLASSICAL_INDEX = Path('/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/local_vae_dataset/midi_index_gigamidi_genres.sqlite')  # SQLite index used to sample additional non-jazz/blues MIDI files.
 CLASSICAL_RATIO = 2  # Non-jazz/blues sampling slots per original jazz/blues file.
-JAZZ_BLUES_REPEATS = 4  # Final jazz/blues sampling weight after the curriculum ramp.
+JAZZ_BLUES_REPEATS = 2  # Final jazz/blues repeat weight; with the 2x non-jazz pool this gives a 1:1 base mix.
 JAZZ_RAMP_START_STEP = 10000  # Keep jazz/blues weight at one through this optimizer step.
 JAZZ_RAMP_END_STEP = 15000  # Linearly increase the weight to JAZZ_BLUES_REPEATS by this step.
 MULTI_INSTRUMENT_PROB = .75  # Preference for multitrack files in eligible sampling paths.
@@ -34,8 +34,8 @@ AR_MIXTURE_SCAN_PER_FILE = 200000  # Maximum records inspected in each original 
 AR_MIXTURE_INDEX = DATA_ROOT / 'prepared' / 'ar_mixtures_v3.json'  # Cached index of eligible AR mixtures.
 
 # Output paths and initialization
-SAVE_DIR = '/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v14'  # Fresh V14 output directory; Earlier checkpoints remain available for comparison.
-RUN_NAME = 'melody_refinement_v14'  # Name identifying this finetuning run.
+SAVE_DIR = '/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v15'  # New separate-drum-memory V15 directory; discarded V15 checkpoints were deleted and V14 is retained.
+RUN_NAME = 'melody_refinement_v15'  # Name identifying this finetuning run.
 INIT_CHECKPOINT = '/e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/ar_context_split_instrument/best_model.pt'  # Pretrained autoregressive weights used for a fresh run.
 RESUME_TRAINING = True  # Resume the latest checkpoint if present; otherwise start fresh.
 GENRES = ['classical', 'jazz', 'blues', 'unknown']  # Genre labels supported by the conditioning vocabulary.
@@ -51,7 +51,8 @@ MODEL_KWARGS = dict(  # Pretrained AR architecture and reference-prefix dimensio
     dropout=.1,  # Dropout probability during training.
     style_dim=256,  # Frozen style-feature width.
     beat_dim=256,  # Frozen rhythm-feature width.
-    memory_tokens=64,  # Two independent 32-token banks, ordered by reference-window time.
+    memory_tokens=80,  # Two windows, each with 32 reference tokens and 8 dedicated drum-statistics tokens.
+    drum_memory_tokens=16,  # Dedicated drum-statistics slots across both windows; excluded from reference resampling.
     memory_dim=256,  # Reference resampler width before projection to the decoder.
     memory_heads=4,  # Heads in the reference resampler; decoder blocks stay unchanged.
 )  # End of model architecture settings.

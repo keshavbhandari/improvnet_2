@@ -1,4 +1,4 @@
-"""Inference buffers and optional retiming preserve V14's training contract."""
+"""Inference buffers and optional retiming preserve V15's training contract."""
 from dataclasses import replace
 import random
 import pytest

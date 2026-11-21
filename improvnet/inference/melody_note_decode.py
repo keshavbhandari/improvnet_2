@@ -16,6 +16,7 @@ def generate_notes(self, prompt, genre, strength, instruments, window_ms,
              protected_pitches=None):
     """Generate notes while retaining every source anchor in stem addition."""
     tok, device = self.tokenizer, self.device
+    prefix_tokens = self.meta.get('prefix_tokens', PREFIX_TOKENS)
     if stem_add and fixed_notes is None:
         raise ValueError('Stem decoding requires source anchors')
     if fixed_notes is not None and not stem_add:
@@ -29,7 +30,7 @@ def generate_notes(self, prompt, genre, strength, instruments, window_ms,
                                  decoded_tokens=0,history_tokens_dropped=0)
     if genre not in self.meta['genres'] or not 0 <= strength <= 1:
         raise ValueError('Unknown genre or strength outside [0,1]')
-    budget = self.meta['seq_len'] - len(prompt) - PREFIX_TOKENS
+    budget = self.meta['seq_len'] - len(prompt) - prefix_tokens
     if max_new_tokens is not None:
         budget = min(budget, max_new_tokens)
     fixed_onsets = [n.onset for n in fixed_notes] if fixed_notes is not None else []
@@ -59,7 +60,7 @@ def generate_notes(self, prompt, genre, strength, instruments, window_ms,
             return logits, cache
         logits, cache = prefill(ids)
         token_progress.set_postfix_str('decoding')
-        offset = len(prompt) + PREFIX_TOKENS
+        offset = len(prompt) + prefix_tokens
         output, stage, segment, last_onset, count = ['<S>'], 0, 0, -tok.time_step_ms, 0
         addition = False
         completed, seen_attacks = [], set()
@@ -135,7 +136,7 @@ def generate_notes(self, prompt, genre, strength, instruments, window_ms,
                     prompt=prompt[:header]+prompt[first_sep:]
                     rebuilt=prompt+output[1:]
                     logits,cache=prefill(torch.tensor([[tok.tok_to_id[t] for t in rebuilt]],device=device))
-                    offset=len(rebuilt)+PREFIX_TOKENS
+                    offset=len(rebuilt)+prefix_tokens
                     budget+=removed
                     token_progress.total=budget
                     self.last_decode_stats['history_tokens_dropped']+=removed
