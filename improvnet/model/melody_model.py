@@ -1,4 +1,4 @@
-"""V15: original AR blocks conditioned by a projected reference-memory prefix."""
+"""V14: original AR blocks conditioned by a projected reference-memory prefix."""
 import hashlib
 from pathlib import Path
 
@@ -12,7 +12,7 @@ from improvnet.utils.melody_stems import DRUM_POLICY, DRUM_KIT_PITCHES, DRUM_KIT
 from improvnet.model.reference_memory import ReferenceMemory
 from improvnet.utils.drum_profile import DRUM_PROFILE_DIM, DRUM_PROFILE_SCHEMA
 
-PROTOCOL_VERSION = 19
+PROTOCOL_VERSION = 18
 
 
 class MelodyRefinementModel(ARContextModel):
@@ -20,7 +20,7 @@ class MelodyRefinementModel(ARContextModel):
                  memory_heads=4, **kwargs):
         if style_dim!=256 or beat_dim!=256:raise ValueError('Reference feature width must be 256')
         if memory_tokens!=64 or memory_dim<4 or memory_heads<1 or memory_dim%memory_heads:
-            raise ValueError('V15 requires 64 memory tokens and a valid resampler width/head count')
+            raise ValueError('V14 requires 64 memory tokens and a valid resampler width/head count')
         kwargs.setdefault('vocab_size',MelodyTokenizer().vocab_size)
         super().__init__(**kwargs)
         dim=self.token_emb.embedding_dim
@@ -131,7 +131,7 @@ def checkpoint_metadata(model, config):
                 refinement_additional_strength_sampling='5_percent_zero_otherwise_equal_10_to_100_percent_levels',
                 refinement_pitch_timing_rate='requested_fraction_of_remaining_notes_or_attack_groups',
                 reference_policy='two_consecutive_safe_shared_windows_pairwise_pitch_augmentation_exact_or_trio_v5',
-                refinement_input_velocity=90,reference_conditioned_tasks=list(TASKS),refinement_timing='90_to_100_percent_masked_and_all_source_time_tokens_removed',data_policy_revision=20,prepared_split_ratios=dict(config.DATA_SPLIT_RATIOS),
+                refinement_input_velocity=90,reference_conditioned_tasks=list(TASKS),refinement_timing='90_to_100_percent_masked_after_melodic_corruptions',data_policy_revision=19,prepared_split_ratios=dict(config.DATA_SPLIT_RATIOS),
                 validation_sampling='one_window_per_file',ar_header_revision=3,
                 midi_recovery_policy='invalid_or_truncated_key_time_signature_metadata_and_sysex_only',
                 jazz_blues_sampling='step_scheduled_jazz_weight_with_fixed_task_weights',
@@ -143,10 +143,9 @@ def validate_checkpoint(checkpoint,expected=None):
     if (meta.get('version')!=PROTOCOL_VERSION or meta.get('prefix_tokens')!=PREFIX_TOKENS or meta.get('percussion_modes')!=PERCUSSION_MODES
             or meta.get('reference_windows')!=2 or meta.get('refinement_input_velocity')!=90
             or meta.get('reference_conditioned_tasks')!=list(TASKS)
-            or meta.get('refinement_timing')!='90_to_100_percent_masked_and_all_source_time_tokens_removed'
             or meta.get('reference_architecture')!='paired_self_attention_prefix_memory_v2'
             or meta.get('drum_profile_schema')!=DRUM_PROFILE_SCHEMA):
-        raise ValueError('Expected V15 prefix-memory checkpoint (protocol 19); initialize from pretrained AR')
+        raise ValueError('Expected V14 prefix-memory checkpoint (protocol 18); initialize from pretrained AR')
     if meta.get('tokenizer') != MelodyTokenizer().signature() or meta.get('style_dim') != 256 or not meta.get('style_encoder_sha256') or meta.get('beat_dim') != 256 or not meta.get('beat_encoder_sha256'):
         raise ValueError('Tokenizer or reference encoder metadata differ')
     if meta.get('tasks') != list(TASKS):

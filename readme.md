@@ -1,6 +1,6 @@
 # ImprovNet: classical-to-jazz/blues MIDI transfer
 
-The current branch implements V15 melody refinement, rhythm/harmonization and
+The current branch implements V14 melody refinement, rhythm/harmonization and
 stem addition. It initializes from the pretrained AR model and keeps both
 contrastive reference encoders frozen.
 
@@ -12,7 +12,7 @@ Training uses a consistent pitch shift across each encoder's reference pair.
 
 Refinement inputs keep their pitches but use velocity 90 in training and
 inference; clean targets and history retain expressive velocities. Refinement
-also removes every `<T>` one-second separator from the current input, masks 90–100% of onset/duration groups and uses two reference windows
+now also masks 90–100% of onset/duration groups and uses two reference windows
 matched exactly to the melody's output instruments. Harmonization keeps the same
 severe timing-mask policy. `--rhythm-strength` controls masking in both stages. Jazz/blues sampling stays unboosted
 through 10k updates, then ramps to 4x by 15k; the non-jazz pool remains 2x.
@@ -33,4 +33,28 @@ sequence construction, prompt history, pitch augmentation, safety boundaries,
 commands, sampling and validation. The sole config is
 `improvnet/model/melody_config.py`; the launcher is `run_scripts/melody_launch.sh`.
 
-V15 uses a fresh `melody_refinement_v15` checkpoint path. V14 is retained; older melody-finetuning checkpoints are removed. Other project checkpoints are untouched.
+The working tree has been restored to `97a0e0a` (`v14 best version added`).
+Use the existing `melody_refinement_v14/best_model.pt`; refinement input `<T>`
+tokens are retained. No retraining is needed for the inference changes below.
+
+Reference tempo stays unchanged by default. Add `--reference-tempo source` to
+retime its notes to the source's estimated pulse **before** reference encoding.
+The only modes are `original` and `source`; manual BPM is not a CLI option. Both consecutive windows,
+both encoders and the drum profiles use the retimed music. Automatic estimates
+can have half/double-tempo ambiguity; this is soft conditioning, not an output
+BPM guarantee. Source and original on-disk reference files remain untouched.
+The run folder includes `reference.mid` (original file copy) and, when matching
+is enabled, `reference_tempo.mid` (the retimed conditioning notes). Both are
+listed in `report.json`. If only prepared notes are available for a catalogue
+entry, the original is reconstructed and this is identified in the report.
+
+Decoding now uses request-owned, preallocated KV buffers and records
+`generation_seconds` and `tokens_per_second` for each chunk in `report.json`.
+The GH200 checkpoint benchmark produced identical logits and sampled notes,
+but no reliable throughput gain from preallocation alone (about 48 tokens/s
+for either strategy in the constrained-decoder test). Training was not submitted.
+
+An initial-pipeline scheduling bug has been fixed: idle downstream stages no
+longer repeatedly wake one another. A controlled V14 refinement replay with
+three idle stages improved from 3.05 to 37.61 tokens/s with identical notes.
+Restart inference to apply the fix. The temporary diagnostics were removed after validation.

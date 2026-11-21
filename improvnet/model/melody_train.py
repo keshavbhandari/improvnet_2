@@ -226,7 +226,7 @@ def train(config=cfg, n_steps=None):
                f'consecutive reference windows={config.REFERENCE_WINDOWS}, memory tokens/window=32, local bins/window={config.REFERENCE_LOCAL_BINS}; '
                f'history refine/mix={config.HISTORY_PROB:.0%}/{config.POLY_HISTORY_PROB:.0%}; history corruption={config.HISTORY_CORRUPTION_PROB:.0%}; '
                f'refinement=ornaments first + balanced 10%-100% independent edits (5% none), current-input velocity=90, '
-               f'timing masking>={config.REFINE_MIN_MASK_RATIO:.0%}, fully masked={config.REFINE_FULL_MASK_PROB:.0%}, all current-input <T> tokens removed, exact-instrument references; '
+               f'timing masking>={config.REFINE_MIN_MASK_RATIO:.0%}, fully masked={config.REFINE_FULL_MASK_PROB:.0%}, exact-instrument references; '
                f'pitch error range=+/-{config.PITCH_CORRUPTION_SEMITONES} semitones; '
                f'onset/duration jitter<= {config.TIMING_CORRUPTION_MS}ms (10ms ticks); '
                f'stem source corruption probability={config.STEM_SOURCE_CORRUPTION_PROB:.0%}; '

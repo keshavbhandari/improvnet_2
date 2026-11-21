@@ -1,4 +1,4 @@
-"""Shared fixtures for current V15 behavior tests."""
+"""Shared fixtures for current V14 behavior tests."""
 import json
 import sqlite3
 import torch
@@ -78,7 +78,7 @@ def scripted_inference(script):
     inference = MelodyInference.__new__(MelodyInference)
     inference.tokenizer = tok = MelodyTokenizer()
     inference.device = torch.device('cpu')
-    inference.meta = dict(version=19,seq_len=512, genres=['jazz'],harmonize_min_mask_ratio=.9)
+    inference.meta = dict(version=18,seq_len=512, genres=['jazz'],harmonize_min_mask_ratio=.9)
     inference.processor = ProcessData()
     calls = []
 

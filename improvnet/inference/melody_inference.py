@@ -3,6 +3,7 @@ from bisect import bisect_right
 from dataclasses import replace
 from contextlib import nullcontext
 import sys
+import time
 from types import SimpleNamespace
 
 import torch
@@ -10,7 +11,7 @@ from tqdm import tqdm
 from improvnet.model.melody_model import MelodyRefinementModel, validate_checkpoint
 from improvnet.utils.ar_utils import ProcessData
 from improvnet.utils.melody import (MelodyTokenizer, TASKS, make_prompt, mask_timing,
-    PREFIX_TOKENS, normalize_refinement_velocity, remove_refinement_time_tokens, combine_notes, melody_voice, notes_to_tokens, ordered, skyline, window, harmonize_strength, tokens_to_notes)
+    PREFIX_TOKENS, normalize_refinement_velocity, combine_notes, melody_voice, notes_to_tokens, ordered, skyline, window, harmonize_strength, tokens_to_notes)
 from improvnet.utils.melody_chunks import (chunk_bounds, chunk_end, group_end,
                                           history_tokens, trim_history, stem_bounds, shorten_chunk)
 from improvnet.utils.melody_corruptions import refinement_source, refinement_strength
@@ -164,7 +165,7 @@ class MelodyInference:
                         source = notes_to_tokens(core, tok)
                     elif task == 'refine':
                         unmasked_source = normalize_refinement_velocity(refinement_source(core, strength, rng, tok, self.options))
-                        source = remove_refinement_time_tokens(mask_timing(tokens_to_notes(unmasked_source,tok),refinement_timing,rng,tok,round_up=True))
+                        source = mask_timing(tokens_to_notes(unmasked_source,tok),refinement_timing,rng,tok,round_up=True)
                     elif task == 'harmonize':
                         source = mask_timing(core, strength, rng, tok, round_up=True)
                     else:
@@ -195,6 +196,7 @@ class MelodyInference:
                     protected = set(melody)
                     protected_pitches = [replace(n, onset=n.onset+start) in protected for n in ordered(core)]
                 progress.set_postfix(chunk=len(logs) + 1, source=len(source), history=len(left))
+                generation_started = time.perf_counter()
                 if bypass_refinement:
                     generated = list(core)
                     self.last_decode_stats = dict(end_reason='zero_strength_passthrough', model_bypassed=True)
@@ -207,6 +209,8 @@ class MelodyInference:
                         protected_pitches=protected_pitches,
                         progress_desc=f'{stage_label} chunk {len(logs) + 1}',
                     percussion_palette=percussion_palette if target_instrument=='drum' else percussion_mode(core))
+                generation_seconds = time.perf_counter() - generation_started
+                response_tokens = self.last_decode_stats.get('decoded_tokens', len(notes_to_tokens(generated, tok))-1)
                 if not generated:
                     raise RuntimeError(f'Empty {task} output; refusing to skip the source melody')
                 consumed = stop
@@ -222,8 +226,9 @@ class MelodyInference:
                     on_chunk(published)
                 logs.append(dict(task=task, start_ms=start, end_ms=end, input_notes=len(core),
                     output_notes=len(generated), history_tokens=len(left), history_view='mono' if task == 'refine' else 'poly',
-                    source_tokens=len(source), response_tokens=self.last_decode_stats.get(
-                        'decoded_tokens',len(notes_to_tokens(generated, tok)) - 1),
+                    source_tokens=len(source), response_tokens=response_tokens,
+                    generation_seconds=None if bypass_refinement else generation_seconds,
+                    tokens_per_second=None if bypass_refinement else response_tokens/max(generation_seconds,1e-9),
                     response_token_budget=self.last_decode_stats.get('response_token_budget',budget),
                     history_tokens_dropped=self.last_decode_stats.get('history_tokens_dropped',0),
                     total_token_budget=len(prompt) + budget + 2,

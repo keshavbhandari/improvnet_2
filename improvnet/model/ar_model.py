@@ -1,3 +1,4 @@
+from improvnet.model.kv_cache import StaticKVCache
 import math
 import torch
 import torch.nn as nn
@@ -132,11 +133,17 @@ class CausalGroupedQueryAttention(nn.Module):
         k = self.rope(k, seq_pos, rotary_cache)
 
         if use_cache:
-            if kv_cache is not None:
-                past_k, past_v = kv_cache
-                k = torch.cat([past_k, k], dim=1)
-                v = torch.cat([past_v, v], dim=1)
-            new_kv_cache = (k, v)
+            if isinstance(kv_cache, StaticKVCache):
+                if self.training or cache_lengths is not None:
+                    raise ValueError('Static KV caches require independent inference rows')
+                k, v = kv_cache.append(k, v)
+                new_kv_cache = kv_cache
+            else:
+                if kv_cache is not None:
+                    past_k, past_v = kv_cache
+                    k = torch.cat([past_k, k], dim=1)
+                    v = torch.cat([past_v, v], dim=1)
+                new_kv_cache = (k, v)
         else:
             new_kv_cache = None
 

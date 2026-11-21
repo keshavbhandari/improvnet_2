@@ -54,3 +54,24 @@ def plan_stages(original, tasks, requested, original_instruments, stem_targets, 
             current = set(selected)
         planned.append((task,target,selected))
     return planned
+
+
+def save_reference_midis(reference, outputs, tokenizer):
+    """Copy the original file and render the exact retimed conditioning note view."""
+    import shutil
+    from improvnet.utils.melody import write_midi_notes
+    original = Path(reference['path']) if reference.get('path') else None
+    if original is not None and original.is_file():
+        shutil.copy2(original, outputs['reference'])
+        reference['saved_original_kind'] = 'file_copy'
+    else:
+        notes = reference.get('_reference_notes')
+        if not notes:
+            raise ValueError('Reference has neither an original MIDI file nor notes to export')
+        write_midi_notes(notes, outputs['reference'], tokenizer)
+        reference['saved_original_kind'] = 'reconstructed_notes'
+    if 'reference_tempo' in outputs:
+        notes = reference.get('_conditioning_notes')
+        if not notes:
+            raise ValueError('Retimed reference notes are missing; cannot export the conditioning MIDI')
+        write_midi_notes(notes, outputs['reference_tempo'], tokenizer)

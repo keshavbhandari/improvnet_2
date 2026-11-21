@@ -142,3 +142,26 @@ def transpose_reference(notes,rng,semitones=7):
     choices=[shift for shift in range(low,high+1) if shift]
     shift=rng.choice(choices) if choices else 0
     return [replace(n,pitch=n.pitch+shift) if n.instrument!='drum' else n for n in notes],shift
+
+
+def reference_tempo(notes):
+    """Estimate performed pulse; refuse the analysis fallback for empty/short music."""
+    from improvnet.utils.melody_groove import infer_clock
+    clock = infer_clock(ordered(notes))
+    if clock.confidence <= 0:
+        raise ValueError('Not enough rhythmic evidence to estimate tempo; keep reference tempo original')
+    return 60000. / clock.beat_ms, clock.confidence
+
+
+def retime_reference(notes, target_bpm):
+    """Scale all reference stems together in memory on the tokenizer's 10-ms grid."""
+    import math
+    if not math.isfinite(target_bpm) or target_bpm <= 0:
+        raise ValueError('Reference target BPM must be finite and positive')
+    bpm, confidence = reference_tempo(notes)
+    scale = bpm / target_bpm
+    origin = min(n.onset for n in notes)
+    retimed = [replace(n, onset=origin + round((n.onset-origin)*scale/10)*10,
+                       duration=max(10,round(n.duration*scale/10)*10)) for n in notes]
+    return ordered(retimed), dict(original_bpm=bpm, target_bpm=target_bpm,
+                                  time_scale=scale, pulse_confidence=confidence)

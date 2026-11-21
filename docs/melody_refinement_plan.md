@@ -1,9 +1,9 @@
-# V15 melody refinement, harmonization and stem addition
+# V14 melody refinement, harmonization and stem addition
 
-V15 initializes from the original pretrained AR model. The two contrastive
+V14 initializes from the original pretrained AR model. The two contrastive
 encoders stay frozen. There are no beat-marker tokens and no cross-attention
 modules in the decoder. Previous finetuning checkpoints are incompatible;
-checkpoint protocol 19 rejects them explicitly.
+checkpoint protocol 18 rejects them explicitly.
 
 ## Model and context
 
@@ -48,9 +48,7 @@ response needs more space. No partial chord or target tail is silently trimmed.
    Targets and history retain their expressive velocities. After those edits,
    onset and duration are masked together for **90–100% of the corrupted melody's
    attack groups**; 25% of training draws mask every group. The source keeps its
-   pitches, instruments and velocity-90 note tokens. Every `<T>` one-second
-   time-advance token is removed from this current source; targets, history and
-   reference windows retain them.
+   pitches, instruments, velocity-90 note tokens and structural timing bins.
    Both frozen encoders supply a safe consecutive reference pair from the same
    output instrument(s), with exact matching even for non-piano instruments.
    The response reconstructs the clean melody, including rhythm and expression.
@@ -133,9 +131,9 @@ no new dashboard cards are added.
 
 ```
 python -m improvnet.inference.parallel_inference \
-  --model /e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v15/best_model.pt \
+  --model /e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v14/best_model.pt \
   --input improvnet/inference/examples/debussy-clair-de-lune_original.mid \
-  --output improvnet/inference/claire_v15.mid \
+  --output improvnet/inference/claire_v14.mid \
   --task pipeline --genre jazz \
   --melody-strength .4 --rhythm-strength .95 \
   --instruments "Acoustic Piano" drum \
@@ -275,34 +273,154 @@ instrumentation and explicit failure for unavailable genre/activity requests.
 
 The sole finetuning config is `improvnet/model/melody_config.py`; the canonical
 one-node/four-GPU launcher is `run_scripts/melody_launch.sh`, with synchronized
-checkpointing and automatic resubmission near its 12-hour limit. V15 outputs go
-to `melody_refinement_v15`, initialized from `ar_context_split_instrument`.
+checkpointing and automatic resubmission near its 12-hour limit. V14 outputs go
+to `melody_refinement_v14`, initialized from `ar_context_split_instrument`.
 
-V15 uses a fresh run directory and retains V14. Older melody-finetuning
-checkpoint directories are removed; user-generated MIDI outputs are preserved. Pretrained AR and reference-encoder checkpoints are
-reused. Batch size remains 24 per GPU with accumulation 1. The canonical launcher starts V15 from the original AR weights.
+The current V14 checkpoint directory is retained. V12/V13 melody checkpoints
+were removed during V15 preparation; the discarded V15 checkpoint directory was
+subsequently removed while V14 and user-generated MIDI outputs were retained. Pretrained AR and reference-encoder checkpoints are reused. Batch size
+remains 24 per GPU with accumulation 1. The V14 rollback uses its existing
+checkpoint; no training was submitted as part of the rollback.
 
 
-## V15 change and validation
+## V14 preflight validation
 
-V15 removes every `<T>` one-second time-advance token from the **current
-refinement input only**, after applying the existing V14 melody corruptions,
-velocity-90 normalization and 90–100% onset/duration masking. Targets, prompt
-history, reference windows, harmonization and stem inputs keep their normal
-time tokens. The model must generate the time-advance tokens in its response.
-Zero-strength refinement remains an unchanged pass-through.
+On 18 November 2026, 310 CPU melody tests passed (one CUDA-only test skipped).
+They cover timing masking, exact instrument reference matching including violin,
+reference exclusion, preserved expressive targets/history, zero-strength bypass,
+standalone refinement, batched stage handoffs, two-rank training/resume, and
+checkpoint protocol 18 rejecting prior training contracts.
 
-Architecture, frozen encoders, double reference windows, batch size and all other
-V14 training settings are unchanged. Protocol 19 records this new input contract
-and prevents a V14 checkpoint from silently using V15 inference preparation.
+A 36-example production-data audit passed across train/validation/test and all
+three tasks. Every example had two safe reference windows with consistent paired
+pitch shifts; refinement/harmonization timing-mask fractions were at least 90%.
+The largest sampled response contained 1990 tokens and its context fit within
+8192 positions (maximum observed context 4610). Empty or oversized corruption
+cases retain the existing complete-target and history-first budgeting behavior.
 
-A 36-example real-data audit passed across train/validation/test and all tasks.
-It verified that refinement sources contain no `<T>`, both safe instrument-matched
-reference windows remain present, and all contexts fit the 8192-token limit.
-The maximum observed response was 1990 tokens and context was 4610 tokens.
+A small-decoder GPU smoke with the actual frozen style/beat checkpoints passed
+two optimizer updates using real examples from all three tasks. Losses and
+reference-projection gradients were finite, and the encoders remained frozen;
+peak allocated memory was 0.75 GiB. This checks the conditioning path, not the
+full-size training memory requirement. The full-size login-GPU training smoke
+was deferred when spare memory fell below its safety threshold. The original AR decoder architecture and 64-token prefix
+are unchanged. Fresh V14 checkpoints require V14 training; V13 checkpoints are
+rejected by the updated inference script rather than receiving unfamiliar masks.
 
-On 19 November 2026, the final suite passed: 311 tests, one CUDA-only skip.
-V15 was submitted as Slurm job **3015487**, one node/four GPUs, using
-`run_scripts/melody_launch.sh` with automatic checkpoint/resubmission enabled.
-Removed only the old V12/V13 melody-finetuning run directories; V14 best/latest
-and all other project checkpoint directories remain intact.
+
+## V14 restoration and inference changes (21 November 2026)
+
+The tracked V15 changes were restored from commit `97a0e0a` (`v14 best version
+added`) without rewriting Git history or deleting generated outputs. All source
+`<T>` time advances are retained again; training configuration, protocol 18,
+reference conditioning and V14 preprocessing are unchanged. Use the existing
+`melody_refinement_v14/best_model.pt`. V15 protocol-19 checkpoints are rejected.
+
+### Optional reference tempo
+
+The default `--reference-tempo original` leaves the reference unchanged.
+`--reference-tempo source` estimates one global pulse from the source pitched
+notes and retimes the selected reference to that BPM. These are the only two
+CLI modes; numeric BPM values are rejected. Both explicit MIDI and descriptor-based selection
+support this option. Descriptors still select the original reference piece.
+
+Retiming scales **all reference instruments together**, including drums, by
+`reference_BPM / target_BPM`, preserving pitches, velocities, articulations and
+relative expressive timing apart from rounding to the 10-ms token grid. The
+first onset stays fixed and durations have a 10-ms minimum. This occurs before
+window selection, both frozen encoders and each window's drum-profile extraction,
+so the temporal features agree. The source, histories, decoder constraints, and
+on-disk MIDI files remain unchanged. It is a soft reference cue, not a guarantee
+of generated BPM, beat phase or local rubato alignment.
+
+Estimated pulse can be half/double the intended musical beat; inspect the logged
+original/target BPM and compare the saved reference MIDI files. Insufficient rhythmic
+evidence raises an error instead of silently using the estimator's fallback.
+`report.json` records the adjustment, scaling factor and pulse confidence.
+
+Example (omit the last argument to compare the original reference tempo):
+
+```bash
+python -m improvnet.inference.parallel_inference \
+  --model /e/scratch/e-dev-2026d09-047/bhandari1/improvnet/artifacts/melody_refinement_v14/best_model.pt \
+  --input "/e/home/jusers/bhandari1/jupiter/improvnet_melody_contrastive/improvnet/inference/examples/nocturne_9_2_(c)unknown.mid" \
+  --output /e/home/jusers/bhandari1/jupiter/improvnet_melody_contrastive/improvnet/inference/nocturne_v14_matched.mid \
+  --genre jazz --melody-strength .4 --rhythm-strength .95 \
+  --reference-description slow --reference-tempo source
+```
+
+### Request-owned preallocated caches and timing
+
+After prompt evaluation, each decoder request reserves bounded KV buffers for
+the checkpoint context length. Cached single-request attention writes the new
+key/value pair into this storage without copying the full history. Unused
+capacity never enters attention. Buffers are inference-only and are absent from
+model parameters and checkpoint state; training follows its original code path.
+
+When parallel tasks share a forward, their occupied prefixes still need packing
+for the existing variable-length attention path. Only the newly generated token
+is copied back into each request's buffer. Original caches stay independent as
+requests join/leave batches. This removes history growth allocations for the
+initial single-task phase but does not eliminate all parallel packing costs.
+
+Each chunk now logs `generation_seconds` and `tokens_per_second`, measured around
+its generation call including prompt evaluation, sampling and coordinator waits.
+They exclude source preparation and upstream waiting before the call. Bypassed
+refinement records null timing/rate. These are observed per-request wall rates,
+not the pipeline bar's aggregate rate and not pure GPU kernel timings.
+
+On the shared GH200, the actual 899M-parameter V14 checkpoint produced bitwise
+identical single-request logits and identical seeded sampled notes with both
+cache strategies. In repeated constrained-decoder runs (524 tokens, 130 notes,
+real refinement prompt without reference features), dynamic caches achieved
+47.61/49.05 tokens/s and static caches 47.95/48.25 tokens/s. Raw model-only decode
+was roughly 56–58 tokens/s at 512/2048-token prompts. The static path did **not**
+produce a reliable throughput gain in these tests. Low throughput on another
+shared GPU cannot be attributed to cache growth from this measurement alone.
+No retraining, new attention package or environment change was needed.
+
+Final validation: **323 tests passed, one CUDA-only test skipped** in the CPU
+suite. Separate GPU benchmarks used the actual V14 checkpoint and checked exact
+logits/seeded note outputs. Launcher syntax and Git whitespace checks passed.
+The V14 and V15 checkpoints and generated MIDI outputs were retained; no job
+was submitted.
+
+### Saved reference MIDI files
+
+Every conditioned inference run saves `reference.mid` alongside its stage files.
+The original MIDI file is copied byte-for-byte, preserving its metadata and
+tracks. If a catalogue entry has only prepared notes and the original file is
+unavailable, it is reconstructed instead; `saved_original_kind` in the reference
+report distinguishes `file_copy` from `reconstructed_notes`.
+
+With `--reference-tempo source`, the run additionally saves `reference_tempo.mid`
+from the exact retimed note representation passed to reference extraction. It
+contains the complete reference note view, not just the two selected windows,
+and reflects the same 10-ms rounding used for conditioning. It is regenerated
+from notes, so non-note MIDI metadata/controllers are not copied into this file.
+Default `original` mode does not create a changed-tempo file. Paths are recorded
+in `report.json` under `files.reference` and, when applicable,
+`files.reference_tempo`. Output collisions with the source or original reference
+are rejected before writing.
+
+
+### Refinement startup slowdown: confirmed scheduling fix
+
+A temporary isolated diagnostic compared the real refinement prompt with and
+without idle downstream workers. It was removed after validation; the production
+fix and deterministic idle-wakeup regression are retained.
+
+A code defect in `NoteStream.read()` made empty downstream streams call
+`notify_all()` on each wake, producing a feedback loop between idle workers.
+Notifying only when entering the source-wait state fixes the problem without
+changing model calculations, sampling, MIDI preparation or chunk boundaries.
+A V14 GPU replay with three idle workers improved from 3.05 to 37.61 sampled
+tokens/s; note hashes matched direct refinement. Absolute throughput depends
+on load. Existing inference processes must be restarted; no retraining or
+checkpoint changes are required. The original process was left untouched.
+
+The full, uncapped isolated Nocturne run completed two refinement chunks at
+41.54 and 42.49 tokens/s (517/506 sampled tokens), with generated history in the
+second chunk. The temporary diagnostic files have been removed. The validation
+suite passed 329 tests with one CUDA-only skip before removing its five dedicated
+diagnostic tests; actual GPU probes were separate.

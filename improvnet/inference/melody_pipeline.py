@@ -3,6 +3,7 @@
 One worker owns each task's history and grammar; only the coordinator runs the
 shared model. Workers never launch independent model copies or GPU forwards.
 """
+from improvnet.model.kv_cache import StaticKVCache
 from collections import Counter, deque
 from copy import copy
 from dataclasses import dataclass, field
@@ -36,8 +37,9 @@ def forward_batch(model, requests):
     Prefills are right padded (causality isolates real prompt tokens). Cached
     steps are left padded, explicitly masked, and use each row's real RoPE
     offset. Neither padding nor another request's keys enters a returned cache.
-    Returned rows are views: attention appends by allocation, so no caller writes
-    into shared past tensors and cloning full histories is unnecessary.
+    Legacy caches return isolated row views. Opt-in static caches belong to one
+    request; only their new token is copied back after a packed batch. A single
+    static request appends directly, avoiding history copies entirely.
     """
     if not requests:
         return []
@@ -81,9 +83,19 @@ def forward_batch(model, requests):
     else:
         kwargs.update(seq_offset=positions, cache_lengths=positions)
     logits, cache = model(ids, **kwargs)
-    return [(logits[row:row+1].clone(),
-             [tuple(t[row:row+1,width-n:] for t in layer) for layer in cache])
-            for row, n in enumerate(lengths)]
+    results = []
+    for row, n in enumerate(lengths):
+        next_cache = []
+        for previous, layer in zip(caches[row], cache):
+            if isinstance(previous, StaticKVCache):
+                # Packed attention computed the new token; retain the request's
+                # existing buffer and copy back only that token, never its history.
+                previous.append(*(t[row:row+1,-1:] for t in layer))
+                next_cache.append(previous)
+            else:
+                next_cache.append(tuple(t[row:row+1,width-n:] for t in layer))
+        results.append((logits[row:row+1].clone(), next_cache))
+    return results
 
 
 class PipelineCoordinator:
@@ -181,8 +193,12 @@ class NoteStream:
         with c.condition:
             while not self.queue:
                 c.check()
-                c.states[self.owner] = 'source'
-                c.condition.notify_all()
+                if c.states[self.owner] != 'source':
+                    c.states[self.owner] = 'source'
+                    # Notify once when entering source-wait. Re-notifying after
+                    # every unrelated wake makes idle stages wake one another
+                    # indefinitely and starves the active decoder's CPU thread.
+                    c.condition.notify_all()
                 c.condition.wait()
             c.check()
             c.states[self.owner] = 'running'
@@ -195,7 +211,7 @@ class NoteStream:
 def run_pipeline(infer, original, tasks, args, requested, original_instruments,
                  reference, output_directory, stem_targets):
     if infer.meta.get('version')!=PROTOCOL_VERSION:
-        raise ValueError('Inference requires a V15 prefix-memory checkpoint (protocol 19)')
+        raise ValueError('Inference requires a V14 prefix-memory checkpoint (protocol 18)')
     output_directory = Path(output_directory)
     output_directory.mkdir(parents=True, exist_ok=True)
     missing_tasks = set(tasks) - set(infer.meta.get('tasks', ()))

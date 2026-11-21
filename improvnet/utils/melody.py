@@ -23,11 +23,6 @@ def normalize_refinement_velocity(tokens):
     return [(t[0], t[1], 90) if isinstance(t, tuple) and t[0] == 'note' else t for t in tokens]
 
 
-def remove_refinement_time_tokens(tokens):
-    """Hide all one-second separators only in the current refinement input."""
-    return [token for token in tokens if token != "<T>"]
-
-
 class MelodyTokenizer(AbsTokenizer):
     def __init__(self):
         super().__init__()

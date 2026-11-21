@@ -6,7 +6,7 @@ import random
 import sys
 import torch
 from tqdm import tqdm
-from improvnet.inference.melody_outputs import inference_output_paths, stage_output_names, plan_stages
+from improvnet.inference.melody_outputs import inference_output_paths, stage_output_names, plan_stages, save_reference_midis
 from improvnet.inference.melody_runtime import INFERENCE_SEED, TOP_K
 from improvnet.utils.ar_utils import ProcessData
 from improvnet.utils.melody import TASKS, melody_voice, read_midi_notes, skyline, write_midi_notes
@@ -19,7 +19,7 @@ def run_cli(inference_factory, pipeline_runner=None):
     parser.add_argument('--model', required=True)
     parser.add_argument('--input', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True,
-                        help='Run name/path: claire_v15.mid writes all outputs inside claire_v15/, including final.mid')
+                        help='Run name/path: claire_v14.mid writes all outputs inside claire_v14/, including final.mid')
     parser.add_argument('--genre', choices=['jazz', 'blues'], default='jazz')
     parser.add_argument('--task', choices=['pipeline', *TASKS],
                         metavar='{pipeline,refine,harmonize,stem}', default='pipeline')
@@ -43,6 +43,8 @@ def run_cli(inference_factory, pipeline_runner=None):
                         help='Catalogue description: slow/moderate/fast and/or sparse/balanced/dense; default: any')
     parser.add_argument('--reference-aggregation', choices=['window','average'], default='window',
                         help='Use a random consecutive reference pair, or average corresponding positions across all eligible pairs')
+    parser.add_argument('--reference-tempo', choices=['original','source'], default='original',
+                        help='Keep reference tempo (default), or match the estimated source pulse before encoding')
     parser.add_argument('--temperature', type=float, default=1.)
     args = parser.parse_args()
     if any(not 0 <= x <= 1 for x in (args.melody_strength, args.rhythm_strength)):
@@ -85,18 +87,30 @@ def run_cli(inference_factory, pipeline_runner=None):
     stage_instruments = {name:selected for name,(task,_,selected) in zip(stage_names,planned)
                          if task != 'refine' or args.melody_strength>0}
     reference = None
+    tempo_options = {}
+    source_tempo = None
+    if stage_instruments and args.reference_tempo == 'source':
+        from improvnet.utils.melody_reference import reference_tempo
+        bpm, confidence = reference_tempo(pitched)
+        source_tempo = dict(estimated_bpm=bpm, pulse_confidence=confidence)
+        tempo_options['tempo_bpm'] = bpm
     if stage_instruments:
         if args.style_reference:
             ref = read_midi_notes(args.style_reference, infer.tokenizer,include_drums=True)
             if not trio_instruments(n.instrument for n in ref):
                 parser.error('Reference MIDI must contain exactly one piano, drums and acoustic/double bass, with no additional instruments')
-            reference = infer.encoders.from_notes(ref, infer.tokenizer,mode=args.reference_mode,stage_instruments=stage_instruments,aggregation=args.reference_aggregation,rng=random.Random(INFERENCE_SEED))
+            reference = infer.encoders.from_notes(ref, infer.tokenizer,mode=args.reference_mode,stage_instruments=stage_instruments,aggregation=args.reference_aggregation,rng=random.Random(INFERENCE_SEED),**tempo_options)
+            reference.setdefault('_reference_notes',ref)
             reference.update(id=str(args.style_reference),path=str(args.style_reference),selection_method='midi')
         else:
             reference = choose_reference(infer.encoders, args.genre, random.Random(INFERENCE_SEED),
                 description=args.reference_description or 'any',
-                mode=args.reference_mode,stage_instruments=stage_instruments,aggregation=args.reference_aggregation)
+                mode=args.reference_mode,stage_instruments=stage_instruments,aggregation=args.reference_aggregation,**tempo_options)
     if reference:
+        adjustment = reference.get('tempo_adjustment')
+        if adjustment:
+            tqdm.write(f"Reference tempo: {adjustment['original_bpm']:.1f} -> {adjustment['target_bpm']:.1f} BPM "
+                       f"(time scale {adjustment['time_scale']:.3f}); estimated pulse may have half/double-tempo ambiguity.",file=sys.stderr)
         if args.style_reference:
             tqdm.write(f'Reference MIDI: {args.style_reference}',file=sys.stderr)
         elif reference.get('title'):
@@ -110,10 +124,21 @@ def run_cli(inference_factory, pipeline_runner=None):
     stage_names = stage_output_names(tasks, stem_targets)
     outputs.update({name: outputs['directory'] / f'{name}.mid' for name in stage_names})
     written_names = {'final', 'report', 'melody', *stage_names}
+    if reference:
+        outputs['reference'] = outputs['directory'] / 'reference.mid'
+        written_names.add('reference')
+        if reference.get('tempo_adjustment'):
+            outputs['reference_tempo'] = outputs['directory'] / 'reference_tempo.mid'
+            written_names.add('reference_tempo')
     if args.input.resolve() in {p.resolve() for name, p in outputs.items() if name in written_names}:
         parser.error('Output or an intermediate file would overwrite the input MIDI')
+    if reference and reference.get('path'):
+        if Path(reference['path']).resolve() in {p.resolve() for name,p in outputs.items() if name in written_names}:
+            parser.error('Output or an intermediate file would overwrite the reference MIDI')
     args.output.parent.mkdir(parents=True, exist_ok=True)
     outputs['directory'].mkdir(parents=True, exist_ok=True)
+    if reference:
+        save_reference_midis(reference, outputs, infer.tokenizer)
     mono = melody_voice(skyline(pitched, infer.meta['skyline_tolerance_ms'])[0])
     write_midi_notes(mono, outputs['melody'], infer.tokenizer)
     current, chunks, task_order, extra_report = pipeline_runner(
@@ -123,6 +148,7 @@ def run_cli(inference_factory, pipeline_runner=None):
     report = dict(model=str(args.model), checkpoint_step=infer.checkpoint_step, protocol_version=infer.meta['version'],
                   input=str(args.input), output=str(outputs['final']), genre=args.genre,
                   nonkit_input_drum_notes_filtered=0,percussion_mode='reference_kit',reference_mode=args.reference_mode,reference_aggregation=args.reference_aggregation,
+                  reference_tempo=args.reference_tempo,source_tempo=source_tempo,
                   reference_description=None if args.style_reference else (args.reference_description or 'any'),
                   input_drum_articulations_normalized=0,
                   requested_instruments=requested, instruments=sorted({n.instrument for n in current}),

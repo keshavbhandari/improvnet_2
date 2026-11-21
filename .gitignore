@@ -89,3 +89,7 @@ improvnet/artifacts/*
 # Data folder
 improvnet/data/*
 improvnet/inference/generated.mid
+
+# Generated melody inference comparisons and Slurm output
+/improvnet/inference/nocturne_v14_*/
+/run_scripts/melody_logs/

@@ -177,9 +177,15 @@ class FrozenConditioners:
             coordinates.append(pos)
         return torch.cat(parts,2),torch.cat(masks,2),torch.cat(coordinates,2)
 
-    def from_notes(self,notes,tokenizer,*,mode='trio',stage_instruments=None,aggregation='window',rng=None):
+    def from_notes(self,notes,tokenizer,*,mode='trio',stage_instruments=None,aggregation='window',rng=None,tempo_bpm=None):
         """Global and local features from the same selected windows, cached by instrument view."""
         from improvnet.utils.melody_reference import reference_instruments
+        original_notes = list(notes)
+        notes = original_notes
+        tempo_adjustment = None
+        if tempo_bpm is not None:
+            from improvnet.utils.melody_reference import retime_reference
+            notes, tempo_adjustment = retime_reference(notes, tempo_bpm)
         if aggregation not in ('window','average'):raise ValueError('Reference aggregation must be window or average')
         rng=rng or random.Random(42)
         available={n.instrument for n in notes}
@@ -242,4 +248,5 @@ class FrozenConditioners:
                         global_aggregation='independent_window_banks' if aggregation=='window' else 'normalized_mean_by_pair_position',
                         instruments=sorted(wanted)))
             conditions[stage]=dict(cache[key],reference_mode='exact' if stage=='refine' else mode,output_instruments=list(target))
-        return dict(stage_conditions=conditions,aggregation=aggregation,reference_mode=mode)
+        return dict(stage_conditions=conditions,aggregation=aggregation,reference_mode=mode,tempo_adjustment=tempo_adjustment,
+                    _reference_notes=original_notes,_conditioning_notes=list(notes))

@@ -2,6 +2,7 @@
 import torch
 from tqdm import tqdm
 from improvnet.inference.melody_runtime import TOP_K
+from improvnet.model.kv_cache import reserve_kv_cache
 from improvnet.inference.melody_stem_anchors import StemAnchors
 from improvnet.utils.melody import Note, ordered, PREFIX_TOKENS
 from improvnet.utils.melody_stems import DRUM_KIT_PITCHES, PERCUSSION_MODES
@@ -44,7 +45,7 @@ def generate_notes(self, prompt, genre, strength, instruments, window_ms,
         token_progress.set_postfix_str('prefill')
         ids = torch.tensor([[tok.tok_to_id[t] for t in prompt]], device=device)
         def prefill(ids):
-            return self.model(ids, genre=torch.tensor([self.meta['genres'].index(genre)], device=device),
+            result = self.model(ids, genre=torch.tensor([self.meta['genres'].index(genre)], device=device),
                                        multi_hot=conditions, strength=torch.tensor([strength], device=device),
                                        percussion_mode=torch.tensor([PERCUSSION_MODES[percussion_palette]],device=device),
                                        reference_features=reference_features.unsqueeze(0).to(device) if reference_features is not None else None,
@@ -52,6 +53,10 @@ def generate_notes(self, prompt, genre, strength, instruments, window_ms,
                                        reference_positions=reference_positions.unsqueeze(0).to(device) if reference_positions is not None else None,
                                        drum_profile=drum_profile.unsqueeze(0).to(device) if drum_profile is not None else None,
                                        use_cache=True)
+            logits, cache = result
+            if getattr(self, 'preallocate_kv', True):
+                cache = reserve_kv_cache(cache, self.meta['seq_len'])
+            return logits, cache
         logits, cache = prefill(ids)
         token_progress.set_postfix_str('decoding')
         offset = len(prompt) + PREFIX_TOKENS

@@ -1,4 +1,4 @@
-"""Current V15 data contracts."""
+"""Current V14 data contracts."""
 import json
 import mido
 import pytest

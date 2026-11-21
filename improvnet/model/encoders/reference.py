@@ -5,7 +5,7 @@ from improvnet.utils.reference_catalog import DEFAULT_CATALOG, load_catalog, loa
 
 
 def choose_reference(encoder,genre,rng,*,description='any',catalog_path=DEFAULT_CATALOG,
-                     mode='trio',stage_instruments=None,aggregation='window'):
+                     mode='trio',stage_instruments=None,aggregation='window',tempo_bpm=None):
     description=parse_reference_description(description)
     requested=set() if description=='any' else set(description.split())
     catalogue=load_catalog(catalog_path)
@@ -34,8 +34,10 @@ def choose_reference(encoder,genre,rng,*,description='any',catalog_path=DEFAULT_
                 notes=load_entry_notes(entry)
                 if not trio_instruments(n.instrument for n in notes):
                     raise ValueError('Reference notes must contain exactly one piano, drums and double bass, with no extra instruments')
+                tempo_options = {} if tempo_bpm is None else dict(tempo_bpm=tempo_bpm)
                 result=encoder.from_notes(notes,MelodyTokenizer(),
-                    mode=mode,stage_instruments=stage_instruments,aggregation=aggregation,rng=rng)
+                    mode=mode,stage_instruments=stage_instruments,aggregation=aggregation,rng=rng,**tempo_options)
+                result.setdefault('_reference_notes',notes)
                 result.update(id=entry['id'],path=entry['path'],title=entry['title'],genre=entry['genre'],
                     source=entry['source'],instruments=entry['instruments'],rhythm=entry['rhythm'],
                     descriptors=entry['descriptors'],requested_description=description,selection_method='description',catalogue=str(catalog_path),

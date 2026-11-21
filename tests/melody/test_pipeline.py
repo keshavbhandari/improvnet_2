@@ -1,4 +1,4 @@
-"""Current V15 pipeline contracts."""
+"""Current V14 pipeline contracts."""
 import random
 import pytest
 import torch
@@ -66,7 +66,7 @@ def test_batched_variable_prompts_and_caches_match_independent_forwards():
 
 
 def fake_reference(*,stage_instruments=None,**kwargs):
-    return dict(stage_conditions={stage:dict(reference_features=torch.ones(2,10,256),
+    return dict(_reference_notes=[Note('Acoustic Piano',60,80,0,100)],stage_conditions={stage:dict(reference_features=torch.ones(2,10,256),
         reference_mask=torch.ones(2,10,dtype=torch.bool),reference_positions=torch.zeros(2,10,3),
         drum_profile=torch.zeros(2,400),drum_palette=[42],output_instruments=instruments)
         for stage,instruments in (stage_instruments or {}).items()})
@@ -80,7 +80,7 @@ def fixture_infer():
     infer.processor = ProcessData()
     infer.options = settings()
     infer.encoders = SimpleNamespace(from_notes=lambda *a,**kw:fake_reference(**kw))
-    infer.meta = dict(version=19, tasks=list(TASKS), seq_len=1024, genres=['jazz'], chunk_tokens=26,
+    infer.meta = dict(version=18, tasks=list(TASKS), seq_len=1024, genres=['jazz'], chunk_tokens=26,
                       history_tokens=64,
                       skyline_tolerance_ms=50,harmonize_min_mask_ratio=.9, style_dim=256)
     return infer
@@ -141,7 +141,8 @@ def test_pipeline_overlaps_tasks_and_matches_offline_boundaries_history_and_note
             monophonic=True if task=='harmonize' else None, target_instrument='drum' if task=='stem' else None)
         serial_logs.extend(log)
     assert parallel == current
-    assert logs == serial_logs
+    semantic = lambda rows: [{k:v for k,v in row.items() if k not in ('generation_seconds','tokens_per_second')} for row in rows]
+    assert semantic(logs) == semantic(serial_logs)
     assert tasks == list(TASKS)
     assert all(log['history_tokens'] <= 64 and log['total_token_budget'] <= 1024 for log in logs)
     stats = report['parallel_inference']
@@ -177,7 +178,7 @@ def test_canonical_cli_batches_three_tasks_and_harmonizes_requested_pitched_mix(
     from improvnet.inference import melody_inference as module
     from improvnet.utils.melody import write_midi_notes
     infer = fixture_infer()
-    infer.meta.update(version=19, tasks=list(TASKS))
+    infer.meta.update(version=18, tasks=list(TASKS))
     infer.checkpoint_step = 1
     calls = []
     def generate(self, prompt, genre, strength, instruments, *args, **kwargs):
@@ -208,7 +209,7 @@ def test_canonical_cli_batches_three_tasks_and_harmonizes_requested_pitched_mix(
     assert report['stem_summary'][0]['generated_notes']>0
     assert report['parallel_inference']['max_batch_size'] >= 2
     assert {p.name for p in (tmp_path/'clair').iterdir()} == {
-        'melody.mid', 'refine.mid', 'harmonize.mid', 'stem.mid', 'final.mid', 'report.json'}
+        'melody.mid', 'refine.mid', 'harmonize.mid', 'stem.mid', 'final.mid', 'report.json', 'reference.mid'}
     assert {instruments for task, instruments, _ in calls if task == '<HARMONIZE>'} == {
         ('Acoustic Piano', 'Electric Bass', 'Tenor Sax')}
     assert all(protected is not None for task, _, protected in calls if task == '<ADD_STEM>')
@@ -220,7 +221,7 @@ def test_cli_rejects_retired_orchestration_before_reading_music(tmp_path, monkey
     import sys
     from improvnet.inference import melody_inference as module
     infer = fixture_infer()
-    infer.meta.update(version=19, tasks=list(TASKS))
+    infer.meta.update(version=18, tasks=list(TASKS))
     monkeypatch.setattr(module, 'MelodyInference', lambda _: infer)
     monkeypatch.setattr('improvnet.inference.melody_cli.choose_reference',lambda *a,**kw:fake_reference(**kw))
     monkeypatch.setattr(sys, 'argv', ['inference', '--model', 'fixture', '--input', 'missing.mid',
